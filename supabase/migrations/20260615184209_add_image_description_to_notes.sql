@@ -1,0 +1,1 @@
+ALTER TABLE notes ADD COLUMN IF NOT EXISTS image_description text;
