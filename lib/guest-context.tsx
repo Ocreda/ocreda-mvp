@@ -2,6 +2,7 @@
 
 import { createContext, useContext, useEffect, useState, useCallback } from 'react';
 import { useAuth } from './auth-context';
+import { supabase } from './supabase';
 
 export interface GuestNote {
   id: string;
@@ -47,6 +48,31 @@ function loadGuestNotes(): GuestNote[] {
 function saveGuestNotes(notes: GuestNote[]): void {
   if (typeof window === 'undefined') return;
   localStorage.setItem(GUEST_STORAGE_KEY, JSON.stringify(notes));
+}
+
+export async function transferGuestNotes(userId: string): Promise<void> {
+  try {
+    const raw = localStorage.getItem(GUEST_STORAGE_KEY);
+    if (!raw) return;
+    const guestNotes = JSON.parse(raw) as GuestNote[];
+    if (!Array.isArray(guestNotes) || guestNotes.length === 0) return;
+
+    // Insert guest notes in reverse order so they appear newest-first
+    const rows = [...guestNotes].reverse().map((n) => ({
+      user_id: userId,
+      title: n.title || '',
+      content: n.content,
+      tags: n.tags || [],
+      type: 'note',
+      created_at: n.created_at,
+      updated_at: n.updated_at,
+    }));
+
+    await supabase.from('notes').insert(rows);
+    localStorage.removeItem(GUEST_STORAGE_KEY);
+  } catch {
+    // non-critical — don't block the sign-in flow
+  }
 }
 
 export function GuestProvider({ children }: { children: React.ReactNode }) {

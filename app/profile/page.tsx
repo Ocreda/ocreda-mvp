@@ -333,7 +333,7 @@ export default function ProfilePage() {
           {/* Brain stats */}
           {stats && (stats.topTags.length > 0 || stats.topCategories.length > 0) && (
             <div className="bg-card border border-border rounded-2xl p-6 mb-6 shadow-sm">
-              <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-4">My Brain Stats</h2>
+              <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-4">Ocreda Stats</h2>
 
               {stats.topTags.length > 0 && (
                 <div className="mb-5">

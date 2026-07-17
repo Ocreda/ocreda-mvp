@@ -10,8 +10,7 @@ export default function HomePage() {
 
   useEffect(() => {
     if (loading) return;
-    // Both authenticated users and guests land on /notes
-    router.replace('/notes');
+    router.replace(user ? '/notes' : '/auth');
   }, [user, loading, router]);
 
   return (

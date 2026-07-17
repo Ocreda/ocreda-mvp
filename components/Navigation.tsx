@@ -214,18 +214,11 @@ export default function Navigation() {
               </div>
             </div>
             <Link
-              href="/auth?mode=signup"
+              href="/auth"
               onClick={() => isMobile && setMobileOpen(false)}
               className="flex items-center gap-2 px-0.5 text-[12px] font-medium text-primary/70 hover:text-primary transition-colors"
             >
               <LogIn className="w-3.5 h-3.5" />
-              Sign up free
-            </Link>
-            <Link
-              href="/auth?mode=signin"
-              onClick={() => isMobile && setMobileOpen(false)}
-              className="flex items-center gap-2 px-0.5 text-[12px] text-muted-foreground/40 hover:text-muted-foreground transition-colors"
-            >
               Sign in
             </Link>
           </div>

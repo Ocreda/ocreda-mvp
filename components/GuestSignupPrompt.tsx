@@ -37,16 +37,10 @@ export default function GuestSignupPrompt({ onClose, message }: GuestSignupPromp
 
         <div className="flex flex-col gap-2">
           <Link
-            href="/auth?mode=signup"
+            href="/auth"
             className="w-full flex items-center justify-center gap-2 px-4 py-2.5 bg-primary text-white text-sm font-medium rounded-xl hover:bg-primary/90 transition-all"
           >
-            Sign up free
-          </Link>
-          <Link
-            href="/auth?mode=signin"
-            className="w-full flex items-center justify-center px-4 py-2 text-sm text-muted-foreground hover:text-foreground transition-colors"
-          >
-            Already have an account? Log in
+            Continue with email
           </Link>
         </div>
       </div>
