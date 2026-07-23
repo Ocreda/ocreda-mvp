@@ -4,8 +4,6 @@ import { Inter } from 'next/font/google';
 import { ThemeProvider } from '@/lib/theme-context';
 import { SidebarProvider } from '@/lib/sidebar-context';
 import { AuthProvider } from '@/lib/auth-context';
-import { GuestProvider } from '@/lib/guest-context';
-import { PinnedProvider } from '@/lib/pinned-context';
 import AppShell from '@/components/AppShell';
 import AppChrome from '@/components/AppChrome';
 
@@ -30,15 +28,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className={inter.className}>
         <ThemeProvider>
           <AuthProvider>
-            <GuestProvider>
-              <SidebarProvider>
-                <PinnedProvider>
-                  <AppChrome>
-                    <AppShell>{children}</AppShell>
-                  </AppChrome>
-                </PinnedProvider>
-              </SidebarProvider>
-            </GuestProvider>
+            <SidebarProvider>
+              <AppChrome>
+                <AppShell>{children}</AppShell>
+              </AppChrome>
+            </SidebarProvider>
           </AuthProvider>
         </ThemeProvider>
       </body>

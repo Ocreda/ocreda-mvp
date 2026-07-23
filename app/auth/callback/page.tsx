@@ -4,14 +4,12 @@ import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import Image from 'next/image';
 import { useAuth } from '@/lib/auth-context';
-import { transferGuestNotes, useGuest } from '@/lib/guest-context';
 import { TriangleAlert as AlertTriangle } from 'lucide-react';
 
 const AUTH_TIMEOUT_MS = 6000;
 
 export default function AuthCallbackPage() {
   const { user, loading } = useAuth();
-  const { clearGuestNotes } = useGuest();
   const router = useRouter();
   const [timedOut, setTimedOut] = useState(false);
 
@@ -22,12 +20,8 @@ export default function AuthCallbackPage() {
 
   useEffect(() => {
     if (loading || !user) return;
-    (async () => {
-      await transferGuestNotes(user.id);
-      clearGuestNotes();
-      router.replace('/notes');
-    })();
-  }, [loading, user, router, clearGuestNotes]);
+    router.replace('/notes');
+  }, [loading, user, router]);
 
   if (!loading && !user && timedOut) {
     return (
