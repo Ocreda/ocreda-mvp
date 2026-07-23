@@ -4,16 +4,13 @@ import { Inter } from 'next/font/google';
 import { ThemeProvider } from '@/lib/theme-context';
 import { SidebarProvider } from '@/lib/sidebar-context';
 import { AuthProvider } from '@/lib/auth-context';
-import { GuestProvider } from '@/lib/guest-context';
-import { PinnedProvider } from '@/lib/pinned-context';
 import AppShell from '@/components/AppShell';
-import Navigation from '@/components/Navigation';
-import SidebarMain from '@/components/SidebarMain';
+import AppChrome from '@/components/AppChrome';
 
 const inter = Inter({ subsets: ['latin'] });
 
 export const metadata: Metadata = {
-  title: 'My Brain — Personal Knowledge Base',
+  title: 'Ocreda — Stop organizing. Start using.',
   description: 'Your AI-powered personal knowledge base',
 };
 
@@ -31,16 +28,11 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
       <body className={inter.className}>
         <ThemeProvider>
           <AuthProvider>
-            <GuestProvider>
-              <SidebarProvider>
-                <PinnedProvider>
-                  <Navigation />
-                  <SidebarMain>
-                    <AppShell>{children}</AppShell>
-                  </SidebarMain>
-                </PinnedProvider>
-              </SidebarProvider>
-            </GuestProvider>
+            <SidebarProvider>
+              <AppChrome>
+                <AppShell>{children}</AppShell>
+              </AppChrome>
+            </SidebarProvider>
           </AuthProvider>
         </ThemeProvider>
       </body>
