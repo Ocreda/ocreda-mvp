@@ -32,10 +32,11 @@ function GoogleIcon() {
 }
 
 export default function AuthPage() {
-  const { user, loading, signInWithOtp } = useAuth();
+  const { user, loading, signInWithOtp, signInWithGoogle } = useAuth();
   const router = useRouter();
   const [email, setEmail] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [googleSubmitting, setGoogleSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -57,6 +58,18 @@ export default function AuthPage() {
       }
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const handleGoogleSignIn = async () => {
+    setError(null);
+    setGoogleSubmitting(true);
+    // On success Supabase redirects to Google, so this component unmounts and
+    // we only reach the code below if the OAuth request itself failed to start.
+    const { error: err } = await signInWithGoogle();
+    if (err) {
+      setError(friendlyError(err));
+      setGoogleSubmitting(false);
     }
   };
 
@@ -87,12 +100,12 @@ export default function AuthPage() {
 
         <button
           type="button"
-          disabled
-          title="Google sign-in isn't set up yet"
-          aria-disabled="true"
-          className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl border border-border bg-card opacity-60 cursor-not-allowed text-sm font-medium text-foreground"
+          onClick={handleGoogleSignIn}
+          disabled={googleSubmitting || submitting}
+          className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl border border-border bg-card hover:bg-accent disabled:opacity-60 disabled:cursor-not-allowed text-sm font-medium text-foreground transition-all"
         >
-          <GoogleIcon />
+          {googleSubmitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <GoogleIcon />}
+          Continue with Google
         </button>
 
         <div className="flex items-center gap-3 my-5">
