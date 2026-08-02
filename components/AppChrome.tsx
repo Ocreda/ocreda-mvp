@@ -3,8 +3,6 @@
 import { useEffect } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { useAuth } from '@/lib/auth-context';
-import Navigation from './Navigation';
-import SidebarMain from './SidebarMain';
 
 const PUBLIC_PATHS = ['/auth'];
 
@@ -31,10 +29,5 @@ export default function AppChrome({ children }: { children: React.ReactNode }) {
     );
   }
 
-  return (
-    <>
-      <Navigation />
-      <SidebarMain>{children}</SidebarMain>
-    </>
-  );
+  return <>{children}</>;
 }

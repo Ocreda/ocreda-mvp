@@ -134,3 +134,27 @@ mark.key-point-highlight {
 .answer-prose strong { font-weight: 600; }
 .answer-prose code { font-family: monospace; font-size: 0.875em; background: hsl(var(--muted)); padding: 0.125rem 0.25rem; border-radius: 0.25rem; }
 .answer-prose h1, .answer-prose h2, .answer-prose h3 { font-weight: 600; margin-bottom: 0.5rem; margin-top: 1rem; }
+
+/* ── Ocreda continuous-workspace motion (restrained, ~180–280ms) ──
+   "thoughts reorganizing", not a slideshow. */
+@keyframes ocreda-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes ocreda-fade-up {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes ocreda-slide-in-right {
+  from { opacity: 0; transform: translateX(18px); }
+  to { opacity: 1; transform: none; }
+}
+.animate-ocreda-fade-in { animation: ocreda-fade-in 200ms ease-out both; }
+.animate-ocreda-fade-up { animation: ocreda-fade-up 240ms ease-out both; }
+.animate-ocreda-slide-in-right { animation: ocreda-slide-in-right 260ms ease-out both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-ocreda-fade-in,
+  .animate-ocreda-fade-up,
+  .animate-ocreda-slide-in-right { animation: none; }
+}
