@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import Link from 'next/link';
-import { ArrowUp, Trash2, Pencil, Check, X, Loader as Loader2 } from 'lucide-react';
+import { ArrowUp, Trash2, Pencil, Check, X, Plus, Loader as Loader2 } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 import { useAuth } from '@/lib/auth-context';
 import { supabase } from '@/lib/supabase';
@@ -258,9 +258,11 @@ function RailCard({
 /* ────────────────────────── page ────────────────────────── */
 
 export default function OcredaHome() {
+  const { user } = useAuth();
   const [notes, setNotes] = useState<Note[]>([]);
   const [questions, setQuestions] = useState<Question[]>([]);
   const [loading, setLoading] = useState(true);
+  const [displayName, setDisplayName] = useState('');
 
   const [active, setActive] = useState<Active>(null);
   const [chat, setChat] = useState<ChatState | null>(null);
@@ -275,6 +277,7 @@ export default function OcredaHome() {
 
   // composers
   const [addValue, setAddValue] = useState('');
+  const [addOpen, setAddOpen] = useState(false);
   const [askValue, setAskValue] = useState('');
   const [composerValue, setComposerValue] = useState('');
   const [busy, setBusy] = useState(false);
@@ -301,6 +304,16 @@ export default function OcredaHome() {
   useEffect(() => {
     load();
   }, [load]);
+
+  useEffect(() => {
+    if (!user) return;
+    supabase
+      .from('user_settings')
+      .select('full_name')
+      .eq('user_id', user.id)
+      .maybeSingle()
+      .then(({ data }) => setDisplayName(data?.full_name?.trim() ?? ''));
+  }, [user]);
 
   // default selection once data lands: most recent note, else most recent chat
   useEffect(() => {
@@ -358,7 +371,7 @@ export default function OcredaHome() {
   };
 
   /* ── submit: add-a-note / ask / follow-up ── */
-  const runHandleMessage = async (text: string) => {
+  const runHandleMessage = async (text: string): Promise<boolean> => {
     setError('');
     setBusy(true);
     try {
@@ -382,8 +395,10 @@ export default function OcredaHome() {
         // refresh questions list so the rail shows the new past-chat
         getQuestions().then(setQuestions).catch(() => {});
       }
+      return true;
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Something went wrong');
+      return false;
     } finally {
       setBusy(false);
     }
@@ -423,11 +438,14 @@ export default function OcredaHome() {
     else runHandleMessage(text);
   };
 
-  const submitAdd = () => {
+  const submitAdd = async () => {
     const text = addValue.trim();
     if (!text || busy) return;
-    setAddValue('');
-    runHandleMessage(text);
+    const saved = await runHandleMessage(text);
+    if (saved) {
+      setAddValue('');
+      setAddOpen(false);
+    }
   };
 
   const submitAsk = () => {
@@ -512,6 +530,78 @@ export default function OcredaHome() {
     <div className="min-h-screen bg-background text-foreground">
       <AvatarButton />
 
+      {addOpen && (
+        <div
+          className="fixed inset-0 z-[70] flex items-end sm:items-center justify-center sm:p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="add-note-title"
+          onKeyDown={(e) => {
+            if (e.key === 'Escape' && !busy) setAddOpen(false);
+          }}
+        >
+          <button
+            type="button"
+            aria-label="Close add note dialog"
+            className="absolute inset-0 bg-black/50 backdrop-blur-sm"
+            onClick={() => !busy && setAddOpen(false)}
+          />
+          <div className="animate-ocreda-fade-up relative w-full sm:max-w-md rounded-t-[1.75rem] sm:rounded-[1.75rem] border border-border/80 bg-card p-5 shadow-2xl shadow-black/20">
+            <div className="mb-4 flex items-start justify-between gap-4">
+              <div className="flex items-center gap-3.5">
+                <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-2xl border border-border/70 bg-background/70 shadow-sm">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img src="/IMG_2929.png" alt="" className="h-7 w-7 object-contain dark:invert" />
+                </div>
+                <div>
+                  <h2 id="add-note-title" className="text-lg font-bold tracking-tight text-foreground">Add a note</h2>
+                  <p className="mt-0.5 text-xs text-muted-foreground">Save a thought, task, or memory.</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAddOpen(false)}
+                disabled={busy}
+                aria-label="Close"
+                className="rounded-lg p-2 text-muted-foreground/60 hover:bg-accent hover:text-foreground disabled:opacity-40 transition-colors"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <textarea
+              autoFocus
+              value={addValue}
+              onChange={(e) => setAddValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                  e.preventDefault();
+                  submitAdd();
+                }
+              }}
+              placeholder="What would you like to remember?"
+              rows={5}
+              className="w-full resize-none rounded-2xl border border-border/80 bg-background/50 px-4 py-3.5 text-[15px] leading-relaxed text-foreground shadow-inner shadow-black/[0.03] placeholder:text-muted-foreground/40 focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary/50 transition-all"
+            />
+
+            {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+
+            <div className="mt-4 flex items-center justify-between gap-3">
+              <span className="hidden sm:block text-xs text-muted-foreground/50">⌘/Ctrl + Enter to save</span>
+              <button
+                type="button"
+                onClick={submitAdd}
+                disabled={!addValue.trim() || busy}
+                className="ml-auto inline-flex items-center justify-center gap-2 rounded-xl bg-primary px-4 py-2.5 text-sm font-semibold text-white shadow-sm shadow-primary/20 hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-40 transition-all"
+              >
+                {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Plus className="h-4 w-4" />}
+                {busy ? 'Saving…' : 'Save note'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="p-3 sm:p-5 lg:p-6">
         <div className="mx-auto max-w-[1500px] rounded-3xl border border-border/60 bg-card shadow-sm lg:h-[calc(100vh-3rem)] overflow-hidden">
           {loading ? (
@@ -522,13 +612,25 @@ export default function OcredaHome() {
             /* ───────────── STATE 1 — first-time user ───────────── */
             <div className="animate-ocreda-fade-in h-full flex flex-col items-center justify-center px-6 py-16">
               <div className="w-full max-w-xl flex flex-col items-center">
+                {displayName && (
+                  <div className="mb-7 flex items-center gap-2 rounded-full border border-primary/15 bg-primary/[0.07] px-4 py-2">
+                    <span className="h-2 w-2 rounded-full bg-primary shadow-sm shadow-primary/40" />
+                    <p className="text-sm text-muted-foreground">
+                      Welcome back, <span className="font-semibold text-foreground">{displayName}</span>
+                    </p>
+                  </div>
+                )}
                 <button
                   type="button"
-                  onClick={submitAdd}
+                  onClick={() => {
+                    setError('');
+                    setAddOpen(true);
+                  }}
                   disabled={busy}
                   className="mb-14 px-6 py-2 rounded-full bg-primary/10 text-primary text-sm font-semibold hover:bg-primary/15 transition-colors disabled:opacity-50"
                 >
-                  {busy ? 'Saving…' : 'Add'}
+                  <Plus className="mr-1.5 inline h-4 w-4" />
+                  Add
                 </button>
 
                 <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-foreground mb-6">Add a note</h1>
@@ -576,6 +678,17 @@ export default function OcredaHome() {
             <div className="h-full flex flex-col lg:flex-row">
               {/* main workspace */}
               <section className="flex-1 min-w-0 flex flex-col lg:h-full px-5 sm:px-8 lg:px-10 pt-14 lg:pt-8 pb-5">
+                {displayName && (
+                  <div className="mb-5 flex shrink-0 items-center gap-3 pr-12">
+                    <div className="h-8 w-1 rounded-full bg-primary" />
+                    <div>
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-primary/75">Your second brain</p>
+                      <p className="text-sm text-muted-foreground">
+                        Welcome back, <span className="font-semibold text-foreground">{displayName}</span>
+                      </p>
+                    </div>
+                  </div>
+                )}
                 <div className="flex-1 lg:overflow-y-auto scrollbar-thin -mx-1 px-1">
                   {active?.kind === 'chat' && chat ? (
                     <ChatView
