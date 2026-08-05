@@ -86,7 +86,7 @@ export default function AuthPage() {
       <div className="w-full max-w-sm">
         <div className="flex flex-col items-center mb-8">
           <div className="w-12 h-12 flex items-center justify-center mb-4">
-            <Image src="/IMG_2929.png" alt="Ocreda" width={48} height={48} className="object-contain dark:invert" />
+            <Image src="/ocreda-logo.png" alt="Ocreda" width={48} height={48} className="object-contain" />
           </div>
           <h1 className="text-2xl font-bold text-foreground">Access Ocreda</h1>
           <p className="text-sm text-muted-foreground mt-1">Stop organizing. Start using.</p>

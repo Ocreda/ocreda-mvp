@@ -20,6 +20,17 @@ export async function getNotes(): Promise<Note[]> {
   return data as Note[];
 }
 
+/** Save from the dedicated note editor without running question/note classification. */
+export async function createNote(rawText: string): Promise<Note> {
+  const { data, error } = await supabase
+    .from('notes')
+    .insert({ user_id: await getOwnerId(), raw_text: rawText })
+    .select('id, user_id, raw_text, summary, target_date, time_of_day, created_at')
+    .single();
+  if (error) throw error;
+  return data as Note;
+}
+
 export async function getNoteById(noteId: string): Promise<Note> {
   const { data, error } = await supabase
     .from('notes')

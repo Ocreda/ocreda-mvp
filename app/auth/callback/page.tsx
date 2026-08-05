@@ -28,7 +28,7 @@ export default function AuthCallbackPage() {
       <div className="min-h-screen flex items-center justify-center bg-background px-4">
         <div className="w-full max-w-sm flex flex-col items-center text-center gap-3">
           <div className="w-12 h-12 flex items-center justify-center mb-2">
-            <Image src="/IMG_2929.png" alt="Ocreda" width={48} height={48} className="object-contain dark:invert" />
+            <Image src="/ocreda-logo.png" alt="Ocreda" width={48} height={48} className="object-contain" />
           </div>
           <div className="w-12 h-12 rounded-full bg-destructive/10 flex items-center justify-center">
             <AlertTriangle className="w-5 h-5 text-destructive" />

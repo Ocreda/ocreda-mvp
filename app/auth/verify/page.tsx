@@ -54,7 +54,7 @@ function VerifyPageInner() {
       <div className="w-full max-w-sm">
         <div className="flex flex-col items-center mb-8">
           <div className="w-12 h-12 flex items-center justify-center mb-4">
-            <Image src="/IMG_2929.png" alt="Ocreda" width={48} height={48} className="object-contain dark:invert" />
+            <Image src="/ocreda-logo.png" alt="Ocreda" width={48} height={48} className="object-contain" />
           </div>
         </div>
 
