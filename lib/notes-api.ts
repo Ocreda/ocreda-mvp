@@ -31,6 +31,40 @@ export async function createNote(rawText: string): Promise<Note> {
   return data as Note;
 }
 
+export async function getGuidedChatReaction(previousAnswer: string, nextQuestion: string): Promise<string> {
+  const response = await fetch(`${SUPABASE_URL}/functions/v1/guided-chat`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ previous_answer: previousAnswer, next_question: nextQuestion }),
+  });
+  if (!response.ok) throw new Error(await response.text());
+  const data = await response.json();
+  return data.message;
+}
+
+export interface GuidedNoteDraft {
+  title: string;
+  body: string;
+  source_answer: number;
+}
+
+export async function extractGuidedNotes(answers: string[]): Promise<GuidedNoteDraft[]> {
+  const response = await fetch(`${SUPABASE_URL}/functions/v1/guided-notes`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ answers }),
+  });
+  if (!response.ok) throw new Error(await response.text());
+  const data = await response.json();
+  return data.notes;
+}
+
 export async function getNoteById(noteId: string): Promise<Note> {
   const { data, error } = await supabase
     .from('notes')
@@ -99,17 +133,39 @@ export async function handleMessage(rawText: string): Promise<
 
 export async function getNoteRelations(
   noteId: string
-): Promise<Array<{ id: string; related_note_id: string; reason: string | null; related_note: { id: string; summary: string | null; raw_text: string } }>> {
-  const { data, error } = await supabase
+): Promise<Array<{ id: string; related_note_id: string; reason: string | null; confidence?: number; weight?: number; related_note: { id: string; summary: string | null; raw_text: string } }>> {
+  const enhanced = await supabase
     .from('note_relations')
-    .select('id, related_note_id, reason, related_note:notes!related_note_id(id, summary, raw_text)')
+    .select('id, related_note_id, reason, confidence, weight, related_note:notes!related_note_id(id, summary, raw_text)')
     .eq('note_id', noteId);
+  // The fallback keeps clients working while the connection-learning migration rolls out.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let data: any[] | null = enhanced.data;
+  let error = enhanced.error;
+  if (error) {
+    const fallback = await supabase
+      .from('note_relations')
+      .select('id, related_note_id, reason, related_note:notes!related_note_id(id, summary, raw_text)')
+      .eq('note_id', noteId);
+    data = fallback.data;
+    error = fallback.error;
+  }
   if (error) throw error;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return (data || []).map((r: any) => ({
     ...r,
     related_note: Array.isArray(r.related_note) ? r.related_note[0] : r.related_note,
-  }));
+  })).sort((a, b) => ((b.confidence ?? 1) * (b.weight ?? 1)) - ((a.confidence ?? 1) * (a.weight ?? 1)));
+}
+
+export async function applyConnectionFeedback(noteId: string, relatedNoteId: string, accepted: boolean): Promise<void> {
+  const { error } = await supabase.rpc('apply_connection_feedback', {
+    p_note_id: noteId,
+    p_related_note_id: relatedNoteId,
+    p_multiplier: accepted ? 1.5 : 0.7,
+    p_feedback: accepted ? 'accepted' : 'rejected',
+  });
+  if (error) throw error;
 }
 
 export async function getQuestions(): Promise<Question[]> {

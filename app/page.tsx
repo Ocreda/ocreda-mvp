@@ -10,24 +10,21 @@ import {
   X,
   Plus,
   Loader as Loader2,
-  Sparkles,
-  LockKeyhole,
-  Paperclip,
   Mic,
   Bold as BoldIcon,
   Italic as ItalicIcon,
   List,
-  Lightbulb,
-  Save,
+  ListOrdered,
   MessageCircle,
   SquarePlus,
-  House,
   ChevronRight,
   Search,
   Clock3,
   Brain,
   FileText,
   ArrowRight,
+  ArrowLeft,
+  Save,
   ThumbsUp,
   ThumbsDown,
   ExternalLink,
@@ -39,6 +36,10 @@ import { Note, Question, ConversationMessage } from '@/lib/types';
 import {
   handleMessage,
   createNote,
+  getGuidedChatReaction,
+  extractGuidedNotes,
+  GuidedNoteDraft,
+  applyConnectionFeedback,
   processNote,
   getNotes,
   getQuestions,
@@ -93,6 +94,8 @@ type RelatedNote = {
   id: string;
   related_note_id: string;
   reason: string | null;
+  confidence?: number;
+  weight?: number;
   related_note: { id: string; summary: string | null; raw_text: string };
 };
 
@@ -107,6 +110,25 @@ type ChatState = {
   questionId: string;
   messages: DisplayMsg[];
   sourceIds: string[];
+};
+
+const GUIDED_QUESTIONS = [
+  "What's been taking up space in your head lately?",
+  "What's something you've gotten unreasonably into lately, and why that?",
+  "Last one. What's something you thought was true a year ago that you'd argue against now?",
+];
+
+type GuidedDraft = GuidedNoteDraft & { id: string; selected: boolean; editing: boolean };
+type ConnectionCandidate = { note: Note; relation: RelatedNote };
+type SpeechRecognitionLike = {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  start: () => void;
+  stop: () => void;
+  onresult: ((event: { results: ArrayLike<{ 0: { transcript: string } }> }) => void) | null;
+  onerror: (() => void) | null;
+  onend: (() => void) | null;
 };
 
 /* ────────────────────────── logo divider ────────────────────────── */
@@ -307,17 +329,36 @@ export default function OcredaHome() {
 
   // composers
   const [addValue, setAddValue] = useState('');
+  const [addTitle, setAddTitle] = useState('');
   const [addOpen, setAddOpen] = useState(false);
+  const [firstNoteWarningShown, setFirstNoteWarningShown] = useState(false);
   const [savedOpen, setSavedOpen] = useState(false);
-  const [focusComposer, setFocusComposer] = useState(false);
+  const [savedExiting, setSavedExiting] = useState(false);
+  const [launchGuidedAfterSave, setLaunchGuidedAfterSave] = useState(false);
+  const [guidedOpen, setGuidedOpen] = useState(false);
+  const [guidedStep, setGuidedStep] = useState(0);
+  const [guidedValue, setGuidedValue] = useState('');
+  const [guidedMessages, setGuidedMessages] = useState<Array<{ answer: string; response: string }>>([]);
+  const [guidedDrafts, setGuidedDrafts] = useState<GuidedDraft[]>([]);
+  const [guidedBusy, setGuidedBusy] = useState(false);
+  const [guidedError, setGuidedError] = useState('');
+  const [connectionQueue, setConnectionQueue] = useState<ConnectionCandidate[]>([]);
+  const [connectionIndex, setConnectionIndex] = useState(0);
   const addTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const addTitleRef = useRef<HTMLInputElement>(null);
+  const addFileRef = useRef<HTMLInputElement>(null);
+  const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
+  const [dictating, setDictating] = useState(false);
   const [askValue, setAskValue] = useState('');
   const [composerValue, setComposerValue] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
+  const [chatHistoryOpen, setChatHistoryOpen] = useState(false);
+  const [chatHistoryLoading, setChatHistoryLoading] = useState(false);
   const [connectionsCount, setConnectionsCount] = useState(0);
+  const [chatAnchor, setChatAnchor] = useState<Note | null>(null);
   const recentSectionRef = useRef<HTMLElement>(null);
 
   // note inline edit
@@ -341,6 +382,31 @@ export default function OcredaHome() {
   useEffect(() => {
     load();
   }, [load]);
+
+  useEffect(() => {
+    const useNote = (event: Event) => {
+      const detail = (event as CustomEvent<{ note?: Note }>).detail;
+      if (!detail?.note) return;
+      setChatAnchor(detail.note);
+      setActive(null);
+      setChat(null);
+      setComposerValue('');
+      setError('');
+    };
+    const openAdd = () => { setError(''); setAddOpen(true); };
+    window.addEventListener('use-note-in-chat', useNote);
+    window.addEventListener('open-add-note', openAdd);
+    return () => {
+      window.removeEventListener('use-note-in-chat', useNote);
+      window.removeEventListener('open-add-note', openAdd);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!user || loading) return;
+    const status = localStorage.getItem(`ocreda-guided-chat:${user.id}`);
+    if (status === 'pending' && notes.length > 0) setGuidedOpen(true);
+  }, [user, loading, notes.length]);
 
   useEffect(() => {
     if (loading || notes.length === 0) {
@@ -422,6 +488,23 @@ export default function OcredaHome() {
     }
   };
 
+  const openChatHistory = async () => {
+    setChatHistoryOpen(true);
+    setChatHistoryLoading(true);
+    try {
+      setQuestions(await getQuestions());
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to load chat history');
+    } finally {
+      setChatHistoryLoading(false);
+    }
+  };
+
+  const openPreviousChat = async (question: Question) => {
+    setChatHistoryOpen(false);
+    await selectChat(question);
+  };
+
   /* ── submit: add-a-note / ask / follow-up ── */
   const runHandleMessage = async (text: string): Promise<'note' | 'question' | null> => {
     setError('');
@@ -486,13 +569,23 @@ export default function OcredaHome() {
     const text = composerValue.trim();
     if (!text || busy) return;
     setComposerValue('');
+    setChatAnchor(null);
     if (active?.kind === 'chat') sendFollowup(text);
     else runHandleMessage(text);
   };
 
   const submitAdd = async () => {
-    const text = addValue.trim();
-    if (!text || busy) return;
+    const title = addTitle.trim();
+    const body = addValue.trim();
+    if (!title || busy) return;
+    const text = body ? `${title}\n\n${body}` : title;
+    const wordCount = text.split(/\s+/).filter(Boolean).length;
+    if (notes.length === 0 && wordCount < 25 && !firstNoteWarningShown) {
+      setFirstNoteWarningShown(true);
+      setError('Add a bit more so we have something to work with.');
+      return;
+    }
+    const isFirstNote = notes.length === 0;
     setError('');
     setBusy(true);
     try {
@@ -500,15 +593,152 @@ export default function OcredaHome() {
       setNotes((prev) => [note, ...prev]);
       setChat(null);
       setActive({ kind: 'note', id: note.id });
+      setAddTitle('');
       setAddValue('');
       setAddOpen(false);
       setSavedOpen(true);
+      if (isFirstNote && user) {
+        localStorage.setItem(`ocreda-guided-chat:${user.id}`, 'pending');
+        setLaunchGuidedAfterSave(true);
+      }
       processNote(note.id).catch(() => {});
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to save note');
     } finally {
       setBusy(false);
     }
+  };
+
+  useEffect(() => {
+    if (addOpen) {
+      setFirstNoteWarningShown(false);
+      setError('');
+      requestAnimationFrame(() => addTitleRef.current?.focus());
+    }
+  }, [addOpen]);
+
+  useEffect(() => {
+    if (!savedOpen) return;
+    setSavedExiting(false);
+    const exitTimer = window.setTimeout(() => setSavedExiting(true), 1400);
+    const closeTimer = window.setTimeout(() => {
+      setSavedOpen(false);
+      if (launchGuidedAfterSave) {
+        setGuidedOpen(true);
+        setLaunchGuidedAfterSave(false);
+      }
+    }, 1900);
+    return () => {
+      window.clearTimeout(exitTimer);
+      window.clearTimeout(closeTimer);
+    };
+  }, [savedOpen, launchGuidedAfterSave]);
+
+  const closeGuidedChat = () => {
+    if (user) localStorage.setItem(`ocreda-guided-chat:${user.id}`, 'complete');
+    setGuidedOpen(false);
+    setGuidedError('');
+  };
+
+  const submitGuidedAnswer = async () => {
+    const answer = guidedValue.trim();
+    if (!answer || guidedBusy) return;
+    if (guidedStep < 2 && answer.split(/\s+/).filter(Boolean).length < 15) {
+      setGuidedError('Say a bit more about that one.');
+      return;
+    }
+    setGuidedError('');
+    setGuidedBusy(true);
+    const nextQuestion = GUIDED_QUESTIONS[guidedStep + 1];
+    try {
+      if (!nextQuestion) {
+        const allAnswers = [...guidedMessages.map((message) => message.answer), answer];
+        let finalResponse = "That's the real one. Give me a second.";
+        try {
+          finalResponse = await getGuidedChatReaction(answer, 'Give me a second.');
+        } catch {
+          // Keep the intentionally restrained fallback copy.
+        }
+        let drafts: GuidedNoteDraft[];
+        try {
+          drafts = await extractGuidedNotes(allAnswers);
+        } catch {
+          drafts = allAnswers.map((sourceAnswer, index) => ({
+            title: sourceAnswer.split(/\s+/).slice(0, 6).join(' '),
+            body: sourceAnswer,
+            source_answer: index + 1,
+          }));
+        }
+        setGuidedMessages((prev) => [...prev, { answer, response: finalResponse }]);
+        setGuidedStep(3);
+        setGuidedValue('');
+        setGuidedDrafts(drafts.map((draft, index) => ({ ...draft, id: `guided-${index}`, selected: true, editing: false })));
+        return;
+      }
+      let response: string;
+      try {
+        response = await getGuidedChatReaction(answer, nextQuestion);
+      } catch {
+        const words = answer.replace(/[.!?]+$/, '').split(/\s+/).slice(0, 7).join(' ').toLowerCase();
+        response = `${words ? `It sounds like ${words}. ` : ''}${nextQuestion}`;
+      }
+      setGuidedMessages((prev) => [...prev, { answer, response }]);
+      setGuidedStep((step) => step + 1);
+      setGuidedValue('');
+    } finally {
+      setGuidedBusy(false);
+    }
+  };
+
+  const saveGuidedDrafts = async () => {
+    const selected = guidedDrafts.filter((draft) => draft.selected);
+    if (selected.length === 0 || guidedBusy) return;
+    setGuidedBusy(true);
+    setGuidedError('');
+    try {
+      const created = await Promise.all(selected.map((draft) => createNote(`${draft.title.trim()}\n\n${draft.body.trim()}`)));
+      setNotes((prev) => [...[...created].reverse(), ...prev]);
+      await Promise.all(created.map((note) => processNote(note.id).catch(() => ({ relations_count: 0 }))));
+      const relationGroups = await Promise.all(created.map(async (note) => ({ note, relations: await getNoteRelations(note.id).catch(() => []) })));
+      const seen = new Set<string>();
+      const candidates: ConnectionCandidate[] = [];
+      for (const group of relationGroups) {
+        for (const relation of group.relations) {
+          const pairKey = [group.note.id, relation.related_note_id].sort().join(':');
+          if (!seen.has(pairKey)) {
+            seen.add(pairKey);
+            candidates.push({ note: group.note, relation });
+          }
+        }
+      }
+      closeGuidedChat();
+      if (candidates.length > 0) {
+        setConnectionQueue(candidates.slice(0, 3));
+        setConnectionIndex(0);
+      } else if (created[0]) {
+        requestAnimationFrame(() => openNotePopup(created[0].id));
+      }
+    } catch (err) {
+      setGuidedError(err instanceof Error ? err.message : 'Failed to add notes');
+    } finally {
+      setGuidedBusy(false);
+    }
+  };
+
+  const handleConnectionDecision = async (accepted: boolean) => {
+    const candidate = connectionQueue[connectionIndex];
+    if (!candidate) return;
+    applyConnectionFeedback(candidate.note.id, candidate.relation.related_note_id, accepted).catch(() => {});
+    if (connectionIndex < connectionQueue.length - 1) {
+      setConnectionIndex((index) => index + 1);
+      return;
+    }
+    const noteId = connectionQueue[0]?.note.id;
+    setConnectionQueue([]);
+    setConnectionIndex(0);
+    if (noteId) requestAnimationFrame(() => {
+      window.dispatchEvent(new CustomEvent('open-note-popup', { detail: { noteId, hideConnections: !accepted } }));
+    });
   };
 
   const formatAddText = (prefix: string, suffix = prefix) => {
@@ -525,15 +755,89 @@ export default function OcredaHome() {
     });
   };
 
-  const formatAddList = () => {
+  const formatAddList = (ordered = false) => {
     const textarea = addTextareaRef.current;
     if (!textarea) return;
     const start = textarea.selectionStart;
     const end = textarea.selectionEnd;
     const selected = addValue.slice(start, end) || 'List item';
-    const formatted = selected.split('\n').map((line) => `- ${line}`).join('\n');
+    const formatted = selected.split('\n').map((line, index) => `${ordered ? `${index + 1}.` : '-'} ${line}`).join('\n');
     setAddValue(`${addValue.slice(0, start)}${formatted}${addValue.slice(end)}`);
-    requestAnimationFrame(() => textarea.focus());
+    requestAnimationFrame(() => {
+      textarea.focus();
+      textarea.setSelectionRange(start, start + formatted.length);
+    });
+  };
+
+  const formatAddBody = () => {
+    const textarea = addTextareaRef.current;
+    if (!textarea) return;
+    const cursor = textarea.selectionStart;
+    const lineStart = addValue.lastIndexOf('\n', Math.max(0, cursor - 1)) + 1;
+    const lineEndIndex = addValue.indexOf('\n', cursor);
+    const lineEnd = lineEndIndex === -1 ? addValue.length : lineEndIndex;
+    const line = addValue.slice(lineStart, lineEnd);
+    const plainLine = line.replace(/^#{1,3}\s+/, '');
+    setAddValue(`${addValue.slice(0, lineStart)}${plainLine}${addValue.slice(lineEnd)}`);
+    requestAnimationFrame(() => {
+      textarea.focus();
+      const removed = line.length - plainLine.length;
+      textarea.setSelectionRange(Math.max(lineStart, cursor - removed), Math.max(lineStart, cursor - removed));
+    });
+  };
+
+  const importAddFile = (file: File | undefined) => {
+    if (!file) return;
+    if (file.size > 2_000_000) {
+      setError('Please choose a text file smaller than 2 MB.');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      const content = typeof reader.result === 'string' ? reader.result.trim() : '';
+      if (!content) {
+        setError('That file does not contain readable text.');
+        return;
+      }
+      setAddValue((current) => `${current}${current.trim() ? '\n\n' : ''}${content}`);
+      setError('');
+      requestAnimationFrame(() => addTextareaRef.current?.focus());
+    };
+    reader.onerror = () => setError('Unable to read that file.');
+    reader.readAsText(file);
+  };
+
+  const toggleAddDictation = () => {
+    if (dictating) {
+      speechRecognitionRef.current?.stop();
+      return;
+    }
+    const speechWindow = window as Window & {
+      SpeechRecognition?: new () => SpeechRecognitionLike;
+      webkitSpeechRecognition?: new () => SpeechRecognitionLike;
+    };
+    const Recognition = speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
+    if (!Recognition) {
+      setError('Voice dictation is not supported in this browser. Try Chrome or Safari.');
+      return;
+    }
+    const recognition = new Recognition();
+    recognition.lang = navigator.language || 'en-US';
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.onresult = (event) => {
+      const transcript = event.results[0]?.[0]?.transcript?.trim();
+      if (transcript) setAddValue((current) => `${current}${current.trim() ? ' ' : ''}${transcript}`);
+    };
+    recognition.onerror = () => setError('Voice dictation could not start. Please check microphone permission.');
+    recognition.onend = () => {
+      setDictating(false);
+      speechRecognitionRef.current = null;
+    };
+    speechRecognitionRef.current = recognition;
+    setError('');
+    setDictating(true);
+    recognition.start();
   };
 
   const submitAsk = () => {
@@ -625,7 +929,7 @@ export default function OcredaHome() {
     <div className="min-h-screen bg-background text-foreground">
       {addOpen && (
         <div
-          className="fixed inset-0 z-[70] overflow-y-auto bg-background p-3 sm:p-5 lg:p-6"
+          className="fixed inset-0 z-[70] flex items-end justify-center bg-black/45 backdrop-blur-sm sm:items-center sm:p-6"
           role="dialog"
           aria-modal="true"
           aria-labelledby="add-note-title"
@@ -633,165 +937,162 @@ export default function OcredaHome() {
             if (e.key === 'Escape' && !busy) setAddOpen(false);
           }}
         >
-          <div className="animate-ocreda-fade-in mx-auto flex min-h-[calc(100vh-1.5rem)] max-w-[1500px] flex-col overflow-hidden rounded-3xl border border-border/60 bg-card shadow-sm sm:min-h-[calc(100vh-2.5rem)] lg:h-[calc(100vh-3rem)] lg:min-h-0">
-            <header className="flex h-[76px] shrink-0 items-center justify-between gap-4 border-b border-border/60 px-5 sm:h-[84px] sm:px-8">
+          <button type="button" aria-label="Close note editor" className="absolute inset-0" onClick={() => !busy && setAddOpen(false)} />
+          <div className="animate-ocreda-fade-up relative flex h-[88vh] w-full max-w-[1100px] flex-col overflow-hidden rounded-t-2xl border border-border/70 bg-card shadow-2xl sm:h-[640px] sm:rounded-2xl">
+            <div className="flex min-h-0 flex-1 flex-col px-6 pb-5 pt-10 sm:px-14 sm:pb-4 sm:pt-12">
+              <label id="add-note-title" htmlFor="new-note-title" className="sr-only">Note title</label>
+              <input
+                id="new-note-title"
+                ref={addTitleRef}
+                value={addTitle}
+                onChange={(e) => setAddTitle(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    addTextareaRef.current?.focus();
+                  }
+                }}
+                placeholder="What's on your mind?"
+                className="w-full bg-transparent text-xl font-medium italic text-foreground placeholder:text-foreground focus:outline-none sm:text-2xl"
+              />
+              <p className="mt-1 max-w-xl text-sm italic leading-relaxed text-muted-foreground">
+                Anything. Something you read, something you&apos;re stuck on, something<br className="hidden sm:block" /> you keep thinking about.
+              </p>
+              <textarea
+                id="new-note"
+                ref={addTextareaRef}
+                value={addValue}
+                onChange={(e) => setAddValue(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                    e.preventDefault();
+                    submitAdd();
+                  }
+                }}
+                placeholder="For example: Someone made the point that we mostly don't choose our beliefs, we absorb them and backfill reasons after. Uncomfortable but I can't argue with it. Makes me wonder how much of what I think is actually mine."
+                className="mt-7 min-h-[220px] flex-1 resize-none bg-transparent text-sm leading-relaxed text-foreground placeholder:text-muted-foreground/35 focus:outline-none sm:mt-8"
+              />
+              {error && <p className="mt-2 text-sm font-medium text-destructive">{error}</p>}
+            </div>
+
+            <div className="flex min-h-[54px] shrink-0 items-center gap-1 overflow-x-auto border-t border-border/70 bg-muted/25 px-3 py-2 text-sm sm:gap-2 sm:px-5">
+              <input ref={addFileRef} type="file" accept=".txt,.md,.markdown,text/plain,text/markdown" className="hidden" onChange={(event) => { importAddFile(event.target.files?.[0]); event.target.value = ''; }} />
+              <button type="button" onClick={() => addFileRef.current?.click()} title="Import a text or Markdown file" aria-label="Attach a file" className="shrink-0 rounded-md p-2 text-muted-foreground hover:bg-accent hover:text-foreground"><Plus className="h-5 w-5" /></button>
+              <button type="button" onClick={toggleAddDictation} title={dictating ? 'Stop voice dictation' : 'Start voice dictation'} aria-label={dictating ? 'Stop voice dictation' : 'Record audio'} className={`shrink-0 rounded-md p-2 transition-colors ${dictating ? 'bg-destructive/10 text-destructive' : 'text-muted-foreground hover:bg-accent hover:text-foreground'}`}><Mic className={`h-4 w-4 ${dictating ? 'animate-pulse' : ''}`} /></button>
+              <span className="mx-1 h-7 w-px shrink-0 bg-border" />
+              <button type="button" onClick={() => formatAddText('**')} aria-label="Bold" className="shrink-0 rounded-md p-2 text-muted-foreground hover:bg-accent hover:text-foreground"><BoldIcon className="h-4 w-4" /></button>
+              <button type="button" onClick={() => formatAddText('*')} aria-label="Italic" className="shrink-0 rounded-md p-2 text-muted-foreground hover:bg-accent hover:text-foreground"><ItalicIcon className="h-4 w-4" /></button>
+              <span className="mx-1 h-7 w-px shrink-0 bg-border" />
+              <button type="button" onClick={() => formatAddText('# ', '')} className="shrink-0 rounded-md px-2 py-1.5 font-semibold text-muted-foreground hover:bg-accent hover:text-foreground">H1</button>
+              <button type="button" onClick={() => formatAddText('## ', '')} className="shrink-0 rounded-md px-2 py-1.5 font-semibold text-muted-foreground hover:bg-accent hover:text-foreground">H2</button>
+              <button type="button" onClick={() => formatAddText('### ', '')} className="shrink-0 rounded-md px-2 py-1.5 font-semibold text-muted-foreground hover:bg-accent hover:text-foreground">H3</button>
+              <button type="button" onClick={formatAddBody} className="shrink-0 rounded-md px-2 py-1.5 text-muted-foreground hover:bg-accent hover:text-foreground">Body</button>
+              <span className="mx-1 h-7 w-px shrink-0 bg-border" />
+              <button type="button" onClick={() => formatAddList(false)} className="inline-flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1.5 text-muted-foreground hover:bg-accent hover:text-foreground"><List className="h-4 w-4" /> Bullet list</button>
+              <button type="button" onClick={() => formatAddList(true)} className="inline-flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1.5 text-muted-foreground hover:bg-accent hover:text-foreground"><ListOrdered className="h-4 w-4" /> Numbered list</button>
               <button
                 type="button"
-                onClick={() => !busy && setAddOpen(false)}
-                disabled={busy}
-                aria-label="Return to Ocreda"
-                className="flex items-center gap-3 disabled:opacity-50"
+                onClick={submitAdd}
+                disabled={!addTitle.trim() || busy}
+                className="ml-auto inline-flex min-w-[126px] shrink-0 items-center justify-center rounded-md bg-primary px-6 py-2 text-sm font-medium text-primary-foreground shadow-sm transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-40"
               >
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src="/ocreda-logo.png" alt="" className="h-9 w-9 object-contain" />
-                <span className="text-xl font-bold tracking-tight sm:text-2xl">Ocreda</span>
+                {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Save'}
               </button>
-              <div className="flex items-center gap-3 sm:gap-7">
-                <span className="hidden rounded-md border border-primary/20 bg-primary/10 px-3 py-1 text-xs font-semibold text-primary sm:inline-flex">Beta</span>
-                <a href="mailto:feedback@ocreda.com" className="hidden text-sm font-medium text-muted-foreground transition-colors hover:text-foreground sm:inline">
-                  Send feedback
-                </a>
-                <AvatarButton embedded />
-              </div>
-            </header>
-
-            <main className="flex min-h-0 flex-1 flex-col px-5 py-8 sm:px-8 sm:py-10">
-              <div className="mx-auto flex min-h-0 w-full max-w-5xl flex-1 flex-col">
-                <div className="mb-5 flex items-center justify-between gap-4">
-                  <h1 id="add-note-title" className="text-xl font-bold tracking-tight sm:text-2xl">Add a note</h1>
-                  <button
-                    type="button"
-                    onClick={() => setAddOpen(false)}
-                    disabled={busy}
-                    aria-label="Close editor"
-                    className="rounded-lg p-2 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-40"
-                  >
-                    <X className="h-5 w-5" />
-                  </button>
-                </div>
-
-                <section className="flex min-h-[430px] flex-1 flex-col overflow-hidden rounded-2xl border border-border bg-background/20 shadow-sm">
-                  <div className="flex min-h-0 flex-1 flex-col px-5 py-7 sm:px-8 sm:py-9">
-                    <label htmlFor="new-note" className="text-xl font-medium text-muted-foreground sm:text-2xl">What&apos;s on your mind?</label>
-                    <textarea
-                      id="new-note"
-                      ref={addTextareaRef}
-                      autoFocus
-                      value={addValue}
-                      onChange={(e) => setAddValue(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-                          e.preventDefault();
-                          submitAdd();
-                        }
-                      }}
-                      placeholder="Write, paste, or capture something you want to remember..."
-                      className="mt-7 min-h-[220px] flex-1 resize-none bg-transparent text-base leading-relaxed text-foreground placeholder:text-muted-foreground/60 focus:outline-none sm:text-lg"
-                    />
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-1 border-t border-border/70 px-3 py-3 sm:gap-2 sm:px-5">
-                    <button type="button" disabled title="Attachments coming soon" aria-label="Attach a file" className="rounded-lg p-2.5 text-muted-foreground opacity-45"><Paperclip className="h-5 w-5" /></button>
-                    <button type="button" disabled title="Voice capture coming soon" aria-label="Record audio" className="rounded-lg p-2.5 text-muted-foreground opacity-45"><Mic className="h-5 w-5" /></button>
-                    <span className="mx-1 h-8 w-px bg-border" />
-                    <button type="button" onClick={() => formatAddText('**')} aria-label="Bold" className="rounded-lg p-2.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"><BoldIcon className="h-5 w-5" /></button>
-                    <button type="button" onClick={() => formatAddText('*')} aria-label="Italic" className="rounded-lg p-2.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"><ItalicIcon className="h-5 w-5" /></button>
-                    <button type="button" onClick={formatAddList} aria-label="Bulleted list" className="rounded-lg p-2.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"><List className="h-5 w-5" /></button>
-                    <button
-                      type="button"
-                      onClick={submitAdd}
-                      disabled={!addValue.trim() || busy}
-                      className="ml-auto inline-flex items-center justify-center gap-2 rounded-xl bg-primary px-4 py-2.5 text-sm font-semibold text-primary-foreground shadow-sm shadow-primary/20 transition-all hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-40 sm:px-6"
-                    >
-                      {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Save className="h-4 w-4" />}
-                      {busy ? 'Saving…' : 'Save note'}
-                    </button>
-                  </div>
-                </section>
-
-                {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
-                <p className="mt-7 flex items-center gap-2 text-xs text-muted-foreground sm:text-sm">
-                  <Lightbulb className="h-4 w-4" />
-                  Tip: You can ask about this note once it&apos;s saved.
-                </p>
-              </div>
-            </main>
+            </div>
           </div>
         </div>
       )}
 
       {savedOpen && (
-        <div className="fixed inset-0 z-[80] overflow-y-auto bg-background p-3 sm:p-5 lg:p-6" role="dialog" aria-modal="true" aria-labelledby="note-saved-title">
-          <div className="animate-ocreda-fade-in mx-auto flex min-h-[calc(100vh-1.5rem)] max-w-[1500px] flex-col overflow-hidden rounded-3xl border border-border/60 bg-card shadow-sm sm:min-h-[calc(100vh-2.5rem)] lg:h-[calc(100vh-3rem)] lg:min-h-0">
-            <header className="flex h-[76px] shrink-0 items-center justify-between gap-4 border-b border-border/60 px-5 sm:h-[84px] sm:px-8">
-              <div className="flex items-center gap-3">
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src="/ocreda-logo.png" alt="" className="h-9 w-9 object-contain" />
-                <span className="text-xl font-bold tracking-tight sm:text-2xl">Ocreda</span>
+        <div className="fixed inset-0 z-[80] flex items-center justify-center overflow-hidden bg-black/30 px-4 backdrop-blur-[3px]" role="status" aria-live="polite">
+          <div
+            className={`flex h-[220px] w-full max-w-[516px] items-center justify-center rounded-lg bg-[#4779e8] px-6 text-center text-xl font-normal text-white shadow-xl transition-all duration-500 ease-in sm:h-[300px] ${
+              savedExiting ? 'translate-y-[calc(50vh+100%)]' : 'animate-ocreda-fade-up translate-y-0'
+            }`}
+          >
+            Saved to you for you
+          </div>
+        </div>
+      )}
+
+      {guidedOpen && (
+        <GuidedChat
+          displayName={displayName}
+          step={guidedStep}
+          messages={guidedMessages}
+          value={guidedValue}
+          busy={guidedBusy}
+          error={guidedError}
+          drafts={guidedDrafts}
+          onChange={setGuidedValue}
+          onSubmit={submitGuidedAnswer}
+          onSkip={closeGuidedChat}
+          onBack={() => setGuidedOpen(false)}
+          onAddNote={() => setAddOpen(true)}
+          onDraftsChange={setGuidedDrafts}
+          onSaveDrafts={saveGuidedDrafts}
+        />
+      )}
+
+      {connectionQueue[connectionIndex] && (
+        <ConnectionReview
+          candidate={connectionQueue[connectionIndex]}
+          position={connectionIndex + 1}
+          total={connectionQueue.length}
+          onAccept={() => handleConnectionDecision(true)}
+          onReject={() => handleConnectionDecision(false)}
+        />
+      )}
+
+      {chatHistoryOpen && (
+        <div className="fixed inset-0 z-[75] flex justify-end bg-black/35 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="chat-history-title">
+          <button type="button" aria-label="Close chat history" className="absolute inset-0" onClick={() => setChatHistoryOpen(false)} />
+          <aside className="animate-ocreda-fade-up relative flex h-full w-full max-w-[480px] flex-col border-l border-border bg-card shadow-2xl">
+            <header className="flex h-20 shrink-0 items-center border-b border-border px-6">
+              <div>
+                <h2 id="chat-history-title" className="text-xl font-semibold">Chat history</h2>
+                <p className="mt-1 text-sm text-muted-foreground">Continue any previous conversation.</p>
               </div>
-              <div className="flex items-center gap-3 sm:gap-7">
-                <span className="hidden rounded-md border border-primary/20 bg-primary/10 px-3 py-1 text-xs font-semibold text-primary sm:inline-flex">Beta</span>
-                <a href="mailto:feedback@ocreda.com" className="hidden text-sm font-medium text-muted-foreground transition-colors hover:text-foreground sm:inline">Send feedback</a>
-                <AvatarButton embedded />
-              </div>
+              <button type="button" onClick={() => setChatHistoryOpen(false)} aria-label="Close" className="ml-auto rounded-lg p-2 text-muted-foreground hover:bg-accent hover:text-foreground"><X className="h-5 w-5" /></button>
             </header>
 
-            <main className="flex flex-1 flex-col items-center justify-center px-5 py-10 sm:px-8 sm:py-14">
-              <div className="relative flex h-24 w-24 items-center justify-center rounded-full bg-emerald-500/15 text-emerald-500 sm:h-28 sm:w-28">
-                <Check className="h-12 w-12" strokeWidth={2.2} />
-                <span className="absolute -left-10 top-8 h-2 w-2 rotate-45 rounded-sm bg-primary/55" />
-                <span className="absolute -right-9 top-4 h-2 w-2 rotate-45 rounded-sm bg-emerald-400/60" />
-                <span className="absolute -right-12 bottom-6 h-2 w-2 rotate-45 rounded-sm bg-pink-400/60" />
-                <span className="absolute -left-6 -top-5 h-2 w-2 rotate-45 rounded-sm bg-amber-400/60" />
-              </div>
-
-              <h1 id="note-saved-title" className="mt-8 text-3xl font-bold tracking-tight sm:text-4xl">Note saved</h1>
-              <p className="mt-3 text-center text-sm text-muted-foreground sm:text-base">Ocreda will connect this as you add more notes.</p>
-
-              <section className="mt-10 w-full max-w-2xl rounded-2xl border border-border bg-background/20 p-5 shadow-sm sm:mt-12 sm:p-7">
-                <h2 className="text-lg font-semibold">What&apos;s next?</h2>
-                <div className="mt-5 space-y-3">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSavedOpen(false);
-                      setFocusComposer(true);
-                    }}
-                    className="group flex w-full items-center gap-4 rounded-xl border border-border bg-card px-4 py-4 text-left transition-colors hover:border-primary/35 hover:bg-accent/40"
-                  >
-                    <MessageCircle className="h-5 w-5 text-primary" />
-                    <span className="flex-1 text-sm font-medium sm:text-base">Ask about this note</span>
-                    <ChevronRight className="h-5 w-5 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSavedOpen(false);
-                      setFocusComposer(false);
-                      setAddOpen(true);
-                    }}
-                    className="group flex w-full items-center gap-4 rounded-xl border border-border bg-card px-4 py-4 text-left transition-colors hover:border-primary/35 hover:bg-accent/40"
-                  >
-                    <SquarePlus className="h-5 w-5 text-primary" />
-                    <span className="flex-1 text-sm font-medium sm:text-base">Add another note</span>
-                    <ChevronRight className="h-5 w-5 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setSavedOpen(false);
-                      setFocusComposer(false);
-                    }}
-                    className="group flex w-full items-center gap-4 rounded-xl border border-border bg-card px-4 py-4 text-left transition-colors hover:border-primary/35 hover:bg-accent/40"
-                  >
-                    <House className="h-5 w-5 text-primary" />
-                    <span className="flex-1 text-sm font-medium sm:text-base">Go to home</span>
-                    <ChevronRight className="h-5 w-5 text-muted-foreground transition-transform group-hover:translate-x-0.5" />
-                  </button>
+            <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
+              {chatHistoryLoading ? (
+                <div className="flex h-40 items-center justify-center"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
+              ) : questions.length === 0 ? (
+                <div className="flex h-56 flex-col items-center justify-center rounded-2xl border border-dashed border-border px-8 text-center">
+                  <MessageCircle className="h-7 w-7 text-muted-foreground" />
+                  <p className="mt-4 font-medium">No previous chats yet</p>
+                  <p className="mt-2 text-sm text-muted-foreground">Ask your first question and it will appear here.</p>
+                  <button type="button" onClick={() => setChatHistoryOpen(false)} className="mt-5 rounded-lg bg-primary px-4 py-2 text-sm text-primary-foreground">Start a chat</button>
                 </div>
-              </section>
-            </main>
-          </div>
+              ) : (
+                <div className="space-y-3">
+                  {questions.map((question) => (
+                    <article key={question.id} className="group relative rounded-2xl border border-border bg-background/30 transition-colors hover:border-primary/35 hover:bg-accent/20">
+                      <button type="button" onClick={() => openPreviousChat(question)} className="block w-full px-5 py-4 pr-12 text-left">
+                        <h3 className="line-clamp-2 font-semibold leading-snug">{question.question}</h3>
+                        {question.answer && <p className="mt-2 line-clamp-2 text-sm leading-relaxed text-muted-foreground">{question.answer}</p>}
+                        <p className="mt-3 text-xs text-muted-foreground/70">{relTime(question.created_at)}</p>
+                      </button>
+                      <button
+                        type="button"
+                        aria-label="Delete conversation"
+                        title="Delete conversation"
+                        onClick={async () => {
+                          if (!window.confirm('Delete this conversation?')) return;
+                          await removeChat(question.id);
+                        }}
+                        className="absolute right-3 top-3 rounded-lg p-2 text-muted-foreground opacity-70 hover:bg-destructive/10 hover:text-destructive sm:opacity-0 sm:group-hover:opacity-100"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </button>
+                    </article>
+                  ))}
+                </div>
+              )}
+            </div>
+          </aside>
         </div>
       )}
 
@@ -803,49 +1104,28 @@ export default function OcredaHome() {
             </div>
           ) : isEmpty ? (
             /* ───────────── STATE 1 — first-time user ───────────── */
-            <div className="animate-ocreda-fade-in h-full min-h-[calc(100vh-1.5rem)] sm:min-h-[calc(100vh-2.5rem)] lg:min-h-0 flex flex-col bg-card">
-              <header className="h-[76px] sm:h-[84px] shrink-0 flex items-center justify-between gap-4 border-b border-border/60 px-5 sm:px-8">
-                <div className="flex items-center gap-3">
+            <div className="animate-ocreda-fade-in relative flex h-full min-h-[calc(100vh-1.5rem)] flex-col bg-card sm:min-h-[calc(100vh-2.5rem)] lg:min-h-0">
+              <div className="absolute right-5 top-5 z-10 flex items-center gap-5 sm:right-8 sm:top-6">
+                <span className="rounded-md border border-primary/20 bg-primary/10 px-4 py-1.5 text-xs font-medium text-primary">Beta</span>
+                <AvatarButton embedded />
+              </div>
+
+              <main className="flex flex-1 flex-col items-center px-5 pb-8 pt-28 sm:px-8 sm:pb-10 sm:pt-32">
+                <div className="flex items-center justify-center gap-3 text-center">
                   {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src="/ocreda-logo.png" alt="" className="h-9 w-9 object-contain" />
-                  <span className="text-xl sm:text-2xl font-bold tracking-tight">Ocreda</span>
+                  <img src="/ocreda-logo.png" alt="" className="h-8 w-8 shrink-0 object-contain sm:h-9 sm:w-9" />
+                  <h1 className="text-2xl font-medium tracking-tight sm:text-3xl">
+                    Welcome to Ocreda{displayName ? `, ${displayName.split(/\s+/)[0]}` : ''}
+                  </h1>
                 </div>
-                <div className="flex items-center gap-3 sm:gap-7">
-                  <span className="hidden sm:inline-flex rounded-md border border-primary/20 bg-primary/10 px-3 py-1 text-xs font-semibold text-primary">Beta</span>
-                  <a
-                    href="mailto:feedback@ocreda.com"
-                    className="hidden sm:inline text-sm font-medium text-muted-foreground hover:text-foreground transition-colors"
-                  >
-                    Send feedback
-                  </a>
-                  <AvatarButton embedded />
-                </div>
-              </header>
-
-              <main className="flex flex-1 flex-col items-center px-5 pb-7 pt-10 sm:px-8 sm:pb-10 sm:pt-14">
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src="/ocreda-logo.png" alt="Ocreda" className="h-14 w-14 object-contain" />
-
-                <h1 className="mt-7 text-center text-3xl font-bold tracking-tight sm:text-4xl">
-                  Welcome to Ocreda{displayName ? `, ${displayName.split(/\s+/)[0]}` : ''}
-                </h1>
                 <p className="mt-3 text-center text-sm text-muted-foreground sm:text-base">
-                  Write notes. Ask questions. Ocreda connects them on its own.
+                  Write notes. Ask questions. Ocreda connects them on its own
                 </p>
 
-                <section className="mt-10 w-full max-w-2xl rounded-2xl border border-border bg-background/25 p-5 shadow-sm sm:mt-14 sm:p-8">
-                  <div className="flex items-start gap-4 sm:gap-5">
-                    <div className="flex h-14 w-14 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary sm:h-16 sm:w-16">
-                      <Sparkles className="h-7 w-7" strokeWidth={1.8} />
-                    </div>
-                    <div className="pt-1">
-                      <h2 className="text-lg font-semibold sm:text-xl">Start with one thought.</h2>
-                      <p className="mt-2 text-sm leading-relaxed text-muted-foreground sm:text-base">
-                        Ocreda will connect it to what you add next.
-                      </p>
-                    </div>
-                  </div>
-
+                <section className="mt-20 flex min-h-[230px] w-full max-w-[630px] flex-col items-center justify-center rounded-2xl bg-muted/45 px-6 py-10 sm:px-10">
+                  <h2 className="text-center text-base font-semibold sm:text-lg">
+                    Add one note to start. Connections appear as you use them.
+                  </h2>
                   <button
                     type="button"
                     onClick={() => {
@@ -853,45 +1133,34 @@ export default function OcredaHome() {
                       setAddOpen(true);
                     }}
                     disabled={busy}
-                    className="mt-7 flex w-full items-center justify-center rounded-xl bg-primary px-5 py-3.5 text-base font-semibold text-primary-foreground shadow-sm shadow-primary/25 hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-primary/40 focus:ring-offset-2 focus:ring-offset-card disabled:opacity-50 transition-all sm:ml-[84px] sm:w-[calc(100%-84px)]"
+                    className="mt-12 flex w-full max-w-[210px] items-center justify-center rounded-md bg-primary px-5 py-3 text-sm font-medium text-primary-foreground shadow-sm shadow-primary/20 transition-colors hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-primary/40 focus:ring-offset-2 focus:ring-offset-card disabled:opacity-50"
                   >
-                    Add your first note
+                    Add a note
                   </button>
                 </section>
 
-                <div className="mt-auto flex items-center gap-2 pt-12 text-xs text-muted-foreground sm:text-sm">
-                  <LockKeyhole className="h-4 w-4" />
-                  <span>Private by default. Your notes belong to you.</span>
-                </div>
+                <p className="mt-auto pt-12 text-center text-xs text-muted-foreground sm:text-sm">
+                  Your notes are private and secured. Nobody can touch them.
+                </p>
                 {error && <p className="mt-4 text-sm text-destructive">{error}</p>}
               </main>
             </div>
           ) : (
             /* ───────────── STATE 2 — existing-user home ───────────── */
-            <div className="animate-ocreda-fade-in flex h-full min-h-[calc(100vh-1.5rem)] flex-col bg-card sm:min-h-[calc(100vh-2.5rem)] lg:min-h-0">
-              <header className="flex min-h-[76px] shrink-0 flex-wrap items-center gap-3 border-b border-border/60 px-5 py-3 sm:min-h-[84px] sm:px-8">
-                <button type="button" onClick={() => { setActive(null); setChat(null); setError(''); }} className="mr-auto flex items-center gap-3">
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src="/ocreda-logo.png" alt="" className="h-9 w-9 object-contain" />
-                  <span className="text-xl font-bold tracking-tight sm:text-2xl">Ocreda</span>
-                </button>
-                <nav className="order-3 flex w-full items-center gap-1 overflow-x-auto sm:order-none sm:w-auto sm:gap-2">
-                  <button onClick={() => { setError(''); setAddOpen(true); }} className="inline-flex shrink-0 items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium hover:bg-accent transition-colors">
-                    <SquarePlus className="h-4 w-4 text-primary" /> Add note
-                  </button>
-                  <button onClick={() => { setActive(null); setChat(null); setSearchOpen((open) => !open); }} className="inline-flex shrink-0 items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium hover:bg-accent transition-colors">
-                    <Search className="h-4 w-4" /> Search
-                  </button>
-                  <button onClick={() => { setActive(null); setChat(null); requestAnimationFrame(() => recentSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })); }} className="inline-flex shrink-0 items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium hover:bg-accent transition-colors">
-                    <Clock3 className="h-4 w-4" /> Recent
-                  </button>
-                </nav>
-                <div className="ml-auto flex items-center gap-3 sm:gap-6">
+            <div className="animate-ocreda-fade-in relative flex h-full min-h-[calc(100vh-1.5rem)] flex-col bg-card sm:min-h-[calc(100vh-2.5rem)] lg:min-h-0">
+              <header className="absolute right-5 top-5 z-10 sm:right-7 sm:top-6">
+                <div className="flex items-center gap-3 sm:gap-6">
                   <span className="hidden rounded-md border border-primary/20 bg-primary/10 px-3 py-1 text-xs font-semibold text-primary md:inline-flex">Beta</span>
                   <a href="mailto:feedback@ocreda.com" className="hidden text-sm font-medium text-muted-foreground hover:text-foreground md:inline">Send feedback</a>
                   <AvatarButton embedded />
                 </div>
               </header>
+
+              <nav className="absolute left-5 top-5 z-10 hidden w-36 flex-col items-start gap-2 lg:flex">
+                <button onClick={() => { setError(''); setAddOpen(true); }} className="inline-flex items-center gap-3 rounded-lg px-2 py-2 text-sm hover:bg-accent"><SquarePlus className="h-6 w-6 text-primary" /> Add a note</button>
+                <button onClick={() => { setActive(null); setChat(null); setSearchOpen((open) => !open); }} className="inline-flex items-center gap-3 rounded-lg px-2 py-2 text-sm hover:bg-accent"><Search className="h-6 w-6" /> Search</button>
+                <button onClick={openChatHistory} className="inline-flex items-center gap-3 rounded-lg px-2 py-2 text-sm hover:bg-accent"><Clock3 className="h-5 w-5" /> Chat history</button>
+              </nav>
 
               {active?.kind === 'chat' && chat ? (
                 <AskResultsView
@@ -906,8 +1175,8 @@ export default function OcredaHome() {
                   onOpenNote={openNotePopup}
                 />
               ) : (
-              <main className="flex-1 overflow-y-auto px-5 py-9 scrollbar-thin sm:px-8 lg:px-12">
-                <div className="mx-auto w-full max-w-5xl">
+              <main className="flex-1 overflow-y-auto px-5 pb-20 pt-28 scrollbar-thin sm:px-8 lg:px-12">
+                <div className="mx-auto w-full max-w-[810px]">
                   {searchOpen && (
                     <div className="mb-6 animate-ocreda-fade-up">
                       <label htmlFor="home-search" className="sr-only">Search notes</label>
@@ -924,12 +1193,18 @@ export default function OcredaHome() {
                       <img src="/ocreda-logo.png" alt="" className="h-6 w-6 object-contain" />
                       <h1 className="text-base font-semibold sm:text-lg">Ask yourself anything</h1>
                     </div>
-                    <div className="rounded-2xl border border-primary/25 bg-background/20 p-4 shadow-sm focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10">
+                    {chatAnchor && (
+                      <div className="mb-4 rounded-xl border border-primary/25 bg-primary/[0.04] px-5 py-4 text-sm">
+                        <strong>I&apos;ve loaded “{noteTitle(chatAnchor)}.”</strong>
+                        <p className="mt-1 text-muted-foreground">What would you like to ask about it?</p>
+                      </div>
+                    )}
+                    <div className="rounded-2xl border border-primary/60 bg-muted/20 p-5 shadow-sm focus-within:ring-2 focus-within:ring-primary/10">
                       <textarea
                         value={composerValue}
                         onChange={(e) => setComposerValue(e.target.value)}
                         onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitComposer(); } }}
-                        placeholder="What's on your mind?"
+                        placeholder={chatAnchor ? `Ask about ${noteTitle(chatAnchor)}…` : 'How do people find meaning in uncertainty?'}
                         rows={2}
                         className="w-full resize-none bg-transparent text-base focus:outline-none placeholder:text-muted-foreground/55"
                       />
@@ -948,43 +1223,18 @@ export default function OcredaHome() {
                     {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
                   </section>
 
-                  <section className="mt-8 flex items-center gap-5 rounded-2xl border border-border bg-background/20 p-5 shadow-sm">
-                    <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary"><Brain className="h-6 w-6" /></div>
-                    <div>
-                      <p className="font-semibold"><span>{notes.length} {notes.length === 1 ? 'note' : 'notes'}</span><span className="mx-5 text-muted-foreground">•</span><span>{connectionsCount} {connectionsCount === 1 ? 'connection' : 'connections'}</span></p>
-                      <p className="mt-1 text-sm text-muted-foreground">Your brain is getting smarter every day.</p>
-                    </div>
-                  </section>
-
-                  <div className="mt-10 grid gap-8 md:grid-cols-2 md:gap-12">
-                    <section>
-                      <h2 className="mb-4 text-sm font-semibold sm:text-base">Continue where you left off</h2>
+                  <div className="mt-36">
+                    <section ref={recentSectionRef}>
+                      <h2 className="mb-4 text-sm font-medium text-primary">From your last session</h2>
                       {filteredHomeNotes[0] ? (
-                        <button type="button" onClick={() => openNotePopup(filteredHomeNotes[0].id)} className="group flex min-h-[150px] w-full items-start gap-4 rounded-2xl border border-border bg-background/20 p-5 text-left transition-colors hover:border-primary/35 hover:bg-accent/30">
-                          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary"><FileText className="h-5 w-5" /></span>
-                          <span className="min-w-0 flex-1"><strong className="block truncate text-sm sm:text-base">{noteTitle(filteredHomeNotes[0])}</strong><span className="mt-2 block line-clamp-2 text-sm leading-relaxed text-muted-foreground">{truncate(filteredHomeNotes[0].raw_text, 110)}</span><span className="mt-4 block text-xs text-muted-foreground/70">Edited {relTime(filteredHomeNotes[0].created_at)}</span></span>
-                          <ChevronRight className="mt-3 h-5 w-5 text-muted-foreground group-hover:translate-x-0.5 transition-transform" />
+                        <button type="button" onClick={() => openNotePopup(filteredHomeNotes[0].id)} className="group flex min-h-[140px] w-full items-start rounded-2xl border border-border bg-background/20 p-7 text-left shadow-md transition-colors hover:border-primary/35">
+                          <span className="min-w-0 flex-1"><strong className="block truncate text-lg">{noteTitle(filteredHomeNotes[0])}</strong><span className="mt-3 block line-clamp-2 text-sm leading-relaxed text-muted-foreground">{truncate(filteredHomeNotes[0].raw_text, 180)}</span></span>
                         </button>
                       ) : <p className="rounded-2xl border border-dashed border-border p-6 text-sm text-muted-foreground">No matching notes.</p>}
                     </section>
-
-                    <section ref={recentSectionRef}>
-                      <h2 className="mb-4 text-sm font-semibold sm:text-base">Recently added</h2>
-                      <div className="overflow-hidden rounded-2xl border border-border bg-background/20">
-                        {filteredHomeNotes.slice(0, 2).map((note, index) => (
-                          <button key={note.id} type="button" onClick={() => openNotePopup(note.id)} className={`group flex w-full items-center gap-4 p-5 text-left transition-colors hover:bg-accent/30 ${index > 0 ? 'border-t border-border' : ''}`}>
-                            <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary"><FileText className="h-5 w-5" /></span>
-                            <span className="min-w-0 flex-1"><strong className="block truncate text-sm sm:text-base">{noteTitle(note)}</strong><span className="mt-1 block text-xs text-muted-foreground">{relTime(note.created_at)}</span></span>
-                            <ChevronRight className="h-5 w-5 text-muted-foreground group-hover:translate-x-0.5 transition-transform" />
-                          </button>
-                        ))}
-                        {filteredHomeNotes.length === 0 && <p className="p-6 text-sm text-muted-foreground">No matching notes.</p>}
-                      </div>
-                    </section>
                   </div>
-
-                  <div className="mt-10 text-center">
-                    <Link href="/notes" className="inline-flex items-center gap-2 text-sm font-medium text-muted-foreground hover:text-foreground">View all notes <ArrowRight className="h-4 w-4" /></Link>
+                  <div className="fixed bottom-0 left-1/2 z-10 flex w-[min(650px,80vw)] -translate-x-1/2 justify-center gap-10 rounded-t-full border border-b-0 border-border bg-card px-10 py-4 text-xs text-muted-foreground shadow-sm">
+                    <span>2 Categories</span><span>{notes.length} Notes</span><span>{connectionsCount} Connections</span>
                   </div>
                 </div>
               </main>
@@ -992,6 +1242,247 @@ export default function OcredaHome() {
             </div>
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+/* ────────────────────────── guided connection review ────────────────────────── */
+
+function ConnectionReview({
+  candidate,
+  position,
+  total,
+  onAccept,
+  onReject,
+}: {
+  candidate: ConnectionCandidate;
+  position: number;
+  total: number;
+  onAccept: () => void;
+  onReject: () => void;
+}) {
+  const left = candidate.note;
+  const right = candidate.relation.related_note;
+
+  return (
+    <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/25 p-4 backdrop-blur-[2px]">
+      <section className="animate-ocreda-fade-up flex min-h-[600px] w-full max-w-[1340px] flex-col items-center rounded-[28px] bg-card px-6 py-14 text-foreground shadow-2xl sm:px-12">
+        <p className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Connection {position} of {total}</p>
+        <h1 className="mt-4 text-3xl font-medium tracking-tight sm:text-4xl">Found a connection</h1>
+        <p className="mt-4 max-w-2xl text-center text-base text-primary sm:text-lg">
+          {candidate.relation.reason || 'They are connected because they reveal the same underlying pattern.'}
+        </p>
+
+        <div className="mt-20 flex w-full max-w-[900px] flex-col items-center gap-6 md:flex-row md:justify-between">
+          <ConnectionNoteCard note={left} />
+          <div className="flex shrink-0 items-center gap-3 text-primary">
+            <span className="h-px w-16 bg-primary" />
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img src="/ocreda-logo.png" alt="Connected" className="h-7 w-7 object-contain" />
+            <span className="h-px w-16 bg-primary" />
+          </div>
+          <ConnectionNoteCard note={{ ...left, id: right.id, raw_text: right.raw_text, summary: right.summary }} />
+        </div>
+
+        <p className="mt-20 max-w-3xl text-center text-sm italic leading-relaxed text-muted-foreground">
+          <strong className="text-foreground">Note:</strong> These aren&apos;t based on words in common or tagging. As you use Ocreda, the connections get sharper. This will show you connections you didn&apos;t even expect. Only connections based on how you used Ocreda will be suggested; the rest will be automatically connected.
+        </p>
+
+        <div className="mt-auto flex items-center gap-5 pt-12">
+          <button type="button" onClick={onAccept} className="inline-flex items-center gap-3 text-sm font-medium text-primary">
+            Accept
+            <span className="flex h-11 w-11 items-center justify-center rounded-full bg-primary text-white"><Check className="h-6 w-6" /></span>
+          </button>
+          <button type="button" onClick={onReject} className="inline-flex items-center gap-3 text-sm font-medium text-foreground">
+            <span className="flex h-11 w-11 items-center justify-center rounded-full border border-foreground"><X className="h-6 w-6" /></span>
+            Reject
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ConnectionNoteCard({ note }: { note: Pick<Note, 'id' | 'raw_text' | 'summary'> }) {
+  return (
+    <article className="w-full max-w-[350px] rounded-xl border border-primary bg-card p-6 shadow-md">
+      <h2 className="text-lg font-bold">{note.summary || truncate(firstLine(note.raw_text), 48)}</h2>
+      <p className="mt-3 line-clamp-5 text-sm leading-relaxed text-muted-foreground">{note.raw_text}</p>
+    </article>
+  );
+}
+
+/* ────────────────────────── one-time guided chat ────────────────────────── */
+
+function GuidedChat({
+  displayName,
+  step,
+  messages,
+  value,
+  busy,
+  error,
+  drafts,
+  onChange,
+  onSubmit,
+  onSkip,
+  onBack,
+  onAddNote,
+  onDraftsChange,
+  onSaveDrafts,
+}: {
+  displayName: string;
+  step: number;
+  messages: Array<{ answer: string; response: string }>;
+  value: string;
+  busy: boolean;
+  error: string;
+  drafts: GuidedDraft[];
+  onChange: (value: string) => void;
+  onSubmit: () => void;
+  onSkip: () => void;
+  onBack: () => void;
+  onAddNote: () => void;
+  onDraftsChange: (drafts: GuidedDraft[]) => void;
+  onSaveDrafts: () => void;
+}) {
+  const firstName = displayName.split(/\s+/)[0] || 'there';
+
+  return (
+    <div className="fixed inset-0 z-[60] overflow-hidden bg-[#e8e8e8] p-3 sm:p-5">
+      <div className="flex h-full min-h-0 bg-card text-foreground">
+        <nav className="flex w-[72px] shrink-0 flex-col items-center py-5 sm:w-[86px]">
+          <button type="button" onClick={onBack} aria-label="Back home" className="rounded-lg p-2 text-foreground hover:bg-accent"><ArrowLeft className="h-7 w-7" /></button>
+          <button type="button" onClick={onAddNote} aria-label="Add note" className="mt-5 rounded-md bg-primary p-2 text-primary-foreground"><Plus className="h-5 w-5" /></button>
+          <button type="button" onClick={onBack} aria-label="Search" className="mt-3 rounded-lg p-2 text-foreground hover:bg-accent"><Search className="h-6 w-6" /></button>
+          <button type="button" aria-label="Recent" className="mt-auto rounded-lg p-2 text-foreground hover:bg-accent"><Clock3 className="h-5 w-5" /></button>
+        </nav>
+
+        <div className="flex min-w-0 flex-1 flex-col border-r border-border/50">
+          <div className="flex h-[70px] shrink-0 items-center justify-end px-5 sm:px-7">
+            <div className="inline-flex overflow-hidden rounded-md border border-primary/35 text-sm">
+              <span className="bg-primary/10 px-5 py-1.5 text-primary">Beta</span>
+              <a href="mailto:feedback@ocreda.com" className="px-3 py-1.5 hover:bg-accent">Send feedback</a>
+            </div>
+          </div>
+
+          <main className="min-h-0 flex-1 overflow-y-auto px-5 pb-5 scrollbar-thin sm:px-10 lg:px-16">
+            <div className="mx-auto flex min-h-full max-w-[760px] flex-col">
+              <div className="flex-1 py-8 sm:py-10">
+                {messages.length === 0 ? (
+                  <div className="space-y-7 text-base font-semibold leading-relaxed sm:text-lg">
+                    <p>Hey {firstName}, I am you. This is where you ask your notes anything.</p>
+                    <p>Before that, three quick things about you. It&apos;ll make what comes back actually useful.</p>
+                    <p>{GUIDED_QUESTIONS[0]}</p>
+                  </div>
+                ) : (
+                  <div className="space-y-8">
+                    {messages.map((message, index) => (
+                      <div key={`${index}:${message.answer.slice(0, 12)}`} className="space-y-7">
+                        <div className="ml-auto max-w-[610px] rounded-xl bg-muted/55 px-6 py-5 text-base font-semibold leading-relaxed sm:text-lg">
+                          {message.answer}
+                          <Check className="ml-2 inline h-4 w-4 text-muted-foreground/40" />
+                        </div>
+                        <p className="text-base font-semibold leading-relaxed sm:text-lg">{message.response}</p>
+                      </div>
+                    ))}
+                    {drafts.length > 0 && (
+                      <p className="text-base font-semibold leading-relaxed sm:text-lg">
+                        On the right you can see what we pulled out. You can edit and check the ones you want to save.
+                      </p>
+                    )}
+                  </div>
+                )}
+
+                {drafts.length === 0 && <button type="button" onClick={onSkip} className="mt-10 text-base italic text-muted-foreground underline underline-offset-2 hover:text-foreground">Skip</button>}
+                <div className="mt-9">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img src="/ocreda-logo.png" alt="Ocreda" className="h-9 w-9 object-contain" />
+                </div>
+              </div>
+
+              <div className="shrink-0 rounded-2xl border border-primary bg-muted/25 p-4 shadow-sm">
+                <textarea
+                  autoFocus
+                  disabled={drafts.length > 0}
+                  value={value}
+                  onChange={(e) => onChange(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSubmit(); } }}
+                  placeholder={drafts.length > 0 ? 'Review the notes on the right' : 'Reply to your Ocreda'}
+                  rows={3}
+                  className="w-full resize-none bg-transparent text-sm italic focus:outline-none placeholder:text-muted-foreground/65"
+                />
+                <div className="mt-2 flex items-center gap-2">
+                  <button type="button" onClick={onAddNote} aria-label="Add note" className="rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground"><Plus className="h-5 w-5" /></button>
+                  <button type="button" disabled aria-label="Record audio" title="Voice capture coming soon" className="rounded-md p-1.5 text-muted-foreground opacity-50"><Mic className="h-4 w-4" /></button>
+                  <button type="button" aria-label="Save draft" title="Draft is saved automatically" className="ml-auto rounded-md p-1.5 text-primary"><Save className="h-5 w-5" /></button>
+                  <button type="button" onClick={onSubmit} disabled={!value.trim() || busy || drafts.length > 0} aria-label="Send reply" className="rounded-md bg-primary p-2 text-primary-foreground disabled:opacity-40">
+                    {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUp className="h-4 w-4" />}
+                  </button>
+                </div>
+                {error && <p className="mt-2 text-sm font-medium text-destructive">{error}</p>}
+              </div>
+            </div>
+          </main>
+        </div>
+
+        <aside className="hidden w-[29%] min-w-[300px] shrink-0 p-3 lg:block">
+          <div className="relative flex h-full flex-col overflow-hidden rounded-xl border border-border/35 bg-background/20 shadow-inner">
+            {drafts.length === 0 ? (
+              <div className="flex flex-1 items-center justify-center px-8 text-center text-base text-muted-foreground/45">
+                Retrieved notes will show up here<br />when you ask something.
+              </div>
+            ) : (
+              <div className="flex-1 space-y-4 overflow-y-auto p-3 pb-20 scrollbar-thin">
+                {drafts.map((draft) => (
+                  <article key={draft.id} className={`overflow-hidden rounded-xl border bg-card shadow-sm ${draft.selected ? 'border-primary/25' : 'border-border opacity-60'}`}>
+                    <div className="p-5">
+                      <div className="flex items-start gap-3">
+                        {draft.editing ? (
+                          <input
+                            value={draft.title}
+                            onChange={(e) => onDraftsChange(drafts.map((item) => item.id === draft.id ? { ...item, title: e.target.value } : item))}
+                            className="min-w-0 flex-1 border-b border-primary/30 bg-transparent text-base font-bold focus:outline-none"
+                          />
+                        ) : <h3 className="min-w-0 flex-1 text-base font-bold">{draft.title}</h3>}
+                        <button
+                          type="button"
+                          onClick={() => onDraftsChange(drafts.map((item) => item.id === draft.id ? { ...item, selected: !item.selected } : item))}
+                          aria-label={draft.selected ? 'Reject note' : 'Accept note'}
+                          className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-sm border ${draft.selected ? 'border-primary bg-primary text-white' : 'border-primary/50'}`}
+                        >
+                          {draft.selected && <Check className="h-3.5 w-3.5" />}
+                        </button>
+                      </div>
+                      {draft.editing ? (
+                        <textarea
+                          value={draft.body}
+                          onChange={(e) => onDraftsChange(drafts.map((item) => item.id === draft.id ? { ...item, body: e.target.value } : item))}
+                          rows={4}
+                          className="mt-3 w-full resize-none rounded-md border border-border bg-transparent p-2 text-sm leading-relaxed focus:border-primary/40 focus:outline-none"
+                        />
+                      ) : <p className="mt-3 line-clamp-4 text-sm leading-relaxed text-muted-foreground">{draft.body}</p>}
+                    </div>
+                    <div className="flex border-t border-border/50">
+                      <button type="button" onClick={() => onDraftsChange(drafts.map((item) => item.id === draft.id ? { ...item, editing: !item.editing } : item))} className="flex-1 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-foreground">
+                        {draft.editing ? 'Done' : 'Edit'}
+                      </button>
+                      <button type="button" onClick={() => onDraftsChange(drafts.filter((item) => item.id !== draft.id))} aria-label="Delete draft" className="border-l border-border/50 px-3 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"><Trash2 className="h-4 w-4" /></button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+            {drafts.length > 0 && (
+              <div className="absolute inset-x-0 bottom-0 flex border-t border-border bg-card">
+                <button type="button" onClick={onSaveDrafts} disabled={!drafts.some((draft) => draft.selected) || busy} className="flex-1 bg-primary px-4 py-3 text-sm font-medium text-primary-foreground disabled:opacity-40">
+                  {busy ? 'Adding…' : 'Add notes'}
+                </button>
+                <button type="button" onClick={onSkip} aria-label="Close drafts" className="bg-foreground px-4 text-background"><X className="h-5 w-5" /></button>
+              </div>
+            )}
+          </div>
+        </aside>
       </div>
     </div>
   );
@@ -1023,8 +1514,8 @@ function AskResultsView({
   const sources = chat.sourceIds.map((id) => noteMap[id]).filter(Boolean);
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
-      <main className="min-w-0 flex-1 overflow-y-auto px-5 py-9 scrollbar-thin sm:px-8 lg:px-10">
+    <div className="flex min-h-0 flex-1 flex-col pt-20 lg:flex-row">
+      <main className="min-w-0 flex-1 overflow-y-auto px-5 pb-9 pt-5 scrollbar-thin sm:px-8 lg:pl-[180px] lg:pr-10 lg:pt-6">
         <div className="mx-auto max-w-3xl">
           <div className="flex items-start gap-4">
             <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-primary/25 bg-primary/10 text-primary">
@@ -1089,7 +1580,7 @@ function AskResultsView({
         </div>
       </main>
 
-      <aside className="shrink-0 border-t border-border/60 bg-background/15 p-5 lg:w-[340px] lg:overflow-y-auto lg:border-l lg:border-t-0 lg:p-7">
+      <aside className="shrink-0 border-t border-border/60 bg-background/15 p-5 lg:w-[340px] lg:overflow-y-auto lg:border-l lg:border-t-0 lg:px-7 lg:pb-7 lg:pt-6">
         <h2 className="text-base font-semibold">Relevant from your notes</h2>
         <div className="mt-5 space-y-4">
           {sources.slice(0, 3).map((note) => (

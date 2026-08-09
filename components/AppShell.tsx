@@ -6,16 +6,21 @@ import { deleteNote } from '@/lib/notes-api';
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const [popupNoteId, setPopupNoteId] = useState<string | null>(null);
+  const [hidePopupConnections, setHidePopupConnections] = useState(false);
 
   const openNote = useCallback((noteId: string) => {
     setPopupNoteId(noteId);
+    setHidePopupConnections(false);
   }, []);
 
   // Listen for open-note-popup events fired from anywhere in the app (e.g. source chips in Q&A)
   useEffect(() => {
     const handler = (e: Event) => {
-      const detail = (e as CustomEvent).detail as { noteId: string };
-      if (detail?.noteId) setPopupNoteId(detail.noteId);
+      const detail = (e as CustomEvent).detail as { noteId: string; hideConnections?: boolean };
+      if (detail?.noteId) {
+        setPopupNoteId(detail.noteId);
+        setHidePopupConnections(Boolean(detail.hideConnections));
+      }
     };
     window.addEventListener('open-note-popup', handler);
     return () => window.removeEventListener('open-note-popup', handler);
@@ -28,6 +33,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
       {popupNoteId && (
         <NotePopup
           noteId={popupNoteId}
+          hideConnections={hidePopupConnections}
           onClose={() => setPopupNoteId(null)}
           onNoteDeleted={async (noteId) => { await deleteNote(noteId); setPopupNoteId(null); }}
           onRelatedNoteClick={(id) => openNote(id)}
