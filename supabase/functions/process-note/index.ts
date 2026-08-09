@@ -10,6 +10,7 @@ interface ProcessNoteRequest {
 interface RelationResult {
   related_note_id: string;
   reason: string;
+  confidence: number;
 }
 
 Deno.serve(async (req: Request) => {
@@ -52,7 +53,7 @@ Deno.serve(async (req: Request) => {
         "You analyze a personal knowledge base for meaningful relationships between notes. Return ONLY valid JSON.",
         [{
           role: "user",
-          content: `NEW NOTE:\n${newNote.summary || newNote.raw_text}\n\nEXISTING NOTES:\n${notesListText}\n\nIdentify which existing notes are meaningfully related to the new note — they share a concept, topic, or context (not just incidental keyword overlap). Return ONLY a JSON array of objects with "related_note_id" (exact UUID) and "reason" (one short sentence). If none are related, return [].`,
+          content: `NEW NOTE:\n${newNote.summary || newNote.raw_text}\n\nEXISTING NOTES:\n${notesListText}\n\nIdentify deeper, meaningful connections between the new note and existing notes. Do not connect notes merely because they share a topic or keywords. The reason must name the underlying shared meaning, tension, belief, motivation, or pattern. Return ONLY a JSON array of objects with "related_note_id" (exact UUID), "reason" (one specific sentence beginning with "They are connected because"), and "confidence" (0 to 1). Return at most 3, ordered from highest confidence to lowest. If none are meaningfully related, return [].`,
         }],
         apiKey
       );
@@ -80,8 +81,8 @@ Deno.serve(async (req: Request) => {
 
       if (relations.length > 0) {
         const relationsToInsert = relations.flatMap((r) => [
-          { note_id: note_id, related_note_id: r.related_note_id, reason: r.reason },
-          { note_id: r.related_note_id, related_note_id: note_id, reason: r.reason },
+          { note_id: note_id, related_note_id: r.related_note_id, reason: r.reason, confidence: Math.max(0, Math.min(1, Number(r.confidence) || 0.5)) },
+          { note_id: r.related_note_id, related_note_id: note_id, reason: r.reason, confidence: Math.max(0, Math.min(1, Number(r.confidence) || 0.5)) },
         ]);
         await supabase.from("note_relations").upsert(relationsToInsert, {
           onConflict: "note_id,related_note_id",
