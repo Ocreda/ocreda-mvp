@@ -20,7 +20,7 @@ export default function AuthCallbackPage() {
 
   useEffect(() => {
     if (loading || !user) return;
-    router.replace('/notes');
+    router.replace('/');
   }, [loading, user, router]);
 
   if (!loading && !user && timedOut) {

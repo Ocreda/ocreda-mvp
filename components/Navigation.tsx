@@ -2,15 +2,14 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Sparkles, PenLine, Menu, X, User } from 'lucide-react';
+import { Sparkles, Menu, X, User } from 'lucide-react';
 import { useAuth } from '@/lib/auth-context';
 import { useSidebar } from '@/lib/sidebar-context';
 import { supabase } from '@/lib/supabase';
 import { useEffect, useState } from 'react';
 
 const NAV_ITEMS = [
-  { href: '/', label: 'My Brain', icon: Sparkles },
-  { href: '/notes', label: 'Notes', icon: PenLine },
+  { href: '/', label: 'Your cortex', icon: Sparkles },
 ];
 
 // Sidebar toggle icon: rounded rect split vertically with a chevron on the left half

@@ -5,30 +5,209 @@ import { Note, Question, ConversationMessage } from './types';
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 
+export type DocumentExtractionMethod = 'ocr' | 'document';
+
+const LEGACY_NOTE_FIELDS = 'id, user_id, raw_text, summary, target_date, time_of_day, created_at';
+const CATEGORY_NOTE_FIELDS = `${LEGACY_NOTE_FIELDS}, category, category_updated_at`;
+let categoryColumnsAvailable: boolean | null = null;
+
+type SupabaseLikeError = { code?: string; message?: string };
+
+function isMissingCategoryColumn(error: SupabaseLikeError | null): boolean {
+  const message = error?.message?.toLowerCase() ?? '';
+  return error?.code === '42703' || error?.code === 'PGRST204' ||
+    (message.includes('category') && (message.includes('does not exist') || message.includes('schema cache')));
+}
+
+function normalizeNote(row: Record<string, unknown>): Note {
+  return {
+    ...(row as unknown as Note),
+    category: typeof row.category === 'string' ? row.category : null,
+    category_updated_at: typeof row.category_updated_at === 'string' ? row.category_updated_at : null,
+  };
+}
+
+function normalizeNotes(rows: Array<Record<string, unknown>> | null): Note[] {
+  return (rows ?? []).map(normalizeNote);
+}
+
+async function getAuthenticatedOwnerId(): Promise<string> {
+  const { data, error } = await supabase.auth.getUser();
+  if (error || !data.user) {
+    throw new Error('Your session has expired. Sign in again to continue.');
+  }
+  return data.user.id;
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(`Could not read ${file.name}.`));
+    reader.onload = () => {
+      const value = typeof reader.result === 'string' ? reader.result : '';
+      const separator = value.indexOf(',');
+      if (separator === -1) {
+        reject(new Error(`Could not encode ${file.name}.`));
+        return;
+      }
+      resolve(value.slice(separator + 1));
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+export async function extractDocumentText(
+  file: File,
+  mimeType: string
+): Promise<{ text: string; extractionMethod: DocumentExtractionMethod }> {
+  const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+  const accessToken = sessionData.session?.access_token;
+  if (sessionError || !accessToken) {
+    throw new Error('Your session has expired. Sign in again before extracting documents.');
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`${SUPABASE_URL}/functions/v1/extract-document`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        apikey: SUPABASE_ANON_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        file_name: file.name,
+        mime_type: mimeType,
+        data: await fileToBase64(file),
+      }),
+    });
+  } catch (error) {
+    // Browsers report a missing Edge Function/CORS preflight as the opaque
+    // "Failed to fetch" TypeError. Give the user a useful, safe message.
+    if (process.env.NODE_ENV !== 'production') console.error('Document extraction request failed:', error);
+    throw new Error('We couldn\'t process this document right now. Please try again.');
+  }
+  const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
+  if (!response.ok) {
+    if (process.env.NODE_ENV !== 'production') {
+      console.error('Document extraction service error:', { status: response.status, payload });
+    }
+    if (response.status === 401 || response.status === 403) {
+      throw new Error('Your session has expired. Sign in again before extracting documents.');
+    }
+    if (response.status === 413) throw new Error('This file is too large. Choose a file smaller than 10 MB.');
+    if (response.status === 415) throw new Error('This file type isn\'t supported yet.');
+    if (response.status === 400 || response.status === 422) {
+      throw new Error('We couldn\'t read this document. Try another file or export it as PDF.');
+    }
+    throw new Error('We couldn\'t process this document right now. Please try again.');
+  }
+  if (typeof payload?.text !== 'string' || !payload.text.trim()) {
+    throw new Error(`No readable note text was found in ${file.name}.`);
+  }
+  const extractionMethod: DocumentExtractionMethod = payload.extraction_method === 'ocr' ? 'ocr' : 'document';
+  return { text: payload.text, extractionMethod };
+}
+
 /** The user's local calendar date (YYYY-MM-DD), not UTC — this is what "today"/"tomorrow" resolve against. */
 export function getLocalDateString(date: Date = new Date()): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 }
 
 export async function getNotes(): Promise<Note[]> {
-  const { data, error } = await supabase
-    .from('notes')
-    .select('id, user_id, raw_text, summary, target_date, time_of_day, created_at')
-    .eq('user_id', await getOwnerId())
-    .order('created_at', { ascending: false });
+  const ownerId = await getAuthenticatedOwnerId();
+  if (categoryColumnsAvailable !== false) {
+    const result = await supabase.from('notes').select(CATEGORY_NOTE_FIELDS).eq('user_id', ownerId).order('created_at', { ascending: false });
+    if (!result.error) {
+      categoryColumnsAvailable = true;
+      return normalizeNotes(result.data as Array<Record<string, unknown>> | null);
+    }
+    if (!isMissingCategoryColumn(result.error)) throw result.error;
+    categoryColumnsAvailable = false;
+  }
+
+  const { data, error } = await supabase.from('notes').select(LEGACY_NOTE_FIELDS).eq('user_id', ownerId).order('created_at', { ascending: false });
   if (error) throw error;
-  return data as Note[];
+  return normalizeNotes(data as Array<Record<string, unknown>> | null);
 }
 
 /** Save from the dedicated note editor without running question/note classification. */
-export async function createNote(rawText: string): Promise<Note> {
-  const { data, error } = await supabase
-    .from('notes')
-    .insert({ user_id: await getOwnerId(), raw_text: rawText })
-    .select('id, user_id, raw_text, summary, target_date, time_of_day, created_at')
-    .single();
+export async function createNote(rawText: string, category: string | null = null): Promise<Note> {
+  const ownerId = await getAuthenticatedOwnerId();
+  if (categoryColumnsAvailable !== false) {
+    const result = await supabase.from('notes').insert({
+      user_id: ownerId,
+      raw_text: rawText,
+      category,
+      category_updated_at: category ? new Date().toISOString() : null,
+    }).select(CATEGORY_NOTE_FIELDS).single();
+    if (!result.error) {
+      categoryColumnsAvailable = true;
+      return normalizeNote(result.data as Record<string, unknown>);
+    }
+    if (!isMissingCategoryColumn(result.error)) throw result.error;
+    categoryColumnsAvailable = false;
+  }
+
+  const { data, error } = await supabase.from('notes').insert({ user_id: ownerId, raw_text: rawText }).select(LEGACY_NOTE_FIELDS).single();
   if (error) throw error;
-  return data as Note;
+  return normalizeNote(data as Record<string, unknown>);
+}
+
+const NOTE_IMPORT_BATCH_SIZE = 50;
+
+/**
+ * Import plain-text notes without summarizing, rewriting, or otherwise
+ * transforming their contents. Inserts are batched to keep large exports
+ * within practical PostgREST request sizes.
+ */
+export async function importNotes(
+  rawTexts: string[],
+  onProgress?: (completed: number, total: number) => void
+): Promise<Note[]> {
+  if (rawTexts.length === 0) return [];
+
+  const { data: authData, error: authError } = await supabase.auth.getUser();
+  if (authError || !authData.user) {
+    throw new Error('Your session has expired. Sign in again before importing notes.');
+  }
+
+  const imported: Note[] = [];
+  const importedIds: string[] = [];
+  onProgress?.(0, rawTexts.length);
+
+  try {
+    for (let start = 0; start < rawTexts.length; start += NOTE_IMPORT_BATCH_SIZE) {
+      const batch = rawTexts.slice(start, start + NOTE_IMPORT_BATCH_SIZE);
+      const { data, error } = await supabase
+        .from('notes')
+        .insert(batch.map((rawText) => ({ user_id: authData.user.id, raw_text: rawText })))
+        .select(categoryColumnsAvailable === true ? CATEGORY_NOTE_FIELDS : LEGACY_NOTE_FIELDS);
+
+      if (error) throw error;
+
+      const savedBatch = normalizeNotes(data as unknown as Array<Record<string, unknown>> | null);
+      if (savedBatch.length !== batch.length) {
+        throw new Error('Supabase did not confirm every imported note.');
+      }
+
+      imported.push(...savedBatch);
+      importedIds.push(...savedBatch.map((note) => note.id));
+      onProgress?.(Math.min(start + batch.length, rawTexts.length), rawTexts.length);
+    }
+
+    return imported;
+  } catch (error) {
+    if (importedIds.length > 0) {
+      const { error: rollbackError } = await supabase.from('notes').delete().in('id', importedIds);
+      if (rollbackError) {
+        throw new Error(
+          `Import stopped after ${importedIds.length} notes were saved, and automatic cleanup failed. Please review your notes before trying again.`
+        );
+      }
+    }
+    throw error;
+  }
 }
 
 export async function getGuidedChatReaction(previousAnswer: string, nextQuestion: string): Promise<string> {
@@ -48,21 +227,35 @@ export async function getGuidedChatReaction(previousAnswer: string, nextQuestion
 export interface GuidedNoteDraft {
   title: string;
   body: string;
-  source_answer: number;
+  existing_note_id: string;
 }
 
-export async function extractGuidedNotes(answers: string[]): Promise<GuidedNoteDraft[]> {
+export async function extractGuidedNotes(answers: string[], corpus: Note[]): Promise<GuidedNoteDraft[]> {
   const response = await fetch(`${SUPABASE_URL}/functions/v1/guided-notes`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ answers }),
+    body: JSON.stringify({
+      answers,
+      corpus: corpus.map((note) => ({ id: note.id, title: note.summary, body: note.raw_text })),
+    }),
   });
   if (!response.ok) throw new Error(await response.text());
   const data = await response.json();
-  return data.notes;
+  const corpusIds = new Set(corpus.map((note) => note.id));
+  if (!Array.isArray(data.notes)) throw new Error('Invalid guided retrieval response');
+  const notes = data.notes.filter((note: unknown): note is GuidedNoteDraft => {
+    if (!note || typeof note !== 'object') return false;
+    const value = note as Record<string, unknown>;
+    return typeof value.existing_note_id === 'string' &&
+      corpusIds.has(value.existing_note_id) &&
+      typeof value.title === 'string' &&
+      typeof value.body === 'string';
+  });
+  if (data.notes.length > 0 && notes.length === 0) throw new Error('Guided retrieval returned notes outside the corpus');
+  return notes.slice(0, 3);
 }
 
 export async function getNoteById(noteId: string): Promise<Note> {
@@ -76,15 +269,49 @@ export async function getNoteById(noteId: string): Promise<Note> {
   return data as Note;
 }
 
-export async function updateNote(noteId: string, rawText: string): Promise<Note> {
-  const { data, error } = await supabase
-    .from('notes')
-    .update({ raw_text: rawText })
-    .eq('id', noteId)
-    .select()
-    .single();
+export async function updateNote(
+  noteId: string,
+  rawText: string,
+  category?: string | null
+): Promise<Note> {
+  if (category !== undefined && categoryColumnsAvailable !== false) {
+    const result = await supabase.from('notes').update({
+      raw_text: rawText,
+      category,
+      category_updated_at: new Date().toISOString(),
+    }).eq('id', noteId).select(CATEGORY_NOTE_FIELDS).single();
+    if (!result.error) {
+      categoryColumnsAvailable = true;
+      return normalizeNote(result.data as Record<string, unknown>);
+    }
+    if (!isMissingCategoryColumn(result.error)) throw result.error;
+    categoryColumnsAvailable = false;
+  }
+
+  const { data, error } = await supabase.from('notes').update({ raw_text: rawText }).eq('id', noteId).select(LEGACY_NOTE_FIELDS).single();
   if (error) throw error;
-  return data as Note;
+  return normalizeNote(data as Record<string, unknown>);
+}
+
+export async function moveNotesToCategory(
+  noteIds: string[],
+  category: string | null
+): Promise<Note[]> {
+  if (noteIds.length === 0) return [];
+  const ownerId = await getAuthenticatedOwnerId();
+  if (categoryColumnsAvailable !== false) {
+    const result = await supabase.from('notes').update({ category, category_updated_at: new Date().toISOString() }).in('id', noteIds).eq('user_id', ownerId).select(CATEGORY_NOTE_FIELDS);
+    if (!result.error) {
+      categoryColumnsAvailable = true;
+      return normalizeNotes(result.data as Array<Record<string, unknown>> | null);
+    }
+    if (!isMissingCategoryColumn(result.error)) throw result.error;
+    categoryColumnsAvailable = false;
+  }
+
+  const { data, error } = await supabase.from('notes').select(LEGACY_NOTE_FIELDS).in('id', noteIds).eq('user_id', ownerId);
+  if (error) throw error;
+  return normalizeNotes(data as Array<Record<string, unknown>> | null).map((note) => ({ ...note, category, category_updated_at: new Date().toISOString() }));
 }
 
 export async function deleteNote(noteId: string): Promise<void> {
@@ -100,7 +327,7 @@ export async function processNote(noteId: string): Promise<{ relations_count: nu
       Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ note_id: noteId, user_id: await getOwnerId() }),
+    body: JSON.stringify({ note_id: noteId, user_id: await getAuthenticatedOwnerId() }),
   });
   if (!response.ok) throw new Error(await response.text());
   return response.json();
@@ -134,25 +361,25 @@ export async function handleMessage(rawText: string): Promise<
 export async function getNoteRelations(
   noteId: string
 ): Promise<Array<{ id: string; related_note_id: string; reason: string | null; confidence?: number; weight?: number; related_note: { id: string; summary: string | null; raw_text: string } }>> {
-  const enhanced = await supabase
+  // Query only columns available in both the current preview schema and the
+  // connection-learning migration. Requesting newer columns against an older
+  // preview database creates noisy 400 responses before a fallback can run.
+  const { data, error } = await supabase
     .from('note_relations')
-    .select('id, related_note_id, reason, confidence, weight, related_note:notes!related_note_id(id, summary, raw_text)')
+    .select('id, related_note_id, reason, related_note:notes!related_note_id(id, summary, raw_text)')
     .eq('note_id', noteId);
-  // The fallback keeps clients working while the connection-learning migration rolls out.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let data: any[] | null = enhanced.data;
-  let error = enhanced.error;
-  if (error) {
-    const fallback = await supabase
-      .from('note_relations')
-      .select('id, related_note_id, reason, related_note:notes!related_note_id(id, summary, raw_text)')
-      .eq('note_id', noteId);
-    data = fallback.data;
-    error = fallback.error;
-  }
   if (error) throw error;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (data || []).map((r: any) => ({
+  type RelationNote = { id: string; summary: string | null; raw_text: string };
+  type RelationRow = {
+    id: string;
+    related_note_id: string;
+    reason: string | null;
+    confidence?: number;
+    weight?: number;
+    related_note: RelationNote | RelationNote[];
+  };
+  const rows = (data ?? []) as unknown as RelationRow[];
+  return rows.map((r) => ({
     ...r,
     related_note: Array.isArray(r.related_note) ? r.related_note[0] : r.related_note,
   })).sort((a, b) => ((b.confidence ?? 1) * (b.weight ?? 1)) - ((a.confidence ?? 1) * (a.weight ?? 1)));
@@ -165,6 +392,14 @@ export async function applyConnectionFeedback(noteId: string, relatedNoteId: str
     p_multiplier: accepted ? 1.5 : 0.7,
     p_feedback: accepted ? 'accepted' : 'rejected',
   });
+  if (error) throw error;
+}
+
+export async function saveConnectionSuggestion(noteId: string, relatedNoteId: string, reason: string): Promise<void> {
+  const { error } = await supabase.from('note_relations').upsert([
+    { note_id: noteId, related_note_id: relatedNoteId, reason },
+    { note_id: relatedNoteId, related_note_id: noteId, reason },
+  ], { onConflict: 'note_id,related_note_id' });
   if (error) throw error;
 }
 

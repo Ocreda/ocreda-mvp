@@ -7,6 +7,8 @@ export interface Note {
   summary: string | null;
   target_date: string | null;
   time_of_day: TimeOfDay | null;
+  category: string | null;
+  category_updated_at: string | null;
   created_at: string;
 }
 

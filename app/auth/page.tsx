@@ -41,7 +41,7 @@ export default function AuthPage() {
 
   useEffect(() => {
     if (!loading && user) {
-      router.replace('/notes');
+      router.replace('/');
     }
   }, [user, loading, router]);
 
