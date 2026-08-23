@@ -4,8 +4,10 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "NEXT_DIST_DIR=.next-build next build",
-    "start": "NEXT_DIST_DIR=.next-build next start",
+    "build": "next build",
+    "build:isolated": "NEXT_DIST_DIR=.next-build next build",
+    "start": "next start",
+    "start:isolated": "NEXT_DIST_DIR=.next-build next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit"
   },
