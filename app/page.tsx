@@ -1,1750 +1,1017 @@
 'use client';
 
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import Link from 'next/link';
-import {
-  ArrowUp,
-  Trash2,
-  Pencil,
-  Check,
-  X,
-  Plus,
-  Loader as Loader2,
-  Mic,
-  Bold as BoldIcon,
-  Italic as ItalicIcon,
-  List,
-  ListOrdered,
-  MessageCircle,
-  SquarePlus,
-  ChevronRight,
-  Search,
-  Clock3,
-  Brain,
-  FileText,
-  ArrowRight,
-  ArrowLeft,
-  Save,
-  ThumbsUp,
-  ThumbsDown,
-  ExternalLink,
-} from 'lucide-react';
-import { formatDistanceToNow } from 'date-fns';
+import { useRouter } from 'next/navigation';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { ArrowLeft, ArrowUp, Bold, Check, ChevronDown, ChevronLeft, ChevronRight, Filter, FolderPlus, Grid2X2, Italic, List, ListOrdered, Loader as Loader2, Mic, MoreHorizontal, PanelRightOpen, Plus, Rows3, Search, Trash2, Upload, X } from 'lucide-react';
+import NoteImporter, { ImportNoteDraft } from '@/components/NoteImporter';
 import { useAuth } from '@/lib/auth-context';
+import { createNote, deleteNote, getNoteRelations, getNotes, importNotes, moveNotesToCategory, processNote, updateNote } from '@/lib/notes-api';
 import { supabase } from '@/lib/supabase';
-import { Note, Question, ConversationMessage } from '@/lib/types';
-import {
-  handleMessage,
-  createNote,
-  getGuidedChatReaction,
-  extractGuidedNotes,
-  GuidedNoteDraft,
-  applyConnectionFeedback,
-  processNote,
-  getNotes,
-  getQuestions,
-  getNoteRelations,
-  getConversationMessages,
-  sendChatMessage,
-  updateNote,
-  deleteNote,
-  deleteQuestion,
-} from '@/lib/notes-api';
+import { Note } from '@/lib/types';
 
-/* ────────────────────────── helpers ────────────────────────── */
+type CortexMeta = { title: string; description: string; createdAt: string };
+type NoteEditorState = { note: Note | null; title: string; body: string; muse: string };
+type CortexEditorState = { originalTitle: string | null; title: string; description: string };
+type SpeechRecognitionLike = {
+  lang: string; continuous: boolean; interimResults: boolean;
+  start: () => void; stop: () => void;
+  onresult: ((event: { results: ArrayLike<{ 0: { transcript: string } }> }) => void) | null;
+  onerror: (() => void) | null; onend: (() => void) | null;
+};
 
-function firstLine(text: string): string {
-  const line = text.trim().split('\n')[0].trim();
-  return line;
+const AUTOMATIC_MUSE = '__automatic__';
+
+function cleanCategory(value: string | null | undefined): string | null {
+  const clean = value?.trim().replace(/\s+/g, ' ') ?? '';
+  return clean || null;
 }
 
-function truncate(text: string, n: number): string {
-  const t = text.trim().replace(/\s+/g, ' ');
-  return t.length > n ? t.slice(0, n).trimEnd() + '…' : t;
+function splitNote(note: Note): { title: string; body: string } {
+  const text = note.raw_text.trim();
+  if (!text) return { title: 'Untitled note', body: '' };
+  const [first, ...rest] = text.split('\n');
+  return { title: (first.trim() || 'Untitled note').slice(0, 120), body: rest.join('\n').trim() };
 }
 
-function noteTitle(note: Note): string {
-  const s = note.summary?.trim();
-  if (s) return s;
-  return truncate(firstLine(note.raw_text), 60) || 'Untitled note';
+function notePreview(note: Note): string {
+  const { body } = splitNote(note);
+  return (body || note.raw_text).replace(/[#*_>`~-]/g, '').replace(/\s+/g, ' ').trim();
 }
 
-function relTime(iso: string): string {
+function formatDate(value: string): string {
+  return new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(new Date(value));
+}
+
+function stableHash(value: string): number {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) hash = ((hash << 5) - hash + value.charCodeAt(index)) | 0;
+  return hash;
+}
+
+function safeErrorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message) return error.message;
+  if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string') return error.message;
+  return fallback;
+}
+
+function readMuseAssignments(userId: string): Record<string, string> {
   try {
-    return formatDistanceToNow(new Date(iso), { addSuffix: true });
+    const parsed = JSON.parse(localStorage.getItem(`ocreda-note-muses:${userId}`) ?? '{}') as Record<string, unknown>;
+    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === 'string'));
   } catch {
-    return '';
+    return {};
   }
 }
 
-function renderAnswer(text: string): string {
-  const body = text
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*(.*?)\*/g, '<em>$1</em>')
-    .replace(/`(.*?)`/g, '<code class="bg-muted px-1 rounded text-xs font-mono">$1</code>')
-    .replace(/\n\n/g, '</p><p class="mt-3">')
-    .replace(/\n/g, '<br />');
-  return `<p>${body}</p>`;
+function inferMuse(text: string, cortexes: CortexMeta[]): string | null {
+  if (!cortexes.length) return null;
+  const ignored = new Set(['this', 'that', 'with', 'from', 'have', 'will', 'your', 'about', 'into', 'were', 'when']);
+  const words = new Set((text.toLowerCase().match(/[a-z0-9']{3,}/g) ?? []).filter((word) => !ignored.has(word)));
+  const ranked = cortexes.map((cortex) => {
+    const titleWords = cortex.title.toLowerCase().match(/[a-z0-9']{3,}/g) ?? [];
+    const descriptionWords = cortex.description.toLowerCase().match(/[a-z0-9']{3,}/g) ?? [];
+    const score = titleWords.reduce((sum, word) => sum + (words.has(word) ? 3 : 0), 0) + descriptionWords.reduce((sum, word) => sum + (words.has(word) ? 1 : 0), 0);
+    return { title: cortex.title, score };
+  });
+  const best = ranked.sort((a, b) => b.score - a.score)[0];
+  return best && best.score > 0 ? best.title : null;
 }
 
-type RelatedNote = {
-  id: string;
-  related_note_id: string;
-  reason: string | null;
-  confidence?: number;
-  weight?: number;
-  related_note: { id: string; summary: string | null; raw_text: string };
-};
-
-type DisplayMsg = { id: string; role: 'user' | 'assistant'; content: string };
-
-type Active =
-  | { kind: 'note'; id: string }
-  | { kind: 'chat'; id: string }
-  | null;
-
-type ChatState = {
-  questionId: string;
-  messages: DisplayMsg[];
-  sourceIds: string[];
-};
-
-const GUIDED_QUESTIONS = [
-  "What's been taking up space in your head lately?",
-  "What's something you've gotten unreasonably into lately, and why that?",
-  "Last one. What's something you thought was true a year ago that you'd argue against now?",
-];
-
-type GuidedDraft = GuidedNoteDraft & { id: string; selected: boolean; editing: boolean };
-type ConnectionCandidate = { note: Note; relation: RelatedNote };
-type SpeechRecognitionLike = {
-  lang: string;
-  continuous: boolean;
-  interimResults: boolean;
-  start: () => void;
-  stop: () => void;
-  onresult: ((event: { results: ArrayLike<{ 0: { transcript: string } }> }) => void) | null;
-  onerror: (() => void) | null;
-  onend: (() => void) | null;
-};
-
-/* ────────────────────────── logo divider ────────────────────────── */
-
-function LogoDivider({ onClick, title }: { onClick?: () => void; title?: string }) {
-  return (
-    <div className="flex items-center gap-4 select-none">
-      <span className="flex-1 h-px bg-border" />
-      <button
-        type="button"
-        onClick={onClick}
-        title={title}
-        className={`flex items-center gap-1 ${onClick ? 'cursor-pointer' : 'cursor-default'}`}
-      >
-        {/* Original Ocreda mark — asset unchanged, only inverted for dark theme */}
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img src="/ocreda-logo.png" alt="Ocreda" className="w-6 h-6 object-contain" />
-        <span className="text-lg font-semibold tracking-tight text-foreground" style={{ fontFamily: 'Georgia, "Times New Roman", serif' }}>
-          R
-        </span>
-      </button>
-      <span className="flex-1 h-px bg-border" />
-    </div>
-  );
+function OcredaMark({ className = '' }: { className?: string }) {
+  // eslint-disable-next-line @next/next/no-img-element
+  return <img src="/ocreda-logo.png" alt="" aria-hidden="true" className={`object-contain ${className}`} />;
 }
-
-/* ────────────────────────── avatar (top-right, always) ────────────────────────── */
-
-function AvatarButton({ embedded = false }: { embedded?: boolean }) {
-  const { user } = useAuth();
-  const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
-  const [name, setName] = useState('');
-
-  useEffect(() => {
-    if (!user) return;
-    supabase
-      .from('user_settings')
-      .select('full_name, avatar_url')
-      .eq('user_id', user.id)
-      .maybeSingle()
-      .then(({ data }) => {
-        setName(data?.full_name ?? '');
-        setAvatarUrl(data?.avatar_url ?? null);
-      });
-  }, [user]);
-
-  const initials = (() => {
-    if (name.trim()) {
-      return name.trim().split(/\s+/).map((w) => w[0]).join('').toUpperCase().slice(0, 2);
-    }
-    return (user?.email?.[0] ?? '?').toUpperCase();
-  })();
-
-  return (
-    <Link
-      href="/profile"
-      title="Account & appearance"
-      className={`${embedded ? 'relative' : 'fixed top-4 right-4 lg:top-6 lg:right-6 z-50'} w-10 h-10 rounded-full overflow-hidden ring-1 ring-border bg-card shadow-sm flex items-center justify-center hover:ring-primary/40 transition-all`}
-    >
-      {avatarUrl ? (
-        // eslint-disable-next-line @next/next/no-img-element
-        <img src={avatarUrl} alt="You" className="w-full h-full object-cover" />
-      ) : (
-        <span className="text-sm font-semibold text-primary select-none">{initials}</span>
-      )}
-    </Link>
-  );
-}
-
-/* ────────────────────────── composer ────────────────────────── */
-
-function Composer({
-  value,
-  onChange,
-  onSubmit,
-  busy,
-  placeholder,
-  autoFocus,
-}: {
-  value: string;
-  onChange: (v: string) => void;
-  onSubmit: () => void;
-  busy: boolean;
-  placeholder: string;
-  autoFocus?: boolean;
-}) {
-  const ref = useRef<HTMLTextAreaElement>(null);
-  useEffect(() => {
-    if (autoFocus) ref.current?.focus();
-  }, [autoFocus]);
-  return (
-    <div className="relative">
-      <textarea
-        ref={ref}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault();
-            onSubmit();
-          }
-        }}
-        placeholder={placeholder}
-        rows={3}
-        className="w-full resize-none rounded-2xl border border-border bg-background/60 px-4 py-3.5 pr-14 text-[15px] leading-relaxed text-foreground placeholder:text-muted-foreground/50 focus:outline-none focus:ring-2 focus:ring-primary/25 focus:border-primary/50 transition-all"
-      />
-      <button
-        type="button"
-        onClick={onSubmit}
-        disabled={!value.trim() || busy}
-        aria-label="Send"
-        className="absolute right-3 bottom-3 w-9 h-9 rounded-lg bg-primary text-white flex items-center justify-center shadow-sm shadow-primary/20 hover:bg-primary/90 disabled:opacity-30 transition-all"
-      >
-        {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <ArrowUp className="w-4 h-4" />}
-      </button>
-    </div>
-  );
-}
-
-/* ────────────────────────── right-rail card ────────────────────────── */
-
-type RailItem = {
-  kind: 'note' | 'chat';
-  id: string;
-  title: string;
-  preview: string;
-  createdAt: string;
-};
-
-function RailCard({
-  item,
-  active,
-  onOpen,
-  onDelete,
-}: {
-  item: RailItem;
-  active: boolean;
-  onOpen: () => void;
-  onDelete: () => void;
-}) {
-  return (
-    <div
-      onClick={onOpen}
-      className={`group relative min-w-[220px] lg:min-w-0 shrink-0 lg:shrink cursor-pointer rounded-2xl border px-4 py-4 transition-all duration-200 ${
-        active
-          ? 'border-primary bg-primary/[0.06] shadow-sm'
-          : 'border-border bg-card hover:border-border hover:bg-accent/40'
-      }`}
-    >
-      <div className="flex items-center gap-2 mb-1.5">
-        <span
-          className={`text-[10px] font-semibold uppercase tracking-wider ${
-            item.kind === 'chat' ? 'text-primary/80' : 'text-muted-foreground/60'
-          }`}
-        >
-          {item.kind === 'chat' ? 'Past chat' : 'Note'}
-        </span>
-      </div>
-      <p className="text-sm font-medium text-foreground leading-snug line-clamp-2">{item.title}</p>
-      {item.preview && (
-        <p className="mt-1 text-xs text-muted-foreground/70 leading-relaxed line-clamp-2">{item.preview}</p>
-      )}
-      <p className="mt-2 text-[11px] text-muted-foreground/50">{relTime(item.createdAt)}</p>
-
-      <button
-        onClick={(e) => {
-          e.stopPropagation();
-          onDelete();
-        }}
-        title="Delete"
-        className="absolute top-2.5 right-2.5 p-1.5 rounded-lg text-muted-foreground/30 hover:text-destructive hover:bg-destructive/10 opacity-0 group-hover:opacity-100 focus:opacity-100 transition-all"
-      >
-        <Trash2 className="w-3.5 h-3.5" />
-      </button>
-    </div>
-  );
-}
-
-/* ────────────────────────── page ────────────────────────── */
 
 export default function OcredaHome() {
+  const router = useRouter();
   const { user } = useAuth();
   const [notes, setNotes] = useState<Note[]>([]);
-  const [questions, setQuestions] = useState<Question[]>([]);
+  const [cortexMeta, setCortexMeta] = useState<CortexMeta[]>([]);
   const [loading, setLoading] = useState(true);
   const [displayName, setDisplayName] = useState('');
-
-  const [active, setActive] = useState<Active>(null);
-  const [chat, setChat] = useState<ChatState | null>(null);
-  const [relationsCache, setRelationsCache] = useState<Record<string, RelatedNote[]>>({});
-
-  // note map for resolving source ids → titles
-  const noteMap = useMemo(() => {
-    const m: Record<string, Note> = {};
-    for (const n of notes) m[n.id] = n;
-    return m;
-  }, [notes]);
-
-  // composers
-  const [addValue, setAddValue] = useState('');
-  const [addTitle, setAddTitle] = useState('');
-  const [addOpen, setAddOpen] = useState(false);
-  const [firstNoteWarningShown, setFirstNoteWarningShown] = useState(false);
+  const [noteEditor, setNoteEditor] = useState<NoteEditorState | null>(null);
+  const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
+  const [cortexEditor, setCortexEditor] = useState<CortexEditorState | null>(null);
+  const [activeCortex, setActiveCortex] = useState<string | null>(null);
+  const [showUnsorted, setShowUnsorted] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [savedOpen, setSavedOpen] = useState(false);
-  const [savedExiting, setSavedExiting] = useState(false);
-  const [launchGuidedAfterSave, setLaunchGuidedAfterSave] = useState(false);
-  const [guidedOpen, setGuidedOpen] = useState(false);
-  const [guidedStep, setGuidedStep] = useState(0);
-  const [guidedValue, setGuidedValue] = useState('');
-  const [guidedMessages, setGuidedMessages] = useState<Array<{ answer: string; response: string }>>([]);
-  const [guidedDrafts, setGuidedDrafts] = useState<GuidedDraft[]>([]);
-  const [guidedBusy, setGuidedBusy] = useState(false);
-  const [guidedError, setGuidedError] = useState('');
-  const [connectionQueue, setConnectionQueue] = useState<ConnectionCandidate[]>([]);
-  const [connectionIndex, setConnectionIndex] = useState(0);
-  const addTextareaRef = useRef<HTMLTextAreaElement>(null);
-  const addTitleRef = useRef<HTMLInputElement>(null);
-  const addFileRef = useRef<HTMLInputElement>(null);
-  const speechRecognitionRef = useRef<SpeechRecognitionLike | null>(null);
-  const [dictating, setDictating] = useState(false);
-  const [askValue, setAskValue] = useState('');
-  const [composerValue, setComposerValue] = useState('');
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [searchOpen, setSearchOpen] = useState(false);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [chatHistoryOpen, setChatHistoryOpen] = useState(false);
-  const [chatHistoryLoading, setChatHistoryLoading] = useState(false);
-  const [connectionsCount, setConnectionsCount] = useState(0);
-  const [chatAnchor, setChatAnchor] = useState<Note | null>(null);
-  const recentSectionRef = useRef<HTMLElement>(null);
-
-  // note inline edit
-  const [editing, setEditing] = useState(false);
-  const [editText, setEditText] = useState('');
-  const [savingEdit, setSavingEdit] = useState(false);
-
-  const isEmpty = !loading && notes.length === 0 && questions.length === 0;
+  const [importError, setImportError] = useState('');
+  const [importProgress, setImportProgress] = useState<{ completed: number; total: number } | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const [n, q] = await Promise.all([getNotes(), getQuestions()]);
-      setNotes(n);
-      setQuestions(q);
-      return { n, q };
-    } finally {
-      setLoading(false);
+      const loaded = await getNotes();
+      const localMuses = user ? readMuseAssignments(user.id) : {};
+      setNotes(loaded.map((note) => localMuses[note.id] ? { ...note, category: localMuses[note.id] } : note));
     }
-  }, []);
-
-  useEffect(() => {
-    load();
-  }, [load]);
-
-  useEffect(() => {
-    const useNote = (event: Event) => {
-      const detail = (event as CustomEvent<{ note?: Note }>).detail;
-      if (!detail?.note) return;
-      setChatAnchor(detail.note);
-      setActive(null);
-      setChat(null);
-      setComposerValue('');
-      setError('');
-    };
-    const openAdd = () => { setError(''); setAddOpen(true); };
-    window.addEventListener('use-note-in-chat', useNote);
-    window.addEventListener('open-add-note', openAdd);
-    return () => {
-      window.removeEventListener('use-note-in-chat', useNote);
-      window.removeEventListener('open-add-note', openAdd);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!user || loading) return;
-    const status = localStorage.getItem(`ocreda-guided-chat:${user.id}`);
-    if (status === 'pending' && notes.length > 0) setGuidedOpen(true);
-  }, [user, loading, notes.length]);
-
-  useEffect(() => {
-    if (loading || notes.length === 0) {
-      setConnectionsCount(0);
-      return;
-    }
-    supabase
-      .from('note_relations')
-      .select('id', { count: 'exact', head: true })
-      .then(({ count }) => setConnectionsCount(count ?? 0));
-  }, [loading, notes.length]);
+    catch (err) { setError(safeErrorMessage(err, 'Unable to load your notes.')); }
+    finally { setLoading(false); }
+  }, [user]);
+  useEffect(() => { void load(); }, [load]);
 
   useEffect(() => {
     if (!user) return;
-    supabase
-      .from('user_settings')
-      .select('full_name')
-      .eq('user_id', user.id)
-      .maybeSingle()
-      .then(({ data }) => {
-        const profileName = data?.full_name?.trim();
-        const authName = String(user.user_metadata?.full_name ?? user.user_metadata?.name ?? '').trim();
-        setDisplayName(profileName || authName || user.email?.split('@')[0] || '');
-      });
+    try {
+      const stored = localStorage.getItem(`ocreda-cortexes:${user.id}`);
+      if (stored) {
+        const parsed = JSON.parse(stored) as CortexMeta[];
+        if (Array.isArray(parsed)) setCortexMeta(parsed.filter((item) => item && typeof item.title === 'string'));
+      }
+    } catch { /* categories still derive from notes */ }
+    supabase.from('user_settings').select('full_name').eq('user_id', user.id).maybeSingle().then(({ data }) => {
+      const authName = String(user.user_metadata?.full_name ?? user.user_metadata?.name ?? '').trim();
+      setDisplayName(data?.full_name?.trim() || authName || user.email?.split('@')[0] || 'you');
+    });
   }, [user]);
 
-  // default selection once data lands: most recent note, else most recent chat
-  useEffect(() => {
-    if (loading || active) return;
-    if (notes.length > 0) setActive({ kind: 'note', id: notes[0].id });
-    else if (questions.length > 0) selectChat(questions[0]);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loading]);
+  const persistCortexMeta = useCallback((next: CortexMeta[]) => {
+    setCortexMeta(next);
+    if (user) localStorage.setItem(`ocreda-cortexes:${user.id}`, JSON.stringify(next));
+  }, [user]);
 
-  /* ── relations for the active note ── */
-  useEffect(() => {
-    if (active?.kind !== 'note') return;
-    if (relationsCache[active.id]) return;
-    let cancelled = false;
-    getNoteRelations(active.id)
-      .then((rels) => {
-        if (!cancelled) setRelationsCache((prev) => ({ ...prev, [active.id]: rels }));
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [active, relationsCache]);
-
-  /* ── selection ── */
-  const selectNote = (id: string) => {
-    setEditing(false);
-    setActive({ kind: 'note', id });
-    setChat(null);
-  };
-
-  const selectChat = async (q: Question) => {
-    setEditing(false);
-    setActive({ kind: 'chat', id: q.id });
-    setChat({
-      questionId: q.id,
-      messages: [
-        { id: `${q.id}-q`, role: 'user', content: q.question },
-        ...(q.answer ? [{ id: `${q.id}-a`, role: 'assistant' as const, content: q.answer }] : []),
-      ],
-      sourceIds: q.relevant_note_ids ?? [],
+  const persistMuseAssignments = useCallback((noteIds: string[], category: string | null) => {
+    if (!user || !noteIds.length) return;
+    const assignments = readMuseAssignments(user.id);
+    noteIds.forEach((noteId) => {
+      if (category) assignments[noteId] = category;
+      else delete assignments[noteId];
     });
-    try {
-      const msgs: ConversationMessage[] = await getConversationMessages(q.id);
-      if (msgs.length > 0) {
-        setChat((prev) =>
-          prev && prev.questionId === q.id
-            ? { ...prev, messages: [...prev.messages, ...msgs.map((m) => ({ id: m.id, role: m.role, content: m.content }))] }
-            : prev
-        );
-      }
-    } catch {
-      /* keep the base thread */
-    }
+    localStorage.setItem(`ocreda-note-muses:${user.id}`, JSON.stringify(assignments));
+    setNotes((current) => current.map((note) => noteIds.includes(note.id) ? { ...note, category, category_updated_at: new Date().toISOString() } : note));
+  }, [user]);
+
+  const cortexes = useMemo(() => {
+    const map = new Map<string, CortexMeta>();
+    cortexMeta.forEach((item) => { const title = cleanCategory(item.title); if (title) map.set(title.toLowerCase(), { ...item, title }); });
+    notes.forEach((note) => {
+      const title = cleanCategory(note.category);
+      if (title && !map.has(title.toLowerCase())) map.set(title.toLowerCase(), { title, description: '', createdAt: note.created_at });
+    });
+    return Array.from(map.values()).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+  }, [cortexMeta, notes]);
+
+  const notesByCortex = useMemo(() => {
+    const grouped = new Map<string, Note[]>();
+    cortexes.forEach((cortex) => grouped.set(cortex.title, []));
+    notes.forEach((note) => {
+      const category = cleanCategory(note.category);
+      if (!category) return;
+      const canonical = cortexes.find((cortex) => cortex.title.toLowerCase() === category.toLowerCase())?.title ?? category;
+      grouped.set(canonical, [...(grouped.get(canonical) ?? []), note]);
+    });
+    return grouped;
+  }, [cortexes, notes]);
+
+  const unsortedNotes = useMemo(() => notes.filter((note) => !cleanCategory(note.category)), [notes]);
+  const isEmpty = !loading && notes.length === 0 && cortexes.length === 0;
+  const flashSaved = () => { setSavedOpen(true); window.setTimeout(() => setSavedOpen(false), 1350); };
+  const closeLibrary = useCallback(() => { router.push('/profile'); }, [router]);
+  const openNewNote = (muse = AUTOMATIC_MUSE) => { setError(''); setNoteEditor({ note: null, title: '', body: '', muse }); };
+  const openExistingNote = (note: Note) => { setError(''); setActiveNoteId(note.id); };
+  const createMuseFromEditor = (value: string) => {
+    const requested = cleanCategory(value);
+    if (!requested) return;
+    const existing = cortexes.find((item) => item.title.toLowerCase() === requested.toLowerCase());
+    const title = existing?.title ?? requested;
+    if (!existing) persistCortexMeta([...cortexMeta, { title, description: '', createdAt: new Date().toISOString() }]);
+    setNoteEditor((current) => current ? { ...current, muse: title } : current);
   };
 
-  const openChatHistory = async () => {
-    setChatHistoryOpen(true);
-    setChatHistoryLoading(true);
+  const saveNote = async () => {
+    if (!noteEditor) return;
+    const title = noteEditor.title.trim(); const body = noteEditor.body.trim();
+    if (!title && !body) { setError('Write something before saving.'); return; }
+    const rawText = title && body ? `${title}\n\n${body}` : title || body;
+    const category = noteEditor.muse === AUTOMATIC_MUSE ? inferMuse(rawText, cortexes) : cleanCategory(noteEditor.muse);
+    setSaving(true); setError('');
     try {
-      setQuestions(await getQuestions());
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Unable to load chat history');
-    } finally {
-      setChatHistoryLoading(false);
-    }
-  };
-
-  const openPreviousChat = async (question: Question) => {
-    setChatHistoryOpen(false);
-    await selectChat(question);
-  };
-
-  /* ── submit: add-a-note / ask / follow-up ── */
-  const runHandleMessage = async (text: string): Promise<'note' | 'question' | null> => {
-    setError('');
-    setBusy(true);
-    try {
-      const result = await handleMessage(text);
-      if (result.type === 'note') {
-        processNote(result.note.id).catch(() => {});
-        setNotes((prev) => [result.note, ...prev]);
-        setChat(null);
-        setActive({ kind: 'note', id: result.note.id });
+      if (noteEditor.note) {
+        const updated = await updateNote(noteEditor.note.id, rawText, category);
+        setNotes((current) => current.map((note) => note.id === updated.id ? { ...updated, category } : note));
+        persistMuseAssignments([updated.id], category);
       } else {
-        const newChat: ChatState = {
-          questionId: result.question_id,
-          messages: [
-            { id: `${result.question_id}-q`, role: 'user', content: text },
-            { id: `${result.question_id}-a`, role: 'assistant', content: result.answer },
-          ],
-          sourceIds: result.relevant_notes.map((r) => r.id),
-        };
-        setChat(newChat);
-        setActive({ kind: 'chat', id: result.question_id });
-        // refresh questions list so the rail shows the new past-chat
-        getQuestions().then(setQuestions).catch(() => {});
+        const created = await createNote(rawText, category);
+        setNotes((current) => [{ ...created, category }, ...current]);
+        persistMuseAssignments([created.id], category);
+        processNote(created.id).catch(() => {});
       }
-      return result.type;
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Something went wrong');
-      return null;
-    } finally {
-      setBusy(false);
-    }
+      setNoteEditor(null); flashSaved();
+    } catch (err) { setError(safeErrorMessage(err, 'Unable to save this note.')); }
+    finally { setSaving(false); }
   };
 
-  const sendFollowup = async (text: string) => {
-    if (!chat) return;
-    setError('');
-    setBusy(true);
-    const tempId = `temp-${chat.messages.length}`;
-    setChat((prev) => (prev ? { ...prev, messages: [...prev.messages, { id: tempId, role: 'user', content: text }] } : prev));
+  const removeNote = async () => {
+    if (!noteEditor?.note || !confirm('Delete this note? This cannot be undone.')) return;
+    setSaving(true);
+    try { const noteId = noteEditor.note.id; await deleteNote(noteId); persistMuseAssignments([noteId], null); setNotes((current) => current.filter((note) => note.id !== noteId)); setNoteEditor(null); }
+    catch (err) { setError(safeErrorMessage(err, 'Unable to delete this note.')); }
+    finally { setSaving(false); }
+  };
+
+  const updateReadingNote = async (noteId: string, rawText: string) => {
+    const current = notes.find((note) => note.id === noteId);
+    if (!current || !rawText.trim()) return;
+    setSaving(true); setError('');
     try {
-      const result = await sendChatMessage(chat.questionId, text);
-      setChat((prev) => {
-        if (!prev) return prev;
-        const base = prev.messages.filter((m) => m.id !== tempId);
-        const appended = result.messages.map((m) => ({ id: m.id, role: m.role as 'user' | 'assistant', content: m.content }));
-        return {
-          ...prev,
-          messages: [...base, ...appended],
-          sourceIds: result.relevant_notes.length ? result.relevant_notes.map((r) => r.id) : prev.sourceIds,
-        };
-      });
-    } catch (err) {
-      setChat((prev) => (prev ? { ...prev, messages: prev.messages.filter((m) => m.id !== tempId) } : prev));
-      setError(err instanceof Error ? err.message : 'Failed to send message');
-    } finally {
-      setBusy(false);
-    }
+      const updated = await updateNote(noteId, rawText, cleanCategory(current.category));
+      setNotes((items) => items.map((note) => note.id === noteId ? { ...updated, category: current.category } : note));
+    } catch (err) { setError(safeErrorMessage(err, 'Unable to save this note.')); throw err; }
+    finally { setSaving(false); }
   };
 
-  const submitComposer = () => {
-    const text = composerValue.trim();
-    if (!text || busy) return;
-    setComposerValue('');
-    setChatAnchor(null);
-    if (active?.kind === 'chat') sendFollowup(text);
-    else runHandleMessage(text);
-  };
-
-  const submitAdd = async () => {
-    const title = addTitle.trim();
-    const body = addValue.trim();
-    if (!title || busy) return;
-    const text = body ? `${title}\n\n${body}` : title;
-    const wordCount = text.split(/\s+/).filter(Boolean).length;
-    if (notes.length === 0 && wordCount < 25 && !firstNoteWarningShown) {
-      setFirstNoteWarningShown(true);
-      setError('Add a bit more so we have something to work with.');
-      return;
-    }
-    const isFirstNote = notes.length === 0;
-    setError('');
-    setBusy(true);
+  const removeReadingNote = async (note: Note) => {
+    if (!confirm('Delete this page? This cannot be undone.')) return;
+    setSaving(true); setError('');
     try {
-      const note = await createNote(text);
-      setNotes((prev) => [note, ...prev]);
-      setChat(null);
-      setActive({ kind: 'note', id: note.id });
-      setAddTitle('');
-      setAddValue('');
-      setAddOpen(false);
-      setSavedOpen(true);
-      if (isFirstNote && user) {
-        localStorage.setItem(`ocreda-guided-chat:${user.id}`, 'pending');
-        setLaunchGuidedAfterSave(true);
-      }
-      processNote(note.id).catch(() => {});
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to save note');
-    } finally {
-      setBusy(false);
-    }
+      await deleteNote(note.id);
+      persistMuseAssignments([note.id], null);
+      setNotes((items) => items.filter((item) => item.id !== note.id));
+      if (activeNoteId === note.id) setActiveNoteId(null);
+    } catch (err) { setError(safeErrorMessage(err, 'Unable to delete this page.')); }
+    finally { setSaving(false); }
   };
 
-  useEffect(() => {
-    if (addOpen) {
-      setFirstNoteWarningShown(false);
-      setError('');
-      requestAnimationFrame(() => addTitleRef.current?.focus());
-    }
-  }, [addOpen]);
-
-  useEffect(() => {
-    if (!savedOpen) return;
-    setSavedExiting(false);
-    const exitTimer = window.setTimeout(() => setSavedExiting(true), 1400);
-    const closeTimer = window.setTimeout(() => {
-      setSavedOpen(false);
-      if (launchGuidedAfterSave) {
-        setGuidedOpen(true);
-        setLaunchGuidedAfterSave(false);
-      }
-    }, 1900);
-    return () => {
-      window.clearTimeout(exitTimer);
-      window.clearTimeout(closeTimer);
-    };
-  }, [savedOpen, launchGuidedAfterSave]);
-
-  const closeGuidedChat = () => {
-    if (user) localStorage.setItem(`ocreda-guided-chat:${user.id}`, 'complete');
-    setGuidedOpen(false);
-    setGuidedError('');
-  };
-
-  const submitGuidedAnswer = async () => {
-    const answer = guidedValue.trim();
-    if (!answer || guidedBusy) return;
-    if (guidedStep < 2 && answer.split(/\s+/).filter(Boolean).length < 15) {
-      setGuidedError('Say a bit more about that one.');
-      return;
-    }
-    setGuidedError('');
-    setGuidedBusy(true);
-    const nextQuestion = GUIDED_QUESTIONS[guidedStep + 1];
+  const saveInstantRetrieval = async (queryText: string, resultNotes: Note[], category: string) => {
+    const muse = cleanCategory(category);
+    if (!muse) throw new Error('Choose or create a cortex first.');
+    setSaving(true); setError('');
     try {
-      if (!nextQuestion) {
-        const allAnswers = [...guidedMessages.map((message) => message.answer), answer];
-        let finalResponse = "That's the real one. Give me a second.";
-        try {
-          finalResponse = await getGuidedChatReaction(answer, 'Give me a second.');
-        } catch {
-          // Keep the intentionally restrained fallback copy.
-        }
-        let drafts: GuidedNoteDraft[];
-        try {
-          drafts = await extractGuidedNotes(allAnswers);
-        } catch {
-          drafts = allAnswers.map((sourceAnswer, index) => ({
-            title: sourceAnswer.split(/\s+/).slice(0, 6).join(' '),
-            body: sourceAnswer,
-            source_answer: index + 1,
-          }));
-        }
-        setGuidedMessages((prev) => [...prev, { answer, response: finalResponse }]);
-        setGuidedStep(3);
-        setGuidedValue('');
-        setGuidedDrafts(drafts.map((draft, index) => ({ ...draft, id: `guided-${index}`, selected: true, editing: false })));
-        return;
-      }
-      let response: string;
-      try {
-        response = await getGuidedChatReaction(answer, nextQuestion);
-      } catch {
-        const words = answer.replace(/[.!?]+$/, '').split(/\s+/).slice(0, 7).join(' ').toLowerCase();
-        response = `${words ? `It sounds like ${words}. ` : ''}${nextQuestion}`;
-      }
-      setGuidedMessages((prev) => [...prev, { answer, response }]);
-      setGuidedStep((step) => step + 1);
-      setGuidedValue('');
-    } finally {
-      setGuidedBusy(false);
-    }
+      const existing = cortexes.find((item) => item.title.toLowerCase() === muse.toLowerCase());
+      const canonicalMuse = existing?.title ?? muse;
+      if (!existing) persistCortexMeta([...cortexMeta, { title: canonicalMuse, description: `Saved instant retrievals about ${queryText.trim()}.`, createdAt: new Date().toISOString() }]);
+      const sources = resultNotes.slice(0, 5).map((item) => `• ${splitNote(item).title}`).join('\n');
+      const rawText = `Instant retrieval — ${queryText.trim()}\n\nI searched my Ocreda for: ${queryText.trim()}.${sources ? `\n\nSurfaced notes:\n${sources}` : ''}`;
+      const created = await createNote(rawText, canonicalMuse);
+      const saved = { ...created, category: canonicalMuse };
+      setNotes((current) => [saved, ...current]);
+      persistMuseAssignments([created.id], canonicalMuse);
+      processNote(created.id).catch(() => {});
+      flashSaved();
+      return saved;
+    } catch (err) { setError(safeErrorMessage(err, 'Unable to save this retrieval.')); throw err; }
+    finally { setSaving(false); }
   };
 
-  const saveGuidedDrafts = async () => {
-    const selected = guidedDrafts.filter((draft) => draft.selected);
-    if (selected.length === 0 || guidedBusy) return;
-    setGuidedBusy(true);
-    setGuidedError('');
+  const saveCortex = async () => {
+    if (!cortexEditor) return;
+    const title = cleanCategory(cortexEditor.title);
+    if (!title) { setError('Add a title for this cortex.'); return; }
+    if (cortexes.some((item) => item.title.toLowerCase() === title.toLowerCase() && item.title !== cortexEditor.originalTitle)) { setError('A cortex with this title already exists.'); return; }
+    setSaving(true); setError('');
     try {
-      const created = await Promise.all(selected.map((draft) => createNote(`${draft.title.trim()}\n\n${draft.body.trim()}`)));
-      setNotes((prev) => [...[...created].reverse(), ...prev]);
-      await Promise.all(created.map((note) => processNote(note.id).catch(() => ({ relations_count: 0 }))));
-      const relationGroups = await Promise.all(created.map(async (note) => ({ note, relations: await getNoteRelations(note.id).catch(() => []) })));
-      const seen = new Set<string>();
-      const candidates: ConnectionCandidate[] = [];
-      for (const group of relationGroups) {
-        for (const relation of group.relations) {
-          const pairKey = [group.note.id, relation.related_note_id].sort().join(':');
-          if (!seen.has(pairKey)) {
-            seen.add(pairKey);
-            candidates.push({ note: group.note, relation });
-          }
-        }
+      if (cortexEditor.originalTitle && cortexEditor.originalTitle !== title) {
+        const affected = notesByCortex.get(cortexEditor.originalTitle) ?? [];
+        const updated = await moveNotesToCategory(affected.map((note) => note.id), title);
+        const updates = new Map(updated.map((note) => [note.id, note]));
+        setNotes((current) => current.map((note) => updates.get(note.id) ?? note));
+        persistMuseAssignments(affected.map((note) => note.id), title);
       }
-      closeGuidedChat();
-      if (candidates.length > 0) {
-        setConnectionQueue(candidates.slice(0, 3));
-        setConnectionIndex(0);
-      } else if (created[0]) {
-        requestAnimationFrame(() => openNotePopup(created[0].id));
-      }
-    } catch (err) {
-      setGuidedError(err instanceof Error ? err.message : 'Failed to add notes');
-    } finally {
-      setGuidedBusy(false);
-    }
+      const originalKey = cortexEditor.originalTitle?.toLowerCase();
+      const next = cortexMeta.filter((item) => item.title.toLowerCase() !== originalKey && item.title.toLowerCase() !== title.toLowerCase());
+      next.push({ title, description: cortexEditor.description.trim(), createdAt: cortexMeta.find((item) => item.title.toLowerCase() === originalKey)?.createdAt ?? new Date().toISOString() });
+      persistCortexMeta(next);
+      if (activeCortex === cortexEditor.originalTitle) setActiveCortex(title);
+      setCortexEditor(null); flashSaved();
+    } catch (err) { setError(safeErrorMessage(err, 'Unable to save this cortex.')); }
+    finally { setSaving(false); }
   };
 
-  const handleConnectionDecision = async (accepted: boolean) => {
-    const candidate = connectionQueue[connectionIndex];
-    if (!candidate) return;
-    applyConnectionFeedback(candidate.note.id, candidate.relation.related_note_id, accepted).catch(() => {});
-    if (connectionIndex < connectionQueue.length - 1) {
-      setConnectionIndex((index) => index + 1);
-      return;
-    }
-    const noteId = connectionQueue[0]?.note.id;
-    setConnectionQueue([]);
-    setConnectionIndex(0);
-    if (noteId) requestAnimationFrame(() => {
-      window.dispatchEvent(new CustomEvent('open-note-popup', { detail: { noteId, hideConnections: !accepted } }));
-    });
-  };
-
-  const formatAddText = (prefix: string, suffix = prefix) => {
-    const textarea = addTextareaRef.current;
-    if (!textarea) return;
-    const start = textarea.selectionStart;
-    const end = textarea.selectionEnd;
-    const selected = addValue.slice(start, end);
-    const nextValue = `${addValue.slice(0, start)}${prefix}${selected}${suffix}${addValue.slice(end)}`;
-    setAddValue(nextValue);
-    requestAnimationFrame(() => {
-      textarea.focus();
-      textarea.setSelectionRange(start + prefix.length, end + prefix.length);
-    });
-  };
-
-  const formatAddList = (ordered = false) => {
-    const textarea = addTextareaRef.current;
-    if (!textarea) return;
-    const start = textarea.selectionStart;
-    const end = textarea.selectionEnd;
-    const selected = addValue.slice(start, end) || 'List item';
-    const formatted = selected.split('\n').map((line, index) => `${ordered ? `${index + 1}.` : '-'} ${line}`).join('\n');
-    setAddValue(`${addValue.slice(0, start)}${formatted}${addValue.slice(end)}`);
-    requestAnimationFrame(() => {
-      textarea.focus();
-      textarea.setSelectionRange(start, start + formatted.length);
-    });
-  };
-
-  const formatAddBody = () => {
-    const textarea = addTextareaRef.current;
-    if (!textarea) return;
-    const cursor = textarea.selectionStart;
-    const lineStart = addValue.lastIndexOf('\n', Math.max(0, cursor - 1)) + 1;
-    const lineEndIndex = addValue.indexOf('\n', cursor);
-    const lineEnd = lineEndIndex === -1 ? addValue.length : lineEndIndex;
-    const line = addValue.slice(lineStart, lineEnd);
-    const plainLine = line.replace(/^#{1,3}\s+/, '');
-    setAddValue(`${addValue.slice(0, lineStart)}${plainLine}${addValue.slice(lineEnd)}`);
-    requestAnimationFrame(() => {
-      textarea.focus();
-      const removed = line.length - plainLine.length;
-      textarea.setSelectionRange(Math.max(lineStart, cursor - removed), Math.max(lineStart, cursor - removed));
-    });
-  };
-
-  const importAddFile = (file: File | undefined) => {
-    if (!file) return;
-    if (file.size > 2_000_000) {
-      setError('Please choose a text file smaller than 2 MB.');
-      return;
-    }
-    const reader = new FileReader();
-    reader.onload = () => {
-      const content = typeof reader.result === 'string' ? reader.result.trim() : '';
-      if (!content) {
-        setError('That file does not contain readable text.');
-        return;
-      }
-      setAddValue((current) => `${current}${current.trim() ? '\n\n' : ''}${content}`);
-      setError('');
-      requestAnimationFrame(() => addTextareaRef.current?.focus());
-    };
-    reader.onerror = () => setError('Unable to read that file.');
-    reader.readAsText(file);
-  };
-
-  const toggleAddDictation = () => {
-    if (dictating) {
-      speechRecognitionRef.current?.stop();
-      return;
-    }
-    const speechWindow = window as Window & {
-      SpeechRecognition?: new () => SpeechRecognitionLike;
-      webkitSpeechRecognition?: new () => SpeechRecognitionLike;
-    };
-    const Recognition = speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
-    if (!Recognition) {
-      setError('Voice dictation is not supported in this browser. Try Chrome or Safari.');
-      return;
-    }
-    const recognition = new Recognition();
-    recognition.lang = navigator.language || 'en-US';
-    recognition.continuous = false;
-    recognition.interimResults = false;
-    recognition.onresult = (event) => {
-      const transcript = event.results[0]?.[0]?.transcript?.trim();
-      if (transcript) setAddValue((current) => `${current}${current.trim() ? ' ' : ''}${transcript}`);
-    };
-    recognition.onerror = () => setError('Voice dictation could not start. Please check microphone permission.');
-    recognition.onend = () => {
-      setDictating(false);
-      speechRecognitionRef.current = null;
-    };
-    speechRecognitionRef.current = recognition;
-    setError('');
-    setDictating(true);
-    recognition.start();
-  };
-
-  const submitAsk = () => {
-    const text = askValue.trim();
-    if (!text || busy) return;
-    setAskValue('');
-    runHandleMessage(text);
-  };
-
-  /* ── deletion ── */
-  const removeNote = async (id: string) => {
-    setNotes((prev) => prev.filter((n) => n.id !== id));
-    if (active?.kind === 'note' && active.id === id) setActive(null);
+  const removeCortex = async (title: string) => {
+    if (!confirm(`Delete “${title}”? Its notes will return to Instant retrieval.`)) return;
+    setSaving(true);
     try {
-      await deleteNote(id);
-    } catch {
-      load();
-    }
+      const updated = await moveNotesToCategory((notesByCortex.get(title) ?? []).map((note) => note.id), null);
+      const updates = new Map(updated.map((note) => [note.id, note]));
+      setNotes((current) => current.map((note) => updates.get(note.id) ?? note));
+      persistMuseAssignments((notesByCortex.get(title) ?? []).map((note) => note.id), null);
+      persistCortexMeta(cortexMeta.filter((item) => item.title.toLowerCase() !== title.toLowerCase())); setActiveCortex(null);
+    } catch (err) { setError(safeErrorMessage(err, 'Unable to delete this cortex.')); }
+    finally { setSaving(false); }
   };
 
-  const removeChat = async (id: string) => {
-    setQuestions((prev) => prev.filter((q) => q.id !== id));
-    if (active?.kind === 'chat' && active.id === id) {
-      setActive(null);
-      setChat(null);
-    }
+  const handleImport = async (drafts: ImportNoteDraft[]) => {
+    setImportError('');
     try {
-      await deleteQuestion(id);
-    } catch {
-      load();
-    }
+      const imported = await importNotes(drafts.map((draft) => draft.rawText), (completed, total) => setImportProgress({ completed, total }));
+      setNotes((current) => [...imported, ...current]); imported.forEach((note) => processNote(note.id).catch(() => {}));
+      setImportProgress(null); flashSaved();
+    } catch (err) { setImportProgress(null); setImportError(safeErrorMessage(err, 'Your notes could not be imported.')); throw err; }
   };
 
-  /* ── inline note edit ── */
-  const activeNote = active?.kind === 'note' ? noteMap[active.id] : undefined;
-
-  const startEdit = () => {
-    if (!activeNote) return;
-    setEditText(activeNote.raw_text);
-    setEditing(true);
-  };
-  const saveEdit = async () => {
-    if (!activeNote || !editText.trim()) return;
-    setSavingEdit(true);
-    try {
-      const updated = await updateNote(activeNote.id, editText.trim());
-      setNotes((prev) => prev.map((n) => (n.id === updated.id ? updated : n)));
-      setEditing(false);
-    } finally {
-      setSavingEdit(false);
-    }
-  };
-
-  /* ── rail items (notes + chats, newest first) ── */
-  const railItems: RailItem[] = useMemo(() => {
-    const items: RailItem[] = [
-      ...notes.map((n) => ({
-        kind: 'note' as const,
-        id: n.id,
-        title: noteTitle(n),
-        preview: truncate(n.raw_text, 80),
-        createdAt: n.created_at,
-      })),
-      ...questions.map((q) => ({
-        kind: 'chat' as const,
-        id: q.id,
-        title: q.question,
-        preview: q.answer ? truncate(q.answer, 80) : '',
-        createdAt: q.created_at,
-      })),
-    ];
-    items.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-    return items;
-  }, [notes, questions]);
-
-  const relations = active?.kind === 'note' ? relationsCache[active.id] ?? [] : [];
-  const composerPlaceholder = active?.kind === 'chat' ? 'Ask a follow-up…' : 'Write a note, or ask a question…';
-  const filteredHomeNotes = notes.filter((note) => {
-    const query = searchQuery.trim().toLowerCase();
-    return !query || note.raw_text.toLowerCase().includes(query) || note.summary?.toLowerCase().includes(query);
-  });
-  const openNotePopup = (noteId: string) => {
-    window.dispatchEvent(new CustomEvent('open-note-popup', { detail: { noteId } }));
-  };
-
-  /* ────────────────── render ────────────────── */
+  if (loading) return <div className="flex h-[100dvh] items-center justify-center overflow-hidden bg-white"><Loader2 className="h-7 w-7 animate-spin text-[#477bea]" /></div>;
 
   return (
-    <div className="min-h-screen bg-background text-foreground">
-      {addOpen && (
-        <div
-          className="fixed inset-0 z-[70] flex items-end justify-center bg-black/45 backdrop-blur-sm sm:items-center sm:p-6"
-          role="dialog"
-          aria-modal="true"
-          aria-labelledby="add-note-title"
-          onKeyDown={(e) => {
-            if (e.key === 'Escape' && !busy) setAddOpen(false);
-          }}
-        >
-          <button type="button" aria-label="Close note editor" className="absolute inset-0" onClick={() => !busy && setAddOpen(false)} />
-          <div className="animate-ocreda-fade-up relative flex h-[88vh] w-full max-w-[1100px] flex-col overflow-hidden rounded-t-2xl border border-border/70 bg-card shadow-2xl sm:h-[640px] sm:rounded-2xl">
-            <div className="flex min-h-0 flex-1 flex-col px-6 pb-5 pt-10 sm:px-14 sm:pb-4 sm:pt-12">
-              <label id="add-note-title" htmlFor="new-note-title" className="sr-only">Note title</label>
-              <input
-                id="new-note-title"
-                ref={addTitleRef}
-                value={addTitle}
-                onChange={(e) => setAddTitle(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') {
-                    e.preventDefault();
-                    addTextareaRef.current?.focus();
-                  }
-                }}
-                placeholder="What's on your mind?"
-                className="w-full bg-transparent text-xl font-medium italic text-foreground placeholder:text-foreground focus:outline-none sm:text-2xl"
-              />
-              <p className="mt-1 max-w-xl text-sm italic leading-relaxed text-muted-foreground">
-                Anything. Something you read, something you&apos;re stuck on, something<br className="hidden sm:block" /> you keep thinking about.
-              </p>
-              <textarea
-                id="new-note"
-                ref={addTextareaRef}
-                value={addValue}
-                onChange={(e) => setAddValue(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
-                    e.preventDefault();
-                    submitAdd();
-                  }
-                }}
-                placeholder="For example: Someone made the point that we mostly don't choose our beliefs, we absorb them and backfill reasons after. Uncomfortable but I can't argue with it. Makes me wonder how much of what I think is actually mine."
-                className="mt-7 min-h-[220px] flex-1 resize-none bg-transparent text-sm leading-relaxed text-foreground placeholder:text-muted-foreground/35 focus:outline-none sm:mt-8"
-              />
-              {error && <p className="mt-2 text-sm font-medium text-destructive">{error}</p>}
-            </div>
+    <main className="light h-[100dvh] w-full overflow-hidden bg-white text-[#141414]">
+      <section className="relative flex h-full w-full flex-col overflow-hidden bg-white">
+        {activeNoteId && notes.find((note) => note.id === activeNoteId) ? <NoteReadingWorkspace key={activeNoteId} note={notes.find((note) => note.id === activeNoteId)!} allNotes={notes} cortexes={cortexes} saving={saving} onBack={() => setActiveNoteId(null)} onAddNote={() => openNewNote(cleanCategory(notes.find((note) => note.id === activeNoteId)?.category) ?? AUTOMATIC_MUSE)} onImport={handleImport} onOpenNote={(note) => setActiveNoteId(note.id)} onUpdate={updateReadingNote} onDelete={removeReadingNote} onSaveRetrieval={saveInstantRetrieval} />
+          : isEmpty ? <EmptyWorkspace displayName={displayName} userEmail={user?.email ?? ''} onAddNote={() => openNewNote()} onImport={handleImport} importError={importError} progress={importProgress} />
+          : activeCortex || showUnsorted ? <CortexDetail title={showUnsorted ? 'Instant retrieval' : activeCortex ?? ''} notes={showUnsorted ? unsortedNotes : notesByCortex.get(activeCortex ?? '') ?? []} isUnsorted={showUnsorted} busy={saving} onBack={() => { setActiveCortex(null); setShowUnsorted(false); }} onAddNote={() => openNewNote(showUnsorted ? AUTOMATIC_MUSE : activeCortex ?? AUTOMATIC_MUSE)} onOpenNote={openExistingNote} onEdit={() => { const meta = cortexes.find((item) => item.title === activeCortex); if (meta) setCortexEditor({ originalTitle: meta.title, title: meta.title, description: meta.description }); }} onDelete={() => { if (activeCortex) void removeCortex(activeCortex); }} />
+          : <CortexGrid cortexes={cortexes} notes={notes} notesByCortex={notesByCortex} busy={saving} onClose={closeLibrary} onAddNote={(muse) => openNewNote(muse ?? AUTOMATIC_MUSE)} onAddCortex={() => setCortexEditor({ originalTitle: null, title: '', description: '' })} onEditCortex={(cortex) => setCortexEditor({ originalTitle: cortex.title, title: cortex.title, description: cortex.description })} onDeleteCortex={(title) => void removeCortex(title)} onOpenNote={openExistingNote} onImport={handleImport} onSaveRetrieval={saveInstantRetrieval} />}
+        {error && !noteEditor && !cortexEditor && <div role="alert" className="fixed bottom-5 left-1/2 z-40 max-w-[90vw] -translate-x-1/2 rounded-lg bg-[#202020] px-4 py-3 text-sm text-white shadow-xl">{error}<button type="button" onClick={() => setError('')} aria-label="Dismiss error" className="ml-4"><X className="inline h-4 w-4" /></button></div>}
+      </section>
+      {noteEditor && <NoteEditor state={noteEditor} cortexes={cortexes} saving={saving} error={error} onChange={setNoteEditor} onCreateMuse={createMuseFromEditor} onClose={() => { setNoteEditor(null); setError(''); }} onSave={() => void saveNote()} onDelete={noteEditor.note ? () => void removeNote() : undefined} />}
+      {cortexEditor && <CortexEditor state={cortexEditor} saving={saving} error={error} onChange={setCortexEditor} onClose={() => { setCortexEditor(null); setError(''); }} onSave={() => void saveCortex()} />}
+      {savedOpen && <SavedConfirmation />}
+    </main>
+  );
+}
 
-            <div className="flex min-h-[54px] shrink-0 items-center gap-1 overflow-x-auto border-t border-border/70 bg-muted/25 px-3 py-2 text-sm sm:gap-2 sm:px-5">
-              <input ref={addFileRef} type="file" accept=".txt,.md,.markdown,text/plain,text/markdown" className="hidden" onChange={(event) => { importAddFile(event.target.files?.[0]); event.target.value = ''; }} />
-              <button type="button" onClick={() => addFileRef.current?.click()} title="Import a text or Markdown file" aria-label="Attach a file" className="shrink-0 rounded-md p-2 text-muted-foreground hover:bg-accent hover:text-foreground"><Plus className="h-5 w-5" /></button>
-              <button type="button" onClick={toggleAddDictation} title={dictating ? 'Stop voice dictation' : 'Start voice dictation'} aria-label={dictating ? 'Stop voice dictation' : 'Record audio'} className={`shrink-0 rounded-md p-2 transition-colors ${dictating ? 'bg-destructive/10 text-destructive' : 'text-muted-foreground hover:bg-accent hover:text-foreground'}`}><Mic className={`h-4 w-4 ${dictating ? 'animate-pulse' : ''}`} /></button>
-              <span className="mx-1 h-7 w-px shrink-0 bg-border" />
-              <button type="button" onClick={() => formatAddText('**')} aria-label="Bold" className="shrink-0 rounded-md p-2 text-muted-foreground hover:bg-accent hover:text-foreground"><BoldIcon className="h-4 w-4" /></button>
-              <button type="button" onClick={() => formatAddText('*')} aria-label="Italic" className="shrink-0 rounded-md p-2 text-muted-foreground hover:bg-accent hover:text-foreground"><ItalicIcon className="h-4 w-4" /></button>
-              <span className="mx-1 h-7 w-px shrink-0 bg-border" />
-              <button type="button" onClick={() => formatAddText('# ', '')} className="shrink-0 rounded-md px-2 py-1.5 font-semibold text-muted-foreground hover:bg-accent hover:text-foreground">H1</button>
-              <button type="button" onClick={() => formatAddText('## ', '')} className="shrink-0 rounded-md px-2 py-1.5 font-semibold text-muted-foreground hover:bg-accent hover:text-foreground">H2</button>
-              <button type="button" onClick={() => formatAddText('### ', '')} className="shrink-0 rounded-md px-2 py-1.5 font-semibold text-muted-foreground hover:bg-accent hover:text-foreground">H3</button>
-              <button type="button" onClick={formatAddBody} className="shrink-0 rounded-md px-2 py-1.5 text-muted-foreground hover:bg-accent hover:text-foreground">Body</button>
-              <span className="mx-1 h-7 w-px shrink-0 bg-border" />
-              <button type="button" onClick={() => formatAddList(false)} className="inline-flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1.5 text-muted-foreground hover:bg-accent hover:text-foreground"><List className="h-4 w-4" /> Bullet list</button>
-              <button type="button" onClick={() => formatAddList(true)} className="inline-flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1.5 text-muted-foreground hover:bg-accent hover:text-foreground"><ListOrdered className="h-4 w-4" /> Numbered list</button>
-              <button
-                type="button"
-                onClick={submitAdd}
-                disabled={!addTitle.trim() || busy}
-                className="ml-auto inline-flex min-w-[126px] shrink-0 items-center justify-center rounded-md bg-primary px-6 py-2 text-sm font-medium text-primary-foreground shadow-sm transition-colors hover:bg-primary/90 disabled:cursor-not-allowed disabled:opacity-40"
-              >
-                {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Save'}
-              </button>
-            </div>
+function Avatar({ email }: { email: string }) {
+  return <Link href="/profile" aria-label="Open profile" className="flex h-9 w-9 items-center justify-center rounded-full bg-[#bd315c] text-sm font-medium text-white hover:opacity-90 sm:h-10 sm:w-10">{(email[0] || 'U').toUpperCase()}</Link>;
+}
+
+function BetaAndAvatar({ email, feedback = false }: { email: string; feedback?: boolean }) {
+  return (
+    <div className="flex items-center gap-4">
+      <div className="inline-flex overflow-hidden rounded-md border border-[#a8c4ff] text-sm">
+        <span className="bg-[#edf3ff] px-4 py-1.5 text-[#477bea]">Beta</span>
+        {feedback && <a href="mailto:feedback@ocreda.com" className="border-l border-[#a8c4ff] px-3 py-1.5 text-[#252525] hover:bg-[#f5f7fb]">Send feedback</a>}
+      </div>
+      <Avatar email={email} />
+    </div>
+  );
+}
+
+function EmptyWorkspace({ displayName, userEmail, onAddNote, onImport, importError, progress }: {
+  displayName: string; userEmail: string; onAddNote: () => void;
+  onImport: (drafts: ImportNoteDraft[]) => Promise<void>; importError: string;
+  progress: { completed: number; total: number } | null;
+}) {
+  return (
+    <div className="relative flex h-full min-h-0 flex-col overflow-y-auto bg-white px-5 md:overflow-hidden sm:px-10">
+      <div className="flex h-[72px] shrink-0 items-start justify-end pt-5 sm:h-[82px] sm:pt-7"><BetaAndAvatar email={userEmail} /></div>
+      <div className="flex flex-none flex-col items-center justify-start py-5 sm:py-7 md:min-h-0 md:flex-1 md:justify-center">
+      <div className="mx-auto w-full max-w-[920px]">
+        <div className="text-center">
+          <h1 className="flex items-center justify-center gap-3 text-[28px] font-medium tracking-[-0.02em] sm:text-[36px]"><OcredaMark className="h-9 w-9 sm:h-10 sm:w-10" /> Welcome to Ocreda, {displayName || 'you'}</h1>
+          <p className="mt-2 text-base text-[#777] sm:text-lg">Let your knowledge proactively come to you without asking</p>
+        </div>
+        <div className="mt-[clamp(32px,5vh,64px)] grid items-start gap-4 md:grid-cols-2">
+          <NoteImporter onImport={onImport} importError={importError} />
+          <div className="flex min-h-[338px] flex-col items-center rounded-[20px] bg-[#f6f6f8] px-8 py-8 text-center">
+            <h2 className="text-[17px] font-semibold">Add one note to start.</h2>
+            <p className="mt-2 max-w-[330px] text-base leading-relaxed text-[#777]">This way there is a cold start, but you will<br className="hidden sm:block" /> start cleanly.</p>
+            <button type="button" onClick={onAddNote} aria-label="Add one note" className="mt-20 flex h-9 w-[145px] items-center justify-center rounded-md bg-[#477bea] text-white hover:bg-[#3d6ed7]"><Plus className="h-5 w-5" /></button>
           </div>
         </div>
-      )}
+        {progress && <div className="mt-6" aria-live="polite"><div className="h-1.5 overflow-hidden rounded-full bg-[#eee]"><div className="h-full bg-[#477bea] transition-all" style={{ width: `${Math.round((progress.completed / progress.total) * 100)}%` }} /></div><p className="mt-2 text-center text-sm text-[#777]">Uploading and organizing {progress.completed} of {progress.total} notes</p></div>}
+      </div>
+      </div>
+      <p className="flex h-[58px] shrink-0 items-center justify-center text-center text-xs text-[#777] sm:h-[68px] sm:text-sm">Your notes are private and secured. Nobody can touch them.</p>
+    </div>
+  );
+}
 
-      {savedOpen && (
-        <div className="fixed inset-0 z-[80] flex items-center justify-center overflow-hidden bg-black/30 px-4 backdrop-blur-[3px]" role="status" aria-live="polite">
-          <div
-            className={`flex h-[220px] w-full max-w-[516px] items-center justify-center rounded-lg bg-[#4779e8] px-6 text-center text-xl font-normal text-white shadow-xl transition-all duration-500 ease-in sm:h-[300px] ${
-              savedExiting ? 'translate-y-[calc(50vh+100%)]' : 'animate-ocreda-fade-up translate-y-0'
-            }`}
-          >
-            Saved to you for you
+type LibrarySort = 'newest' | 'oldest' | 'random' | 'date';
+
+function CortexGrid({ cortexes, notes, notesByCortex, busy, onClose, onAddNote, onAddCortex, onEditCortex, onDeleteCortex, onOpenNote, onImport, onSaveRetrieval }: {
+  cortexes: CortexMeta[]; notes: Note[]; notesByCortex: Map<string, Note[]>; busy: boolean;
+  onClose: () => void;
+  onAddNote: (muse?: string) => void; onAddCortex: () => void; onEditCortex: (cortex: CortexMeta) => void;
+  onDeleteCortex: (title: string) => void; onOpenNote: (note: Note) => void;
+  onImport: (drafts: ImportNoteDraft[]) => Promise<void>;
+  onSaveRetrieval: (queryText: string, resultNotes: Note[], category: string) => Promise<Note>;
+}) {
+  const [selectedMuses, setSelectedMuses] = useState<Set<string>>(new Set());
+  const [layout, setLayout] = useState<'grid' | 'list'>('grid');
+  const [sort, setSort] = useState<LibrarySort>('newest');
+  const [randomSeed, setRandomSeed] = useState(() => Date.now());
+  const [sortOpen, setSortOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const [date, setDate] = useState('');
+  const [musesOpen, setMusesOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [instantRetrievalOpen, setInstantRetrievalOpen] = useState(false);
+
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || searchOpen || sortOpen || musesOpen || importOpen || instantRetrievalOpen) return;
+      if (document.querySelector('[aria-modal="true"], [role="status"]')) return;
+      onClose();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [importOpen, instantRetrievalOpen, musesOpen, onClose, searchOpen, sortOpen]);
+
+  const visibleNotes = useMemo(() => {
+    const cleanQuery = query.trim().toLowerCase();
+    const filtered = notes.filter((note) => {
+      const muse = cleanCategory(note.category);
+      if (selectedMuses.size && (!muse || !Array.from(selectedMuses).some((item) => item.toLowerCase() === muse.toLowerCase()))) return false;
+      if (date && localDateKey(note.created_at) !== date) return false;
+      return !cleanQuery || note.raw_text.toLowerCase().includes(cleanQuery) || (muse ?? '').toLowerCase().includes(cleanQuery);
+    });
+    if (sort === 'oldest') return [...filtered].sort((a, b) => a.created_at.localeCompare(b.created_at));
+    if (sort === 'random') return [...filtered].sort((a, b) => stableHash(`${a.id}-${randomSeed}`) - stableHash(`${b.id}-${randomSeed}`));
+    return [...filtered].sort((a, b) => b.created_at.localeCompare(a.created_at));
+  }, [date, notes, query, randomSeed, selectedMuses, sort]);
+
+  const firstSelectedMuse = Array.from(selectedMuses)[0];
+  const resetLibrary = () => { setSelectedMuses(new Set()); setQuery(''); setSearchOpen(false); setDate(''); setSort('newest'); setSortOpen(false); };
+  const toggleMuse = (title: string) => setSelectedMuses((current) => {
+    const next = new Set(current);
+    if (next.has(title)) next.delete(title); else next.add(title);
+    return next;
+  });
+
+  return (
+    <div className="relative flex h-full min-h-0 flex-col overflow-hidden bg-white">
+      <header className="relative z-20 flex h-[118px] shrink-0 items-end gap-3 overflow-x-auto bg-[#bdbdbd] px-5 pb-4 pt-10 lg:px-7">
+        <button type="button" onClick={onAddCortex} className="h-10 shrink-0 rounded-md border border-white bg-transparent px-8 text-sm italic text-white shadow hover:bg-white/10">Create</button>
+        <button type="button" onClick={resetLibrary} className={`h-10 shrink-0 rounded-md px-9 text-sm shadow ${selectedMuses.size === 0 ? 'bg-[#202020] text-white' : 'bg-white text-[#222]'}`}>All</button>
+        {cortexes.slice(0, 5).map((cortex) => <button key={cortex.title} type="button" onClick={() => toggleMuse(cortex.title)} className={`h-10 min-w-[174px] shrink-0 rounded-md px-5 text-sm shadow ${selectedMuses.has(cortex.title) ? 'bg-[#202020] text-white' : 'bg-[#fbfbfd] text-[#b5b5b5]'}`}>{cortex.title}</button>)}
+        <button type="button" onClick={() => setMusesOpen(true)} className="ml-auto h-10 min-w-[170px] shrink-0 rounded-md bg-white px-8 text-sm text-[#222] shadow hover:bg-[#f8f8f8]">See all</button>
+        <button type="button" onClick={onClose} aria-label="Close note library" title="Close note library" className="absolute right-3 top-3 flex h-9 w-9 items-center justify-center rounded-md text-white drop-shadow hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"><X className="h-6 w-6" /></button>
+      </header>
+
+      <div className="relative min-h-0 flex-1 overflow-y-auto bg-white">
+        <aside className="absolute left-5 top-24 z-10 flex w-24 flex-col items-center text-[#aaa] lg:left-8">
+          <button type="button" onClick={() => onAddNote(firstSelectedMuse)} aria-label="Add note" className="flex h-32 w-8 items-center justify-center rounded-md bg-[#477bea] text-white shadow hover:bg-[#3d6ed7]"><Plus className="h-5 w-5" /></button>
+          <span className="mt-20 text-xs text-[#477bea]">{visibleNotes.length} {visibleNotes.length === 1 ? 'note' : 'notes'}</span>
+          <div className="relative mt-6">
+            <button type="button" onClick={() => setSortOpen((open) => !open)} aria-label="Sort notes" className="flex h-10 w-10 items-center justify-center rounded-md hover:bg-[#f4f4f4]"><Filter className="h-5 w-5" /></button>
+            {sortOpen && <div className="absolute left-10 top-0 z-30 w-28 rounded-lg border border-[#e5e5e5] bg-white p-2 text-left text-xs text-[#aaa] shadow-xl">{(['newest', 'oldest', 'random', 'date'] as LibrarySort[]).map((option) => <button key={option} type="button" onClick={() => { setSort(option); if (option === 'random') setRandomSeed(Date.now()); if (option !== 'date') setDate(''); setSortOpen(false); }} className={`block w-full rounded px-2 py-1.5 capitalize hover:bg-[#f5f5f5] ${sort === option ? 'text-[#222]' : ''}`}>{option}</button>)}</div>}
+          </div>
+          {sort === 'date' && <input type="date" value={date} onChange={(event) => setDate(event.target.value)} aria-label="Filter by date" className="mt-1 w-24 rounded border border-[#ddd] px-1 py-1 text-[10px] text-[#555]" />}
+          <button type="button" onClick={() => setLayout((value) => value === 'grid' ? 'list' : 'grid')} aria-label={layout === 'grid' ? 'Use large card view' : 'Use grid view'} className="mt-1 flex h-10 w-10 items-center justify-center rounded-md hover:bg-[#f4f4f4]">{layout === 'grid' ? <Grid2X2 className="h-5 w-5" /> : <Rows3 className="h-5 w-5" />}</button>
+          <button type="button" onClick={() => { setSearchOpen((open) => !open); if (searchOpen) setQuery(''); }} aria-label="Search notes" className="mt-1 flex h-10 w-10 items-center justify-center rounded-md hover:bg-[#f4f4f4]"><Search className="h-5 w-5" /></button>
+          <button type="button" onClick={() => setImportOpen(true)} aria-label="Import notes" className="mt-1 flex h-10 w-10 items-center justify-center rounded-md hover:bg-[#f4f4f4]"><Upload className="h-5 w-5" /></button>
+        </aside>
+
+        <section className="min-h-full pl-[138px] pr-6 pt-16 lg:pl-[190px] lg:pr-14">
+          {searchOpen && <label className="mb-10 flex h-12 w-full max-w-[330px] items-center rounded-xl bg-[#f7f7f9] px-4 shadow"><Search className="mr-3 h-5 w-5 text-[#aaa]" /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'Escape') { setSearchOpen(false); setQuery(''); } }} placeholder="Search your notes" className="min-w-0 flex-1 bg-transparent text-sm outline-none" /></label>}
+          <div className={`grid gap-10 pb-20 ${query.trim() ? 'grid-cols-1' : layout === 'grid' ? 'grid-cols-1 md:grid-cols-2 xl:grid-cols-3' : 'grid-cols-1 xl:grid-cols-2'}`}>
+            {selectedMuses.size === 0 && !query.trim() && <AddLibraryCard layout={layout} onClick={() => onAddNote()} />}
+            {visibleNotes.map((note) => <LibraryNoteCard key={note.id} note={note} query={query} layout={query.trim() ? 'search' : layout} onClick={() => onOpenNote(note)} />)}
+            {query.trim() && <InstantRetrievalCard onClick={() => setInstantRetrievalOpen(true)} tall />}
+            {selectedMuses.size > 0 && !query.trim() && <AddLibraryCard layout={layout} onClick={() => onAddNote(firstSelectedMuse)} />}
+          </div>
+          {!visibleNotes.length && query.trim() && <p className="pb-20 text-sm text-[#999]">No notes contain “{query.trim()}”.</p>}
+        </section>
+      </div>
+
+      {musesOpen && <MuseSelector cortexes={cortexes} notesByCortex={notesByCortex} selected={selectedMuses} busy={busy} onClose={() => setMusesOpen(false)} onSave={(next) => { setSelectedMuses(next); setMusesOpen(false); }} onCreate={() => { setMusesOpen(false); onAddCortex(); }} onEdit={(cortex) => { setMusesOpen(false); onEditCortex(cortex); }} onDelete={onDeleteCortex} />}
+      {importOpen && <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/25 p-4 backdrop-blur-[5px]"><button type="button" onClick={() => setImportOpen(false)} aria-label="Close importer" className="absolute right-6 top-6 text-white"><X className="h-7 w-7" /></button><div className="w-[min(92vw,620px)] rounded-2xl bg-white p-7 shadow-2xl"><NoteImporter onImport={async (drafts) => { await onImport(drafts); setImportOpen(false); }} /></div></div>}
+      {instantRetrievalOpen && <InstantRetrievalOverlay notes={notes} cortexes={cortexes} initialQuery={query} saving={busy} onClose={() => setInstantRetrievalOpen(false)} onOpenNote={(note) => { setInstantRetrievalOpen(false); onOpenNote(note); }} onSave={onSaveRetrieval} />}
+    </div>
+  );
+}
+
+function AddLibraryCard({ layout, onClick }: { layout: 'grid' | 'list'; onClick: () => void }) {
+  return <button type="button" onClick={onClick} className={`relative rounded-lg border border-[#e1e1e1] bg-white p-7 text-left text-[#477bea] shadow-[0_2px_9px_rgba(0,0,0,0.16)] transition hover:-translate-y-0.5 hover:shadow-lg ${layout === 'grid' ? 'min-h-[300px]' : 'min-h-[420px]'}`}><span className="flex items-center gap-2 text-base"><Plus className="h-5 w-5" /> Add</span><span className="absolute inset-x-5 bottom-5 text-center text-sm italic text-[#bbb]">You can always add more</span></button>;
+}
+
+function LibraryNoteCard({ note, query, layout, onClick }: { note: Note; query: string; layout: 'grid' | 'list' | 'search'; onClick: () => void }) {
+  const content = splitNote(note);
+  return <button type="button" onClick={onClick} className={`relative overflow-hidden rounded-lg border border-[#e1e1e1] bg-[#f7f7f9] text-left shadow-[0_2px_9px_rgba(0,0,0,0.16)] transition hover:-translate-y-0.5 hover:border-[#7ca2ff] hover:shadow-lg ${layout === 'grid' ? 'min-h-[300px]' : layout === 'list' ? 'min-h-[420px]' : 'min-h-[500px]'}`}><span className="m-2 block min-h-[230px] rounded-md bg-white px-6 py-7"><strong className="block text-base"><HighlightedText text={content.title} query={query} /></strong><span className={`mt-4 block whitespace-pre-wrap text-sm leading-relaxed text-[#777] ${layout === 'search' ? 'line-clamp-[18]' : layout === 'list' ? 'line-clamp-[15]' : 'line-clamp-[9]'}`}><HighlightedText text={content.body || notePreview(note)} query={query} /></span></span><span className="absolute inset-x-4 bottom-4 flex justify-between text-xs text-[#aaa]"><span>Muse: {cleanCategory(note.category) || 'Instant retrieval'}</span><span>{formatDate(note.created_at)}</span></span></button>;
+}
+
+function MuseSelector({ cortexes, notesByCortex, selected, busy, onClose, onSave, onCreate, onEdit, onDelete }: {
+  cortexes: CortexMeta[]; notesByCortex: Map<string, Note[]>; selected: Set<string>; busy: boolean;
+  onClose: () => void; onSave: (selected: Set<string>) => void; onCreate: () => void;
+  onEdit: (cortex: CortexMeta) => void; onDelete: (title: string) => void;
+}) {
+  const [draft, setDraft] = useState(() => new Set(selected));
+  const [menu, setMenu] = useState<string | null>(null);
+  const toggle = (title: string) => setDraft((current) => { const next = new Set(current); if (next.has(title)) next.delete(title); else next.add(title); return next; });
+  return <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/30 p-5 backdrop-blur-[6px]" role="dialog" aria-modal="true" aria-label="Choose Muses"><div className="relative flex h-[min(78vh,720px)] w-[min(92vw,1220px)] flex-col rounded-xl bg-white shadow-2xl"><button type="button" onClick={onClose} aria-label="Close Muse selector" className="absolute right-2 top-2 z-10 text-[#777] sm:-right-10 sm:-top-10 sm:text-white"><X className="h-7 w-7" /></button><button type="button" onClick={onCreate} aria-label="Create Muse" className="absolute left-3 top-3 flex h-7 w-7 items-center justify-center rounded-md bg-[#477bea] text-white"><Plus className="h-4 w-4" /></button><h2 className="pt-12 text-center text-sm text-[#aaa]">Muses</h2><div className="grid flex-1 grid-cols-1 gap-8 overflow-y-auto px-12 pb-10 pt-14 sm:grid-cols-2 lg:grid-cols-4">{cortexes.map((cortex) => <div key={cortex.title} className="relative"><button type="button" onClick={() => toggle(cortex.title)} className={`flex h-32 w-full flex-col justify-between rounded-lg p-5 text-left shadow-[0_2px_8px_rgba(0,0,0,0.16)] ${draft.has(cortex.title) ? 'bg-[#202020] text-white' : 'bg-[#f6f6f8] text-[#777]'}`}><span>{cortex.title}</span><span className="text-xs opacity-60">{notesByCortex.get(cortex.title)?.length ?? 0} notes</span></button><button type="button" onClick={() => setMenu(menu === cortex.title ? null : cortex.title)} aria-label={`${cortex.title} options`} className="absolute bottom-2 right-2 rounded p-1 hover:bg-black/10"><MoreHorizontal className="h-4 w-4" /></button>{menu === cortex.title && <div className="absolute right-0 top-full z-20 mt-1 w-28 rounded-md border border-[#ddd] bg-white py-1 text-xs text-[#222] shadow-xl"><button type="button" onClick={() => onEdit(cortex)} className="block w-full px-3 py-2 text-left hover:bg-[#f5f5f5]">Edit</button><button type="button" disabled={busy} onClick={() => { setMenu(null); setDraft((current) => { const next = new Set(current); next.delete(cortex.title); return next; }); onDelete(cortex.title); }} className="block w-full px-3 py-2 text-left text-red-600 hover:bg-red-50">Delete</button></div>}</div>)}<button type="button" onClick={onCreate} aria-label="Add another Muse" className="flex h-32 items-center justify-center rounded-lg text-[#477bea] hover:bg-[#fafafa]"><Plus className="h-7 w-7" /></button></div><button type="button" onClick={() => onSave(draft)} className="absolute bottom-2 right-2 h-8 w-28 rounded-md bg-[#202020] text-sm text-white hover:bg-black">Save</button></div></div>;
+}
+
+function CortexDetail({ title, notes, isUnsorted, busy, onBack, onAddNote, onOpenNote, onEdit, onDelete }: {
+  title: string; notes: Note[]; isUnsorted: boolean; busy: boolean; onBack: () => void; onAddNote: () => void;
+  onOpenNote: (note: Note) => void; onEdit: () => void; onDelete: () => void;
+}) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  return (
+    <div className="relative h-full min-h-0 overflow-y-auto bg-white px-5 pb-16 pt-6 sm:px-12 lg:px-20">
+      <button type="button" onClick={onBack} aria-label="Back to your cortex" className="absolute left-5 top-5 flex h-10 w-10 items-center justify-center rounded-md text-[#555] hover:bg-[#f4f4f4] sm:left-8"><ArrowLeft className="h-5 w-5" /></button>
+      <h1 className="text-center text-sm font-normal text-[#aaa]">{title}</h1>
+      {!isUnsorted && <div className="absolute right-6 top-5 sm:right-10"><button type="button" onClick={() => setMenuOpen((value) => !value)} aria-label="Cortex options" aria-expanded={menuOpen} className="flex h-10 w-10 items-center justify-center rounded-md hover:bg-[#f4f4f4]"><MoreHorizontal className="h-5 w-5" /></button>{menuOpen && <div className="absolute right-0 top-11 z-10 w-40 overflow-hidden rounded-lg border border-[#ddd] bg-white py-1 text-sm shadow-xl"><button type="button" onClick={() => { setMenuOpen(false); onEdit(); }} className="block w-full px-4 py-2.5 text-left hover:bg-[#f5f5f5]">Edit cortex</button><button type="button" disabled={busy} onClick={() => { setMenuOpen(false); onDelete(); }} className="block w-full px-4 py-2.5 text-left text-red-600 hover:bg-red-50">Delete cortex</button></div>}</div>}
+      <div className="mx-auto mt-16 grid max-w-[1300px] grid-cols-1 justify-items-center gap-x-14 gap-y-16 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+        {notes.map((note) => { const content = splitNote(note); return <button key={note.id} type="button" onClick={() => onOpenNote(note)} className="relative h-[355px] w-[278px] rounded-md border border-[#e2e2e2] bg-white p-6 text-left shadow-[0_2px_9px_rgba(0,0,0,0.15)] transition-all hover:-translate-y-0.5 hover:shadow-lg"><strong className="block text-base">{content.title}</strong><span className="mt-4 block whitespace-pre-wrap text-sm leading-relaxed text-[#727272] line-clamp-[12]">{content.body || notePreview(note)}</span><span className="absolute bottom-4 right-4 text-xs text-[#b8b8b8]">{formatDate(note.created_at)}</span></button>; })}
+        <button type="button" onClick={onAddNote} aria-label={`Add a note to ${title}`} className="flex h-[355px] w-[278px] items-center justify-center text-[#477bea] hover:bg-[#fafafa]"><FolderPlus className="h-9 w-9 stroke-[1.6]" /></button>
+      </div>
+      {!notes.length && <p className="mt-8 text-center text-sm text-[#999]">This cortex is ready for its first note.</p>}
+    </div>
+  );
+}
+
+type ReadingRelation = {
+  note: Note;
+  reason: string;
+  related: boolean;
+};
+
+type KnowledgeFilter = { kind: 'muse' | 'date'; value: string; label: string };
+type KnowledgeSearchRequest = { query: string; filter?: KnowledgeFilter };
+
+function sharedWordScore(left: string, right: string): number {
+  const ignored = new Set(['about', 'after', 'again', 'because', 'before', 'being', 'could', 'from', 'have', 'into', 'just', 'more', 'that', 'their', 'there', 'these', 'they', 'this', 'what', 'when', 'where', 'which', 'will', 'with', 'would', 'your']);
+  const words = (value: string) => new Set((value.toLowerCase().match(/[a-z0-9']{4,}/g) ?? []).filter((word) => !ignored.has(word)));
+  const first = words(left); const second = words(right);
+  let score = 0; first.forEach((word) => { if (second.has(word)) score += 1; });
+  return score;
+}
+
+function fullNoteDate(value: string): string {
+  return new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric' }).format(new Date(value));
+}
+
+function localDateKey(value: string): string {
+  const date = new Date(value);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function HighlightedText({ text, query }: { text: string; query: string }) {
+  const clean = query.trim();
+  if (!clean) return <>{text}</>;
+  const expression = new RegExp(`(${escapeRegExp(clean)})`, 'ig');
+  return <>{text.split(expression).map((part, index) => part.toLowerCase() === clean.toLowerCase() ? <mark key={`${part}-${index}`} className="bg-transparent text-[#477bea]">{part}</mark> : part)}</>;
+}
+
+function NoteReadingWorkspace({ note, allNotes, cortexes, saving, onBack, onAddNote, onImport, onOpenNote, onUpdate, onDelete, onSaveRetrieval }: {
+  note: Note; allNotes: Note[]; cortexes: CortexMeta[]; saving: boolean;
+  onBack: () => void; onAddNote: () => void; onImport: (drafts: ImportNoteDraft[]) => Promise<void>;
+  onOpenNote: (note: Note) => void; onUpdate: (noteId: string, rawText: string) => Promise<void>;
+  onDelete: (note: Note) => Promise<void>;
+  onSaveRetrieval: (queryText: string, resultNotes: Note[], category: string) => Promise<Note>;
+}) {
+  const initial = splitNote(note);
+  const [title, setTitle] = useState(initial.title);
+  const [body, setBody] = useState(initial.body);
+  const [editing, setEditing] = useState(false);
+  const [selectedParagraph, setSelectedParagraph] = useState(-1);
+  const [selectedSourceId, setSelectedSourceId] = useState<string | null>(null);
+  const [relations, setRelations] = useState<ReadingRelation[]>([]);
+  const [relationsLoading, setRelationsLoading] = useState(true);
+  const [sourcesOpen, setSourcesOpen] = useState(true);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [searchRequest, setSearchRequest] = useState<KnowledgeSearchRequest | null>(null);
+  const [detailNote, setDetailNote] = useState<Note | null>(null);
+  const [instantRetrievalOpen, setInstantRetrievalOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const bodyRef = useRef<HTMLTextAreaElement>(null);
+  const latestSaveRef = useRef(onUpdate);
+  latestSaveRef.current = onUpdate;
+
+  useEffect(() => {
+    let active = true;
+    setRelationsLoading(true);
+    const loadRelations = async () => {
+      let connected: Awaited<ReturnType<typeof getNoteRelations>> = [];
+      try { connected = await getNoteRelations(note.id); } catch { connected = []; }
+      if (!active) return;
+      const connectedMap = new Map(connected.map((relation) => [relation.related_note_id, relation]));
+      const candidates = allNotes
+        .filter((item) => item.id !== note.id)
+        .map((item) => ({ item, score: sharedWordScore(note.raw_text, item.raw_text), relation: connectedMap.get(item.id) }))
+        .sort((a, b) => Number(Boolean(b.relation)) - Number(Boolean(a.relation)) || b.score - a.score || b.item.created_at.localeCompare(a.item.created_at))
+        .slice(0, 8)
+        .map(({ item, score, relation }): ReadingRelation => ({
+          note: item,
+          related: Boolean(relation),
+          reason: relation?.reason?.trim() || (score > 0 ? `This note returns to ${score === 1 ? 'a theme' : `${score} themes`} in the page you are reading.` : 'This is a recent note from your knowledge base.'),
+        }));
+      setRelations(candidates);
+      setSelectedSourceId(candidates[0]?.note.id ?? null);
+      setRelationsLoading(false);
+    };
+    void loadRelations();
+    return () => { active = false; };
+  }, [allNotes, note.id, note.raw_text]);
+
+  const rawText = title.trim() && body.trim() ? `${title.trim()}\n\n${body.trim()}` : title.trim() || body.trim();
+  useEffect(() => {
+    if (!editing || !rawText || rawText === note.raw_text.trim()) return;
+    setSaveState('saving');
+    const timeout = window.setTimeout(() => {
+      latestSaveRef.current(note.id, rawText).then(() => setSaveState('saved')).catch(() => setSaveState('error'));
+    }, 850);
+    return () => window.clearTimeout(timeout);
+  }, [body, editing, note.id, note.raw_text, rawText, title]);
+
+  const orderedNotes = useMemo(() => [...allNotes].sort((a, b) => b.created_at.localeCompare(a.created_at)), [allNotes]);
+  const noteIndex = orderedNotes.findIndex((item) => item.id === note.id);
+  const previousNote = noteIndex < orderedNotes.length - 1 ? orderedNotes[noteIndex + 1] : null;
+  const nextNote = noteIndex > 0 ? orderedNotes[noteIndex - 1] : null;
+  const paragraphs = body.split(/\n\s*\n/).map((part) => part.trim()).filter(Boolean);
+  const selectedSource = relations.find((item) => item.note.id === selectedSourceId) ?? relations[0] ?? null;
+  const selectedSourceContent = selectedSource ? splitNote(selectedSource.note) : null;
+  const sourceCortexes = useMemo(() => {
+    const names = new Set(relations.map((relation) => cleanCategory(relation.note.category)).filter((value): value is string => Boolean(value)));
+    const matching = cortexes.filter((cortex) => names.has(cortex.title));
+    return (matching.length ? matching : cortexes).slice(0, 3);
+  }, [cortexes, relations]);
+
+  const leaveWorkspace = async (next?: Note | null) => {
+    if (rawText && rawText !== note.raw_text.trim()) {
+      setSaveState('saving');
+      try { await latestSaveRef.current(note.id, rawText); setSaveState('saved'); }
+      catch { setSaveState('error'); return; }
+    }
+    if (next) onOpenNote(next); else onBack();
+  };
+
+  const surfaceForParagraph = (paragraph: string) => {
+    const ranked = [...relations].sort((a, b) => sharedWordScore(paragraph, b.note.raw_text) - sharedWordScore(paragraph, a.note.raw_text));
+    if (ranked[0]) setSelectedSourceId(ranked[0].note.id);
+  };
+
+  const applyReadingFormat = (kind: 'bold' | 'italic' | 'h1' | 'h2' | 'h3' | 'body' | 'bullet' | 'number') => {
+    const field = bodyRef.current; if (!field) return;
+    const start = field.selectionStart; const end = field.selectionEnd; const selection = body.slice(start, end);
+    let replacement = selection;
+    if (kind === 'bold') replacement = `**${selection || 'bold text'}**`;
+    if (kind === 'italic') replacement = `*${selection || 'italic text'}*`;
+    if (kind === 'h1') replacement = `# ${selection || 'Heading'}`;
+    if (kind === 'h2') replacement = `## ${selection || 'Heading'}`;
+    if (kind === 'h3') replacement = `### ${selection || 'Heading'}`;
+    if (kind === 'body') replacement = selection.replace(/^#{1,3}\s+/gm, '');
+    if (kind === 'bullet') replacement = (selection || 'List item').split('\n').map((line) => `• ${line.replace(/^[-•]\s*/, '')}`).join('\n');
+    if (kind === 'number') replacement = (selection || 'List item').split('\n').map((line, index) => `${index + 1}. ${line.replace(/^\d+\.\s*/, '')}`).join('\n');
+    setBody(`${body.slice(0, start)}${replacement}${body.slice(end)}`);
+    requestAnimationFrame(() => { field.focus(); field.setSelectionRange(start, start + replacement.length); });
+  };
+
+  return (
+    <div className="flex h-full min-h-0 flex-col bg-white p-3 sm:p-5">
+      <header className="relative flex h-14 shrink-0 items-center justify-between px-1 sm:px-2">
+        <div className="flex items-center gap-1 text-[#aaa] sm:gap-2">
+          <button type="button" onClick={() => void leaveWorkspace()} aria-label="Back to Muse" className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-[#f4f4f4] hover:text-[#222]"><ArrowLeft className="h-5 w-5" /></button>
+          <span className="mx-1 h-7 w-px bg-[#e5e5e5]" />
+          <button type="button" onClick={onAddNote} aria-label="Add a note" className="flex h-8 w-8 items-center justify-center rounded-md bg-[#477bea] text-white hover:bg-[#3d6ed7]"><Plus className="h-5 w-5" /></button>
+          <button type="button" onClick={() => setImportOpen(true)} aria-label="Import notes" className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-[#f4f4f4] hover:text-[#555]"><Upload className="h-5 w-5" /></button>
+          <button type="button" onClick={() => setSearchRequest({ query: '' })} aria-label="Search notes and Muses" className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-[#f4f4f4] hover:text-[#555]"><Search className="h-5 w-5" /></button>
+        </div>
+        <div className="flex items-center gap-1 text-xs text-[#888] sm:gap-2">
+          <button type="button" disabled={!previousNote} onClick={() => previousNote && void leaveWorkspace(previousNote)} aria-label="Previous note" className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-[#f4f4f4] disabled:opacity-25"><ChevronLeft className="h-4 w-4" /></button>
+          <span className="min-w-[48px] text-center">{formatDate(note.created_at)}</span>
+          <button type="button" disabled={!nextNote} onClick={() => nextNote && void leaveWorkspace(nextNote)} aria-label="Next note" className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-[#f4f4f4] disabled:opacity-25"><ChevronRight className="h-4 w-4" /></button>
+          <div className="relative">
+            <button type="button" onClick={() => setMenuOpen((open) => !open)} aria-label="Page options" aria-expanded={menuOpen} className="flex h-9 w-9 items-center justify-center rounded-md text-[#222] hover:bg-[#f4f4f4]"><MoreHorizontal className="h-5 w-5" /></button>
+            {menuOpen && <div className="absolute right-0 top-10 z-30 w-40 overflow-hidden rounded-lg border border-[#ddd] bg-white py-1 text-sm shadow-xl"><button type="button" onClick={() => { setMenuOpen(false); setEditing(true); }} className="block w-full px-4 py-2.5 text-left hover:bg-[#f5f5f5]">Edit page</button><button type="button" disabled={saving} onClick={() => { setMenuOpen(false); void onDelete(note); }} className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-red-600 hover:bg-red-50"><Trash2 className="h-4 w-4" /> Delete page</button></div>}
           </div>
         </div>
-      )}
+      </header>
 
-      {guidedOpen && (
-        <GuidedChat
-          displayName={displayName}
-          step={guidedStep}
-          messages={guidedMessages}
-          value={guidedValue}
-          busy={guidedBusy}
-          error={guidedError}
-          drafts={guidedDrafts}
-          onChange={setGuidedValue}
-          onSubmit={submitGuidedAnswer}
-          onSkip={closeGuidedChat}
-          onBack={() => setGuidedOpen(false)}
-          onAddNote={() => setAddOpen(true)}
-          onDraftsChange={setGuidedDrafts}
-          onSaveDrafts={saveGuidedDrafts}
-        />
-      )}
+      <div className={`grid min-h-0 flex-1 overflow-y-auto rounded-xl border border-[#cfcfcf] bg-[#f7f7f9] shadow-[0_2px_9px_rgba(0,0,0,0.16)] lg:overflow-hidden ${sourcesOpen ? 'lg:grid-cols-[minmax(0,1.05fr)_minmax(330px,.92fr)_320px]' : 'lg:grid-cols-[minmax(0,1.35fr)_minmax(350px,.85fr)]'}`}>
+        <section className="relative flex min-h-[520px] min-w-0 flex-col overflow-hidden bg-white shadow-[4px_0_12px_rgba(0,0,0,0.13)] lg:min-h-0">
+          <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-24 pt-12 sm:px-14 lg:px-[7%] lg:pt-16">
+            {editing ? <div className="mx-auto max-w-3xl"><input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} aria-label="Note title" className="w-full bg-transparent text-2xl font-semibold outline-none" /><textarea ref={bodyRef} value={body} onChange={(event) => setBody(event.target.value)} aria-label="Note text" className="mt-7 min-h-[420px] w-full resize-none bg-transparent text-base leading-[1.65] outline-none" /></div> : <article className="mx-auto max-w-3xl"><button type="button" onClick={() => setEditing(true)} className="w-full rounded-md text-left outline-none hover:bg-[#f8f8f8] focus:ring-2 focus:ring-[#477bea]/20"><h1 className="px-2 py-1 text-2xl font-semibold">{title}</h1></button><div className="mt-6 space-y-3">{paragraphs.length ? paragraphs.map((paragraph, index) => <button key={`${index}-${paragraph.slice(0, 20)}`} type="button" onMouseEnter={() => surfaceForParagraph(paragraph)} onFocus={() => surfaceForParagraph(paragraph)} onClick={() => { surfaceForParagraph(paragraph); if (selectedParagraph === index) setEditing(true); else setSelectedParagraph(index); }} className={`block w-full rounded-md px-2 py-2 text-left text-base leading-[1.65] transition-colors ${selectedParagraph === index ? 'bg-[#e5edff]' : 'hover:bg-[#f2f5fb]'}`}>{paragraph}</button>) : <button type="button" onClick={() => setEditing(true)} className="block w-full rounded-md px-2 py-3 text-left text-[#aaa] hover:bg-[#f5f5f5]">Tap to start writing.</button>}</div></article>}
+          </div>
+          {editing && <div className="absolute bottom-5 left-1/2 flex max-w-[calc(100%-32px)] -translate-x-1/2 items-center gap-1 rounded-xl bg-[#f7f7f9] px-3 py-2 text-sm text-[#555] shadow-sm"><button type="button" aria-label="Voice input" className="flex h-8 w-8 items-center justify-center rounded hover:bg-white"><Mic className="h-4 w-4" /></button><span className="mx-1 h-7 w-px bg-[#ddd]" /><button type="button" onClick={() => applyReadingFormat('bold')} className="h-8 w-8 rounded font-bold hover:bg-white">B</button><button type="button" onClick={() => applyReadingFormat('italic')} className="h-8 w-8 rounded italic hover:bg-white">I</button><span className="mx-1 h-7 w-px bg-[#ddd]" />{(['h1', 'h2', 'h3'] as const).map((kind) => <button key={kind} type="button" onClick={() => applyReadingFormat(kind)} className="hidden h-8 rounded px-2 font-semibold hover:bg-white sm:block">{kind.toUpperCase()}</button>)}<button type="button" onClick={() => applyReadingFormat('body')} className="hidden h-8 rounded px-2 hover:bg-white md:block">Body</button><span className="mx-1 hidden h-7 w-px bg-[#ddd] md:block" /><button type="button" onClick={() => applyReadingFormat('bullet')} className="hidden h-8 items-center gap-1 rounded px-2 hover:bg-white lg:flex"><List className="h-4 w-4" /> Bullet list</button><button type="button" onClick={() => applyReadingFormat('number')} className="hidden h-8 items-center gap-1 rounded px-2 hover:bg-white xl:flex"><ListOrdered className="h-4 w-4" /> Numbered list</button><button type="button" onClick={() => setEditing(false)} className="ml-2 h-8 rounded-md bg-[#477bea] px-3 text-white hover:bg-[#3d6ed7]">Done</button></div>}
+          <span className="absolute bottom-3 right-4 text-[11px] text-[#aaa]">{saveState === 'saving' || saving ? 'Saving…' : saveState === 'saved' ? 'Saved' : saveState === 'error' ? 'Save failed' : ''}</span>
+        </section>
 
-      {connectionQueue[connectionIndex] && (
-        <ConnectionReview
-          candidate={connectionQueue[connectionIndex]}
-          position={connectionIndex + 1}
-          total={connectionQueue.length}
-          onAccept={() => handleConnectionDecision(true)}
-          onReject={() => handleConnectionDecision(false)}
-        />
-      )}
+        <section className="relative min-h-[480px] min-w-0 overflow-y-auto bg-[#f7f7f9] px-8 pb-14 pt-14 sm:px-12 lg:min-h-0">
+          <button type="button" onClick={() => setSourcesOpen((open) => !open)} aria-label={sourcesOpen ? 'Hide retrieved notes' : 'Show retrieved notes'} aria-expanded={sourcesOpen} className="absolute left-2 top-2 flex h-8 w-8 items-center justify-center rounded text-[#777] hover:bg-white"><PanelRightOpen className="h-5 w-5" /></button>
+          {!sourcesOpen && relations.length > 0 && <button type="button" onClick={() => setSourcesOpen(true)} className="absolute right-3 top-3 rounded-md border border-[#bbb] bg-white px-3 py-1 text-xs text-[#477bea] hover:bg-[#f5f7fb]">See notes</button>}
+          {relationsLoading ? <div className="flex h-full items-center justify-center"><Loader2 className="h-5 w-5 animate-spin text-[#aaa]" /></div> : selectedSource && selectedSourceContent ? <article className="mx-auto max-w-xl"><h2 className="text-lg font-semibold">{selectedSourceContent.title}</h2><p className="mt-6 whitespace-pre-wrap text-sm leading-[1.55] text-[#333]">{selectedSourceContent.body || selectedSource.note.raw_text}</p>{!sourcesOpen && <div className="mt-7 border-t border-[#ddd] pt-4 text-xs leading-relaxed text-[#777]"><p className="italic"><span className="text-[#477bea]">Why this surfaced:</span> {selectedSource.reason}</p><p className="mt-3 text-[11px] text-[#999]">Muse: {cleanCategory(selectedSource.note.category) || 'Instant retrieval'} · {fullNoteDate(selectedSource.note.created_at)}</p></div>}</article> : <div className="flex h-full items-center justify-center text-center"><div><h2 className="text-lg font-semibold">Your note is ready.</h2><p className="mt-3 max-w-sm text-sm leading-relaxed text-[#777]">As your knowledge base grows, related ideas will proactively appear here.</p></div></div>}
+        </section>
 
-      {chatHistoryOpen && (
-        <div className="fixed inset-0 z-[75] flex justify-end bg-black/35 backdrop-blur-sm" role="dialog" aria-modal="true" aria-labelledby="chat-history-title">
-          <button type="button" aria-label="Close chat history" className="absolute inset-0" onClick={() => setChatHistoryOpen(false)} />
-          <aside className="animate-ocreda-fade-up relative flex h-full w-full max-w-[480px] flex-col border-l border-border bg-card shadow-2xl">
-            <header className="flex h-20 shrink-0 items-center border-b border-border px-6">
-              <div>
-                <h2 id="chat-history-title" className="text-xl font-semibold">Chat history</h2>
-                <p className="mt-1 text-sm text-muted-foreground">Continue any previous conversation.</p>
-              </div>
-              <button type="button" onClick={() => setChatHistoryOpen(false)} aria-label="Close" className="ml-auto rounded-lg p-2 text-muted-foreground hover:bg-accent hover:text-foreground"><X className="h-5 w-5" /></button>
-            </header>
+        {sourcesOpen && <aside className="min-h-[420px] overflow-y-auto border-l border-[#d6d6d6] bg-white p-4 lg:min-h-0"><h2 className="mb-4 text-center text-sm text-[#999]">Retrieved for this page</h2><div className="space-y-4">{relations.map((relation) => { const content = splitNote(relation.note); return <button key={relation.note.id} type="button" onMouseEnter={() => setSelectedSourceId(relation.note.id)} onFocus={() => setSelectedSourceId(relation.note.id)} onClick={() => { setSelectedSourceId(relation.note.id); setDetailNote(relation.note); }} className={`group block w-full overflow-hidden rounded-lg border bg-[#f5f5f7] text-left shadow-[0_2px_8px_rgba(0,0,0,0.12)] transition-all hover:-translate-y-0.5 hover:shadow-lg ${selectedSourceId === relation.note.id ? 'border-[#6f9cff] ring-1 ring-[#6f9cff]/40' : 'border-[#e2e2e2]'}`}><div className="relative bg-white p-4"><span className="absolute right-3 top-3 text-xs text-[#477bea]">note</span><strong className="block max-w-[82%] truncate text-sm">{content.title}</strong><p className="mt-3 line-clamp-3 text-xs leading-relaxed text-[#777]">{content.body || notePreview(relation.note)}</p></div><div className="max-h-0 overflow-hidden px-4 text-xs italic leading-relaxed text-[#777] opacity-0 transition-all duration-200 group-hover:max-h-24 group-hover:pb-3 group-hover:pt-3 group-hover:opacity-100"><span className="text-[#477bea]">Reason:</span> {relation.reason}</div><div className="flex items-center justify-between border-t border-[#ddd] px-4 py-2 text-[11px] text-[#999]"><span>Muse: {cleanCategory(relation.note.category) || 'Instant retrieval'}</span><span>{formatDate(relation.note.created_at)}</span></div></button>; })}{sourceCortexes.map((cortex) => <button key={`cortex-${cortex.title}`} type="button" onClick={() => setSearchRequest({ query: cortex.title, filter: { kind: 'muse', value: cortex.title, label: cortex.title } })} className="group block w-full overflow-hidden rounded-lg border border-[#e2e2e2] bg-[#f5f5f7] text-left shadow-[0_2px_8px_rgba(0,0,0,0.12)] transition-all hover:-translate-y-0.5 hover:border-[#8fb1ff] hover:shadow-lg"><div className="relative bg-[#f5f5f7] p-4"><span className="absolute right-3 top-3 text-xs text-[#477bea]">cortex</span><strong className="block max-w-[82%] truncate text-sm">{cortex.title}</strong><p className="mt-3 line-clamp-4 text-xs leading-relaxed text-[#777]">{cortex.description || `Notes and ideas organized in ${cortex.title}.`}</p></div><div className="flex items-center justify-between border-t border-[#ddd] px-4 py-2 text-[11px] text-[#999]"><span>{cortex.title}</span><span>{formatDate(cortex.createdAt)}</span></div></button>)}</div></aside>}
+      </div>
 
-            <div className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6">
-              {chatHistoryLoading ? (
-                <div className="flex h-40 items-center justify-center"><Loader2 className="h-5 w-5 animate-spin text-muted-foreground" /></div>
-              ) : questions.length === 0 ? (
-                <div className="flex h-56 flex-col items-center justify-center rounded-2xl border border-dashed border-border px-8 text-center">
-                  <MessageCircle className="h-7 w-7 text-muted-foreground" />
-                  <p className="mt-4 font-medium">No previous chats yet</p>
-                  <p className="mt-2 text-sm text-muted-foreground">Ask your first question and it will appear here.</p>
-                  <button type="button" onClick={() => setChatHistoryOpen(false)} className="mt-5 rounded-lg bg-primary px-4 py-2 text-sm text-primary-foreground">Start a chat</button>
-                </div>
-              ) : (
-                <div className="space-y-3">
-                  {questions.map((question) => (
-                    <article key={question.id} className="group relative rounded-2xl border border-border bg-background/30 transition-colors hover:border-primary/35 hover:bg-accent/20">
-                      <button type="button" onClick={() => openPreviousChat(question)} className="block w-full px-5 py-4 pr-12 text-left">
-                        <h3 className="line-clamp-2 font-semibold leading-snug">{question.question}</h3>
-                        {question.answer && <p className="mt-2 line-clamp-2 text-sm leading-relaxed text-muted-foreground">{question.answer}</p>}
-                        <p className="mt-3 text-xs text-muted-foreground/70">{relTime(question.created_at)}</p>
-                      </button>
-                      <button
-                        type="button"
-                        aria-label="Delete conversation"
-                        title="Delete conversation"
-                        onClick={async () => {
-                          if (!window.confirm('Delete this conversation?')) return;
-                          await removeChat(question.id);
-                        }}
-                        className="absolute right-3 top-3 rounded-lg p-2 text-muted-foreground opacity-70 hover:bg-destructive/10 hover:text-destructive sm:opacity-0 sm:group-hover:opacity-100"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </button>
-                    </article>
-                  ))}
-                </div>
-              )}
+      {importOpen && <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/25 p-4 backdrop-blur-[5px]"><div className="relative max-h-[92vh] overflow-y-auto rounded-2xl bg-white p-7 shadow-2xl"><button type="button" onClick={() => setImportOpen(false)} aria-label="Close importer" className="absolute right-3 top-3 flex h-8 w-8 items-center justify-center rounded-md text-[#777] hover:bg-[#f4f4f4]"><X className="h-5 w-5" /></button><NoteImporter onImport={async (drafts) => { await onImport(drafts); setImportOpen(false); }} /></div></div>}
+      {detailNote && <RetrievedNoteOverlay key={detailNote.id} note={detailNote} cortexes={cortexes} saving={saving} onClose={() => setDetailNote(null)} onAddNote={onAddNote} onImport={() => { setDetailNote(null); setImportOpen(true); }} onSearch={(request) => { setDetailNote(null); setSearchRequest(request); }} onUpdate={onUpdate} onDelete={async (item) => { await onDelete(item); setDetailNote(null); }} />}
+      {searchRequest && <KnowledgeSearchOverlay request={searchRequest} notes={allNotes} cortexes={cortexes} onClose={() => setSearchRequest(null)} onOpenNote={(item) => { setSearchRequest(null); setDetailNote(item); }} onInstantRetrieval={() => { setSearchRequest(null); setInstantRetrievalOpen(true); }} />}
+      {instantRetrievalOpen && <InstantRetrievalOverlay notes={allNotes} cortexes={cortexes} saving={saving} onClose={() => setInstantRetrievalOpen(false)} onOpenNote={(item) => { setInstantRetrievalOpen(false); setDetailNote(item); }} onSave={onSaveRetrieval} />}
+    </div>
+  );
+}
+
+function RetrievedNoteOverlay({ note, cortexes, saving, onClose, onAddNote, onImport, onSearch, onUpdate, onDelete }: {
+  note: Note; cortexes: CortexMeta[]; saving: boolean;
+  onClose: () => void; onAddNote: () => void; onImport: () => void;
+  onSearch: (request: KnowledgeSearchRequest) => void;
+  onUpdate: (noteId: string, rawText: string) => Promise<void>; onDelete: (note: Note) => Promise<void>;
+}) {
+  const initial = splitNote(note);
+  const [title, setTitle] = useState(initial.title);
+  const [body, setBody] = useState(initial.body);
+  const [editing, setEditing] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const bodyRef = useRef<HTMLTextAreaElement>(null);
+  const rawText = title.trim() && body.trim() ? `${title.trim()}\n\n${body.trim()}` : title.trim() || body.trim();
+  const muse = cleanCategory(note.category) || 'Instant retrieval';
+  const usedCortexes = useMemo(() => {
+    const direct = cortexes.filter((cortex) => cortex.title.toLowerCase() === muse.toLowerCase());
+    return (direct.length ? direct : cortexes).slice(0, 4);
+  }, [cortexes, muse]);
+
+  useEffect(() => {
+    if (!editing || !rawText || rawText === note.raw_text.trim()) return;
+    setSaveState('saving');
+    const timeout = window.setTimeout(() => {
+      onUpdate(note.id, rawText).then(() => setSaveState('saved')).catch(() => setSaveState('error'));
+    }, 850);
+    return () => window.clearTimeout(timeout);
+  }, [body, editing, note.id, note.raw_text, onUpdate, rawText, title]);
+
+  const applyFormat = (kind: 'bold' | 'italic' | 'h1' | 'h2' | 'h3' | 'body' | 'bullet' | 'number') => {
+    setEditing(true);
+    const field = bodyRef.current; if (!field) return;
+    const start = field.selectionStart; const end = field.selectionEnd; const selection = body.slice(start, end);
+    let replacement = selection;
+    if (kind === 'bold') replacement = `**${selection || 'bold text'}**`;
+    if (kind === 'italic') replacement = `*${selection || 'italic text'}*`;
+    if (kind === 'h1') replacement = `# ${selection || 'Heading'}`;
+    if (kind === 'h2') replacement = `## ${selection || 'Heading'}`;
+    if (kind === 'h3') replacement = `### ${selection || 'Heading'}`;
+    if (kind === 'body') replacement = selection.replace(/^#{1,3}\s+/gm, '');
+    if (kind === 'bullet') replacement = (selection || 'List item').split('\n').map((line) => `• ${line.replace(/^[-•]\s*/, '')}`).join('\n');
+    if (kind === 'number') replacement = (selection || 'List item').split('\n').map((line, index) => `${index + 1}. ${line.replace(/^\d+\.\s*/, '')}`).join('\n');
+    setBody(`${body.slice(0, start)}${replacement}${body.slice(end)}`);
+    requestAnimationFrame(() => { field.focus(); field.setSelectionRange(start, start + replacement.length); });
+  };
+
+  const openDate = () => onSearch({ query: '', filter: { kind: 'date', value: localDateKey(note.created_at), label: fullNoteDate(note.created_at) } });
+  const openMuse = () => onSearch({ query: muse, filter: { kind: 'muse', value: muse, label: muse } });
+
+  return (
+    <div className="fixed inset-0 z-[70] bg-black/25 p-3 backdrop-blur-[5px] sm:p-6" role="dialog" aria-modal="true" aria-label={`Retrieved note: ${initial.title}`}>
+      <div className="relative mx-auto flex h-full max-w-[1760px] flex-col">
+        <div className="flex h-14 shrink-0 items-center justify-between px-2 text-white">
+          <div className="flex items-center gap-2">
+            <button type="button" onClick={() => { onClose(); onAddNote(); }} aria-label="Add a note" className="flex h-8 w-24 items-center justify-center rounded-md bg-[#477bea] hover:bg-[#3d6ed7]"><Plus className="h-5 w-5" /></button>
+            <button type="button" onClick={onImport} aria-label="Import notes" className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-white/10"><Upload className="h-6 w-6" /></button>
+            <button type="button" onClick={() => onSearch({ query: '' })} aria-label="Search notes and Muses" className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-white/10"><Search className="h-6 w-6" /></button>
+          </div>
+          <button type="button" onClick={onClose} aria-label="Close retrieved note" className="flex h-10 w-10 items-center justify-center rounded-md hover:bg-white/10"><X className="h-7 w-7" /></button>
+        </div>
+        <div className="grid min-h-0 flex-1 overflow-hidden rounded-2xl border-[9px] border-white/80 bg-[#f7f7f9] shadow-2xl lg:grid-cols-[minmax(0,1fr)_330px]">
+          <section className="relative flex min-h-0 flex-col overflow-hidden bg-white shadow-[4px_0_14px_rgba(0,0,0,0.14)]">
+            <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-28 pt-12 sm:px-16 lg:px-[11%] lg:pt-20">
+              <input value={title} readOnly={!editing} onClick={() => setEditing(true)} onChange={(event) => setTitle(event.target.value)} aria-label="Retrieved note title" className={`w-full bg-transparent text-2xl font-semibold outline-none ${editing ? 'cursor-text' : 'cursor-pointer'}`} />
+              <textarea ref={bodyRef} value={body} readOnly={!editing} onClick={() => setEditing(true)} onChange={(event) => setBody(event.target.value)} aria-label="Retrieved note text" className={`mt-8 min-h-[540px] w-full resize-none bg-transparent text-base leading-[1.7] outline-none ${editing ? 'cursor-text' : 'cursor-pointer'}`} />
             </div>
+            <ReadingFormatBar onFormat={applyFormat} onDone={() => setEditing(false)} editing={editing} />
+            <span className="absolute bottom-3 right-5 text-[11px] text-[#999]">{saving || saveState === 'saving' ? 'Saving…' : saveState === 'saved' ? 'Saved' : saveState === 'error' ? 'Save failed' : ''}</span>
+          </section>
+          <aside className="relative min-h-0 overflow-y-auto bg-[#f7f7f9] px-6 pb-8 pt-16">
+            <div className="absolute right-4 top-3">
+              <button type="button" onClick={() => setMenuOpen((open) => !open)} aria-label="Retrieved note options" aria-expanded={menuOpen} className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-white"><MoreHorizontal className="h-5 w-5" /></button>
+              {menuOpen && <div className="absolute right-0 top-10 z-10 w-40 overflow-hidden rounded-lg border border-[#ddd] bg-white py-1 text-sm shadow-xl"><button type="button" onClick={() => { setMenuOpen(false); setEditing(true); bodyRef.current?.focus(); }} className="block w-full px-4 py-2.5 text-left hover:bg-[#f5f5f5]">Edit note</button><button type="button" disabled={saving} onClick={() => { setMenuOpen(false); void onDelete(note); }} className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-red-600 hover:bg-red-50"><Trash2 className="h-4 w-4" /> Delete note</button></div>}
+            </div>
+            <button type="button" onClick={openDate} className="block rounded px-1 py-1 text-left text-sm text-[#777] hover:bg-white hover:text-[#477bea]">{fullNoteDate(note.created_at)}</button>
+            <button type="button" onClick={openMuse} className="mt-5 block rounded px-1 py-1 text-left text-sm hover:bg-white"><span className="font-medium">Muse:</span> <span className="text-[#777]">{muse}</span></button>
+            <div className="my-6 h-px bg-[#d8d8d8]" />
+            <button type="button" onClick={openMuse} className="text-sm text-[#477bea] hover:underline">Used in cortex</button>
+            <div className="mt-5 space-y-5">{usedCortexes.map((cortex) => <button key={cortex.title} type="button" onClick={() => onSearch({ query: cortex.title, filter: { kind: 'muse', value: cortex.title, label: cortex.title } })} className="block w-full rounded-lg border border-[#e0e0e0] bg-white p-5 text-left shadow-[0_2px_8px_rgba(0,0,0,0.13)] transition hover:-translate-y-0.5 hover:border-[#8fb1ff]"><strong className="block text-base">{cortex.title}</strong><p className="mt-4 line-clamp-6 text-sm leading-relaxed text-[#777]">{cortex.description || `Notes and ideas organized in ${cortex.title}.`}</p><div className="mt-8 flex justify-between text-xs text-[#aaa]"><span>{cortex.title}</span><span>{formatDate(cortex.createdAt)}</span></div></button>)}</div>
           </aside>
         </div>
-      )}
+      </div>
+    </div>
+  );
+}
 
-      <div className="p-3 sm:p-5 lg:p-6">
-        <div className="mx-auto max-w-[1500px] rounded-3xl border border-border/60 bg-card shadow-sm lg:h-[calc(100vh-3rem)] overflow-hidden">
-          {loading ? (
-            <div className="h-full flex items-center justify-center py-32">
-              <Loader2 className="w-6 h-6 text-muted-foreground/50 animate-spin" />
-            </div>
-          ) : isEmpty ? (
-            /* ───────────── STATE 1 — first-time user ───────────── */
-            <div className="animate-ocreda-fade-in relative flex h-full min-h-[calc(100vh-1.5rem)] flex-col bg-card sm:min-h-[calc(100vh-2.5rem)] lg:min-h-0">
-              <div className="absolute right-5 top-5 z-10 flex items-center gap-5 sm:right-8 sm:top-6">
-                <span className="rounded-md border border-primary/20 bg-primary/10 px-4 py-1.5 text-xs font-medium text-primary">Beta</span>
-                <AvatarButton embedded />
-              </div>
+function ReadingFormatBar({ onFormat, onDone, editing }: { onFormat: (kind: 'bold' | 'italic' | 'h1' | 'h2' | 'h3' | 'body' | 'bullet' | 'number') => void; onDone: () => void; editing: boolean }) {
+  return <div className="absolute bottom-5 left-1/2 flex max-w-[calc(100%-32px)] -translate-x-1/2 items-center gap-1 rounded-xl bg-[#f7f7f9] px-3 py-2 text-sm text-[#555] shadow-sm"><button type="button" aria-label="Voice input" className="flex h-8 w-8 items-center justify-center rounded hover:bg-white"><Mic className="h-4 w-4" /></button><span className="mx-1 h-7 w-px bg-[#ddd]" /><button type="button" onClick={() => onFormat('bold')} className="h-8 w-8 rounded font-bold hover:bg-white">B</button><button type="button" onClick={() => onFormat('italic')} className="h-8 w-8 rounded italic hover:bg-white">I</button><span className="mx-1 h-7 w-px bg-[#ddd]" />{(['h1', 'h2', 'h3'] as const).map((kind) => <button key={kind} type="button" onClick={() => onFormat(kind)} className="hidden h-8 rounded px-2 font-semibold hover:bg-white sm:block">{kind.toUpperCase()}</button>)}<button type="button" onClick={() => onFormat('body')} className="hidden h-8 rounded px-2 hover:bg-white md:block">Body</button><span className="mx-1 hidden h-7 w-px bg-[#ddd] md:block" /><button type="button" onClick={() => onFormat('bullet')} className="hidden h-8 items-center gap-1 rounded px-2 hover:bg-white lg:flex"><List className="h-4 w-4" /> Bullet list</button><button type="button" onClick={() => onFormat('number')} className="hidden h-8 items-center gap-1 rounded px-2 hover:bg-white xl:flex"><ListOrdered className="h-4 w-4" /> Numbered list</button>{editing && <button type="button" onClick={onDone} className="ml-2 h-8 rounded-md bg-[#477bea] px-3 text-white hover:bg-[#3d6ed7]">Done</button>}</div>;
+}
 
-              <main className="flex flex-1 flex-col items-center px-5 pb-8 pt-28 sm:px-8 sm:pb-10 sm:pt-32">
-                <div className="flex items-center justify-center gap-3 text-center">
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src="/ocreda-logo.png" alt="" className="h-8 w-8 shrink-0 object-contain sm:h-9 sm:w-9" />
-                  <h1 className="text-2xl font-medium tracking-tight sm:text-3xl">
-                    Welcome to Ocreda{displayName ? `, ${displayName.split(/\s+/)[0]}` : ''}
-                  </h1>
-                </div>
-                <p className="mt-3 text-center text-sm text-muted-foreground sm:text-base">
-                  Write notes. Ask questions. Ocreda connects them on its own
-                </p>
+function InstantRetrievalCard({ onClick, tall = false }: { onClick: () => void; tall?: boolean }) {
+  return <button type="button" onClick={onClick} className={`flex w-full flex-col items-center justify-center rounded-lg border border-[#e6e6e6] bg-[#f7f7f9] text-center shadow-[0_2px_8px_rgba(0,0,0,0.1)] transition hover:-translate-y-0.5 hover:border-[#8fb1ff] hover:shadow-lg ${tall ? 'min-h-[340px]' : 'min-h-[270px]'}`}><span className="flex h-20 w-20 items-center justify-center rounded-md bg-[#477bea] text-[#8fb1ff] shadow-md"><ArrowUp className="h-16 w-16 stroke-[1.8]" /></span><span className="mt-7 text-sm font-medium text-[#222]">Instant retrieval instead</span></button>;
+}
 
-                <section className="mt-20 flex min-h-[230px] w-full max-w-[630px] flex-col items-center justify-center rounded-2xl bg-muted/45 px-6 py-10 sm:px-10">
-                  <h2 className="text-center text-base font-semibold sm:text-lg">
-                    Add one note to start. Connections appear as you use them.
-                  </h2>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setError('');
-                      setAddOpen(true);
-                    }}
-                    disabled={busy}
-                    className="mt-12 flex w-full max-w-[210px] items-center justify-center rounded-md bg-primary px-5 py-3 text-sm font-medium text-primary-foreground shadow-sm shadow-primary/20 transition-colors hover:bg-primary/90 focus:outline-none focus:ring-2 focus:ring-primary/40 focus:ring-offset-2 focus:ring-offset-card disabled:opacity-50"
-                  >
-                    Add a note
-                  </button>
-                </section>
+function KnowledgeSearchOverlay({ request, notes, cortexes, onClose, onOpenNote, onInstantRetrieval }: {
+  request: KnowledgeSearchRequest; notes: Note[]; cortexes: CortexMeta[]; onClose: () => void; onOpenNote: (note: Note) => void; onInstantRetrieval: () => void;
+}) {
+  const [query, setQuery] = useState(request.query);
+  const [filter, setFilter] = useState<KnowledgeFilter | undefined>(request.filter);
+  const normalized = query.trim().toLowerCase();
+  const sortedNotes = useMemo(() => [...notes].sort((a, b) => b.created_at.localeCompare(a.created_at)), [notes]);
+  const filteredNotes = useMemo(() => sortedNotes.filter((note) => {
+    if (filter?.kind === 'date' && localDateKey(note.created_at) !== filter.value) return false;
+    if (filter?.kind === 'muse' && (cleanCategory(note.category) || 'Instant retrieval').toLowerCase() !== filter.value.toLowerCase()) return false;
+    if (filter) return true;
+    return !normalized || `${note.raw_text} ${note.category ?? ''}`.toLowerCase().includes(normalized);
+  }), [filter, normalized, sortedNotes]);
+  const matchingCortexes = useMemo(() => cortexes.filter((cortex) => {
+    if (filter?.kind === 'muse') return cortex.title.toLowerCase() === filter.value.toLowerCase();
+    if (filter?.kind === 'date') return filteredNotes.some((note) => cleanCategory(note.category)?.toLowerCase() === cortex.title.toLowerCase());
+    return !normalized || `${cortex.title} ${cortex.description}`.toLowerCase().includes(normalized) || notes.some((note) => cleanCategory(note.category)?.toLowerCase() === cortex.title.toLowerCase() && note.raw_text.toLowerCase().includes(normalized));
+  }), [cortexes, filter, filteredNotes, normalized, notes]);
+  const recentTerms = useMemo(() => {
+    const values = [...cortexes.map((cortex) => cortex.title), ...sortedNotes.slice(0, 5).map((note) => splitNote(note).title)];
+    return Array.from(new Set(values.filter(Boolean))).slice(0, 6);
+  }, [cortexes, sortedNotes]);
+  const heading = filter?.kind === 'date' ? `Notes written on ${filter.label}` : filter?.kind === 'muse' ? `Notes in ${filter.label}` : `Notes containing “${query.trim()}”`;
 
-                <p className="mt-auto pt-12 text-center text-xs text-muted-foreground sm:text-sm">
-                  Your notes are private and secured. Nobody can touch them.
-                </p>
-                {error && <p className="mt-4 text-sm text-destructive">{error}</p>}
-              </main>
-            </div>
-          ) : (
-            /* ───────────── STATE 2 — existing-user home ───────────── */
-            <div className="animate-ocreda-fade-in relative flex h-full min-h-[calc(100vh-1.5rem)] flex-col bg-card sm:min-h-[calc(100vh-2.5rem)] lg:min-h-0">
-              <header className="absolute right-5 top-5 z-10 sm:right-7 sm:top-6">
-                <div className="flex items-center gap-3 sm:gap-6">
-                  <span className="hidden rounded-md border border-primary/20 bg-primary/10 px-3 py-1 text-xs font-semibold text-primary md:inline-flex">Beta</span>
-                  <a href="mailto:feedback@ocreda.com" className="hidden text-sm font-medium text-muted-foreground hover:text-foreground md:inline">Send feedback</a>
-                  <AvatarButton embedded />
-                </div>
-              </header>
+  const changeQuery = (value: string) => { setQuery(value); setFilter(undefined); };
 
-              <nav className="absolute left-5 top-5 z-10 hidden w-36 flex-col items-start gap-2 lg:flex">
-                <button onClick={() => { setError(''); setAddOpen(true); }} className="inline-flex items-center gap-3 rounded-lg px-2 py-2 text-sm hover:bg-accent"><SquarePlus className="h-6 w-6 text-primary" /> Add a note</button>
-                <button onClick={() => { setActive(null); setChat(null); setSearchOpen((open) => !open); }} className="inline-flex items-center gap-3 rounded-lg px-2 py-2 text-sm hover:bg-accent"><Search className="h-6 w-6" /> Search</button>
-                <button onClick={openChatHistory} className="inline-flex items-center gap-3 rounded-lg px-2 py-2 text-sm hover:bg-accent"><Clock3 className="h-5 w-5" /> Chat history</button>
-              </nav>
+  return (
+    <div className="fixed inset-0 z-[80] bg-black/25 p-3 backdrop-blur-[5px] sm:p-6" role="dialog" aria-modal="true" aria-label="Search your cortex and notes">
+      <button type="button" onClick={onClose} aria-label="Close search" className="absolute right-5 top-5 z-10 flex h-10 w-10 items-center justify-center rounded-md text-white hover:bg-white/10"><X className="h-7 w-7" /></button>
+      <div className="mx-auto mt-12 flex h-[calc(100%-3rem)] max-w-[1640px] flex-col overflow-hidden rounded-[20px] bg-white shadow-2xl sm:mt-16 sm:h-[calc(100%-4rem)]">
+        <div className="flex h-20 shrink-0 items-center border-b border-[#ddd] px-7 sm:px-10"><Search className="mr-4 h-6 w-6 shrink-0 text-[#aaa]" /><input autoFocus value={query} onChange={(event) => changeQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'Escape') onClose(); }} placeholder="Search your cortex and notes" className="h-full min-w-0 flex-1 bg-transparent text-xl outline-none placeholder:text-[#b3b3b3] sm:text-2xl" />{filter && <button type="button" onClick={() => { setFilter(undefined); setQuery(''); }} className="rounded-full bg-[#edf3ff] px-3 py-1.5 text-xs text-[#477bea]">Clear {filter.kind}</button>}</div>
+        {!query.trim() && !filter ? <div className="min-h-0 flex-1 overflow-y-auto px-10 py-12 sm:px-16"><p className="text-sm text-[#aaa]">Recent</p><div className="mt-5 max-w-2xl space-y-1">{recentTerms.map((term) => <button key={term} type="button" onClick={() => setQuery(term)} className="block w-full rounded-lg px-1 py-3 text-left text-base text-[#555] hover:bg-[#f6f6f6] hover:px-3">{term}</button>)}</div></div> : <div className="grid min-h-0 flex-1 overflow-y-auto lg:grid-cols-[450px_minmax(0,1fr)] lg:overflow-hidden">
+          <aside className="border-b border-[#ddd] px-7 py-10 lg:overflow-y-auto lg:border-b-0 lg:border-r sm:px-10"><p className="mb-7 text-sm text-[#aaa]">Found in cortex</p><div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-1">{matchingCortexes.map((cortex) => { const related = notes.filter((note) => cleanCategory(note.category)?.toLowerCase() === cortex.title.toLowerCase()); const preview = cortex.description || related[0]?.raw_text || `Notes organized in ${cortex.title}.`; return <button key={cortex.title} type="button" onClick={() => { setFilter({ kind: 'muse', value: cortex.title, label: cortex.title }); setQuery(cortex.title); }} className="relative min-h-[340px] rounded-lg border border-[#e3e3e3] bg-white p-7 text-left shadow-[0_2px_8px_rgba(0,0,0,0.14)] transition hover:-translate-y-0.5 hover:border-[#8fb1ff]"><strong className="block text-base"><HighlightedText text={cortex.title} query={query} /></strong><p className="mt-5 line-clamp-[12] text-sm leading-relaxed text-[#777]"><HighlightedText text={preview} query={query} /></p><div className="absolute inset-x-4 bottom-4 flex justify-between text-xs text-[#aaa]"><span>{cortex.title}</span><span>{formatDate(cortex.createdAt)}</span></div></button>; })}{!matchingCortexes.length && <p className="text-sm text-[#999] sm:col-span-2 lg:col-span-1">No cortex matches this search.</p>}<InstantRetrievalCard onClick={onInstantRetrieval} tall /></div></aside>
+          <section className="min-h-0 px-7 py-10 lg:overflow-y-auto sm:px-12"><p className="mb-7 text-sm text-[#aaa]">{heading}</p><div className="grid gap-7 xl:grid-cols-2">{filteredNotes.map((item) => { const content = splitNote(item); const preview = content.body || notePreview(item); return <button key={item.id} type="button" onClick={() => onOpenNote(item)} className="relative min-h-[250px] rounded-lg border border-[#e3e3e3] bg-[#f7f7f9] p-2 text-left shadow-[0_2px_8px_rgba(0,0,0,0.14)] transition hover:-translate-y-0.5 hover:border-[#8fb1ff]"><div className="h-[190px] rounded-md bg-white p-6"><strong className="block text-base"><HighlightedText text={content.title} query={filter ? '' : query} /></strong><p className="mt-4 line-clamp-6 text-sm leading-relaxed text-[#777]"><HighlightedText text={preview} query={filter ? '' : query} /></p></div><div className="flex items-center justify-between px-3 py-3 text-xs text-[#aaa]"><span>Muse: {cleanCategory(item.category) || 'Instant retrieval'}</span><span>{formatDate(item.created_at)}</span></div></button>; })}{!filteredNotes.length && <p className="text-sm text-[#999] xl:col-span-2">No notes match this search.</p>}<InstantRetrievalCard onClick={onInstantRetrieval} /></div></section>
+        </div>}
+      </div>
+    </div>
+  );
+}
 
-              {active?.kind === 'chat' && chat ? (
-                <AskResultsView
-                  chat={chat}
-                  noteMap={noteMap}
-                  value={composerValue}
-                  busy={busy}
-                  error={error}
-                  onChange={setComposerValue}
-                  onSubmit={submitComposer}
-                  onAddNote={() => { setError(''); setAddOpen(true); }}
-                  onOpenNote={openNotePopup}
-                />
-              ) : (
-              <main className="flex-1 overflow-y-auto px-5 pb-20 pt-28 scrollbar-thin sm:px-8 lg:px-12">
-                <div className="mx-auto w-full max-w-[810px]">
-                  {searchOpen && (
-                    <div className="mb-6 animate-ocreda-fade-up">
-                      <label htmlFor="home-search" className="sr-only">Search notes</label>
-                      <div className="relative">
-                        <Search className="absolute left-4 top-1/2 h-5 w-5 -translate-y-1/2 text-muted-foreground" />
-                        <input id="home-search" autoFocus value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder="Search your notes..." className="w-full rounded-xl border border-border bg-background/30 py-3 pl-12 pr-4 text-sm focus:border-primary/50 focus:outline-none focus:ring-2 focus:ring-primary/20" />
-                      </div>
-                    </div>
-                  )}
+function retrievalKeywords(value: string): string[] {
+  const ignored = new Set(['about', 'after', 'also', 'been', 'between', 'could', 'difference', 'find', 'from', 'have', 'looking', 'note', 'something', 'stated', 'that', 'their', 'there', 'these', 'they', 'this', 'what', 'when', 'where', 'which', 'will', 'with', 'would']);
+  return (value.toLowerCase().match(/[a-z0-9']{3,}/g) ?? []).filter((word) => !ignored.has(word));
+}
 
-                  <section>
-                    <div className="mb-4 flex items-center gap-3">
-                      {/* eslint-disable-next-line @next/next/no-img-element */}
-                      <img src="/ocreda-logo.png" alt="" className="h-6 w-6 object-contain" />
-                      <h1 className="text-base font-semibold sm:text-lg">Ask yourself anything</h1>
-                    </div>
-                    {chatAnchor && (
-                      <div className="mb-4 rounded-xl border border-primary/25 bg-primary/[0.04] px-5 py-4 text-sm">
-                        <strong>I&apos;ve loaded “{noteTitle(chatAnchor)}.”</strong>
-                        <p className="mt-1 text-muted-foreground">What would you like to ask about it?</p>
-                      </div>
-                    )}
-                    <div className="rounded-2xl border border-primary/60 bg-muted/20 p-5 shadow-sm focus-within:ring-2 focus-within:ring-primary/10">
-                      <textarea
-                        value={composerValue}
-                        onChange={(e) => setComposerValue(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitComposer(); } }}
-                        placeholder={chatAnchor ? `Ask about ${noteTitle(chatAnchor)}…` : 'How do people find meaning in uncertainty?'}
-                        rows={2}
-                        className="w-full resize-none bg-transparent text-base focus:outline-none placeholder:text-muted-foreground/55"
-                      />
-                      <div className="mt-2 flex items-center justify-between">
-                        <button type="button" onClick={() => { setError(''); setAddOpen(true); }} aria-label="Add a note" className="rounded-lg p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground"><Plus className="h-5 w-5" /></button>
-                        <div className="flex items-center gap-2">
-                          <button type="button" disabled title="Voice capture coming soon" aria-label="Record audio" className="rounded-lg p-1.5 text-muted-foreground opacity-45"><Mic className="h-5 w-5" /></button>
-                          {composerValue.trim() && (
-                            <button type="button" onClick={submitComposer} disabled={busy} aria-label="Send" className="rounded-lg bg-primary p-2 text-primary-foreground disabled:opacity-40">
-                              {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUp className="h-4 w-4" />}
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                    {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
-                  </section>
+function InstantRetrievalOverlay({ notes, cortexes, initialQuery = '', saving, onClose, onOpenNote, onSave }: {
+  notes: Note[]; cortexes: CortexMeta[]; saving: boolean; onClose: () => void; onOpenNote: (note: Note) => void;
+  initialQuery?: string;
+  onSave: (queryText: string, resultNotes: Note[], category: string) => Promise<Note>;
+}) {
+  const [phase, setPhase] = useState<'intro' | 'clarify' | 'results'>('intro');
+  const [query, setQuery] = useState(initialQuery);
+  const [clarificationRound, setClarificationRound] = useState(0);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [saveMenuOpen, setSaveMenuOpen] = useState(false);
+  const [newCortex, setNewCortex] = useState('');
+  const [saveMessage, setSaveMessage] = useState('');
+  const [saveError, setSaveError] = useState('');
 
-                  <div className="mt-36">
-                    <section ref={recentSectionRef}>
-                      <h2 className="mb-4 text-sm font-medium text-primary">From your last session</h2>
-                      {filteredHomeNotes[0] ? (
-                        <button type="button" onClick={() => openNotePopup(filteredHomeNotes[0].id)} className="group flex min-h-[140px] w-full items-start rounded-2xl border border-border bg-background/20 p-7 text-left shadow-md transition-colors hover:border-primary/35">
-                          <span className="min-w-0 flex-1"><strong className="block truncate text-lg">{noteTitle(filteredHomeNotes[0])}</strong><span className="mt-3 block line-clamp-2 text-sm leading-relaxed text-muted-foreground">{truncate(filteredHomeNotes[0].raw_text, 180)}</span></span>
-                        </button>
-                      ) : <p className="rounded-2xl border border-dashed border-border p-6 text-sm text-muted-foreground">No matching notes.</p>}
-                    </section>
-                  </div>
-                  <div className="fixed bottom-0 left-1/2 z-10 flex w-[min(650px,80vw)] -translate-x-1/2 justify-center gap-10 rounded-t-full border border-b-0 border-border bg-card px-10 py-4 text-xs text-muted-foreground shadow-sm">
-                    <span>2 Categories</span><span>{notes.length} Notes</span><span>{connectionsCount} Connections</span>
-                  </div>
-                </div>
-              </main>
-              )}
-            </div>
-          )}
+  const results = useMemo(() => {
+    const keywords = retrievalKeywords(query);
+    return [...notes].map((note) => {
+      const haystack = `${note.raw_text} ${note.category ?? ''}`.toLowerCase();
+      const keywordScore = keywords.reduce((score, word) => score + (haystack.includes(word) ? 2 : 0), 0);
+      return { note, score: keywordScore + sharedWordScore(query, note.raw_text) };
+    }).sort((left, right) => right.score - left.score || right.note.created_at.localeCompare(left.note.created_at)).filter((item, index) => item.score > 0 || index < 2).slice(0, 6).map((item) => item.note);
+  }, [notes, query]);
+
+  useEffect(() => { setSelectedId(results[0]?.id ?? null); }, [results]);
+
+  const keywords = retrievalKeywords(query);
+  const topic = keywords.slice(-3).join(' ');
+  const clarification = clarificationRound === 0
+    ? `Did it mention anything about ${topic || 'a specific detail'}?`
+    : 'Should I search broadly across every Muse and include the closest related ideas?';
+
+  const beginClarification = () => {
+    if (!query.trim()) return;
+    setClarificationRound(0); setPhase('clarify'); setSaveMessage(''); setSaveError('');
+  };
+
+  const answerClarification = (yes: boolean) => {
+    if (yes || clarificationRound > 0) setPhase('results');
+    else setClarificationRound(1);
+  };
+
+  const saveTo = async (category: string) => {
+    const clean = cleanCategory(category); if (!clean || !query.trim()) return;
+    setSaveError('');
+    try {
+      await onSave(query, results, clean);
+      setSaveMessage(`Saved to ${clean}`); setSaveMenuOpen(false); setNewCortex('');
+    } catch (error) { setSaveError(safeErrorMessage(error, 'Unable to save this retrieval.')); }
+  };
+
+  if (phase === 'intro') return (
+    <div className="fixed inset-0 z-[90] bg-black/25 p-3 backdrop-blur-[5px] sm:p-6" role="dialog" aria-modal="true" aria-label="Instant retrieval introduction">
+      <button type="button" onClick={onClose} aria-label="Close instant retrieval" className="absolute right-5 top-5 z-10 flex h-10 w-10 items-center justify-center rounded-md text-white hover:bg-white/10"><X className="h-7 w-7" /></button>
+      <button type="button" onClick={() => setPhase('clarify')} className="mx-auto flex h-full w-full max-w-[1760px] items-center justify-center rounded-2xl border-[9px] border-white/80 bg-[#f7f7f9] text-left shadow-2xl">
+        <span className="w-[min(90%,720px)] space-y-8 text-base leading-relaxed text-[#222] sm:text-lg"><span className="block">This is a temporary cortex where you can instantly retrieve anything from your Ocreda.</span><span className="block">You can ask for a specific thing you are looking for or go as broad as you want.</span><span className="block">This will not be saved unless you save it to a cortex.</span><span className="block font-medium">Tap on the screen.</span></span>
+      </button>
+    </div>
+  );
+
+  return (
+    <div className="fixed inset-0 z-[90] bg-black/25 p-3 backdrop-blur-[5px] sm:p-6" role="dialog" aria-modal="true" aria-label="Instant retrieval temporary cortex">
+      <div className="relative mx-auto flex h-full max-w-[1760px] flex-col">
+        <div className="relative flex h-14 shrink-0 items-center justify-between px-2 text-white">
+          <div className="relative">
+            <button type="button" disabled={!query.trim() || saving} onClick={() => setSaveMenuOpen((open) => !open)} className="rounded-md bg-white px-3 py-2 text-sm text-[#222] shadow disabled:opacity-45">{saving ? 'Saving…' : 'Save this to a cortex'}</button>
+            {saveMenuOpen && <div className="absolute left-0 top-11 z-30 w-[280px] overflow-hidden rounded-lg border border-[#ddd] bg-white py-2 text-sm text-[#222] shadow-xl"><p className="px-4 pb-2 text-xs text-[#999]">Choose a cortex</p>{cortexes.map((cortex) => <button key={cortex.title} type="button" onClick={() => void saveTo(cortex.title)} className="block w-full px-4 py-2.5 text-left hover:bg-[#f5f5f5]">{cortex.title}</button>)}<div className="mt-1 flex items-center gap-2 border-t border-[#eee] px-3 pt-2"><input value={newCortex} onChange={(event) => setNewCortex(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void saveTo(newCortex); } }} placeholder="New cortex" className="min-w-0 flex-1 rounded border border-[#ddd] px-2 py-2 outline-none focus:border-[#477bea]" /><button type="button" disabled={!newCortex.trim()} onClick={() => void saveTo(newCortex)} aria-label="Create cortex and save" className="rounded bg-[#477bea] p-2 text-white disabled:opacity-35"><Check className="h-4 w-4" /></button></div>{saveError && <p className="px-4 pt-2 text-xs text-red-600">{saveError}</p>}</div>}
+          </div>
+          {saveMessage && <span className="absolute left-1/2 -translate-x-1/2 rounded-full bg-white/90 px-4 py-1.5 text-xs text-[#477bea] shadow">{saveMessage}</span>}
+          <button type="button" onClick={onClose} aria-label="Close instant retrieval" className="flex h-10 w-10 items-center justify-center rounded-md hover:bg-white/10"><X className="h-7 w-7" /></button>
+        </div>
+        <div className={`grid min-h-0 flex-1 overflow-y-auto rounded-xl border border-[#cfcfcf] bg-white shadow-[0_2px_9px_rgba(0,0,0,0.16)] lg:overflow-hidden ${phase === 'results' ? 'lg:grid-cols-[minmax(0,1.05fr)_minmax(360px,.95fr)_360px]' : 'lg:grid-cols-2'}`}>
+          <section className="relative min-h-[430px] overflow-hidden bg-[#f7f7f9] px-8 py-16 shadow-[4px_0_12px_rgba(0,0,0,0.14)] sm:px-14 lg:min-h-0">
+            <textarea autoFocus value={query} onChange={(event) => { setQuery(event.target.value); if (phase === 'results') setPhase('clarify'); }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); beginClarification(); } }} placeholder="Ask for a specific note or explore a broad idea…" aria-label="Instant retrieval request" className="h-full min-h-[300px] w-full resize-none bg-transparent text-lg leading-relaxed outline-none placeholder:text-[#aaa]" />
+            <span className="absolute bottom-5 left-1/2 -translate-x-1/2 text-xs text-[#aaa]">Press Enter to continue · Shift+Enter for a new line</span>
+          </section>
+          <section className="relative min-h-[430px] overflow-y-auto bg-white px-8 py-16 sm:px-14 lg:min-h-0">
+            {!query.trim() ? <p className="text-base text-[#aaa]">Start typing what you want to find.</p> : phase === 'clarify' ? <div><p className="text-lg leading-relaxed">{clarification}</p><div className="mt-8 flex gap-6"><button type="button" onClick={() => answerClarification(true)} aria-label="Yes" className="flex h-10 w-10 items-center justify-center rounded-full bg-[#477bea] text-white hover:bg-[#3d6ed7]"><Check className="h-5 w-5" /></button><button type="button" onClick={() => answerClarification(false)} aria-label="No" className="flex h-10 w-10 items-center justify-center rounded-full border-2 border-[#222] hover:bg-[#f5f5f5]"><X className="h-5 w-5" /></button></div></div> : <div><Check className="h-10 w-10 rounded-full bg-[#477bea] p-2 text-white" /><p className="mt-10 text-lg">I have found {results.length} {results.length === 1 ? 'note' : 'notes'} that are close to your request.</p>{results[0] && <div className="mt-12 border-t border-[#eee] pt-7"><strong className="text-base">Closest match: {splitNote(results[0]).title}</strong><p className="mt-4 line-clamp-8 whitespace-pre-wrap text-sm leading-relaxed text-[#555]">{splitNote(results[0]).body || notePreview(results[0])}</p></div>}</div>}
+          </section>
+          {phase === 'results' && <aside className="min-h-[430px] overflow-y-auto border-l border-[#d6d6d6] bg-white p-5 lg:min-h-0"><div className="mb-4 flex items-center justify-between"><h2 className="text-sm text-[#999]">Retrieved notes</h2><span className="rounded border border-[#bbb] px-3 py-1 text-xs text-[#477bea]">See notes</span></div><div className="space-y-5">{results.map((item) => { const content = splitNote(item); return <button key={item.id} type="button" onMouseEnter={() => setSelectedId(item.id)} onFocus={() => setSelectedId(item.id)} onClick={() => onOpenNote(item)} className={`block min-h-[200px] w-full rounded-lg border bg-white p-5 text-left shadow-[0_2px_8px_rgba(0,0,0,0.13)] transition hover:-translate-y-0.5 ${selectedId === item.id ? 'border-[#6f9cff] ring-1 ring-[#6f9cff]/40' : 'border-[#e2e2e2]'}`}><span className="float-right text-xs text-[#477bea]">note</span><strong className="block max-w-[82%] text-base">{content.title}</strong><p className="mt-4 line-clamp-6 whitespace-pre-wrap text-sm leading-relaxed text-[#777]">{content.body || notePreview(item)}</p><div className="mt-7 flex justify-between text-xs text-[#aaa]"><span>{cleanCategory(item.category) || 'Instant retrieval'}</span><span>{formatDate(item.created_at)}</span></div></button>; })}{!results.length && <p className="text-sm text-[#999]">No close notes yet. Try a broader request.</p>}</div></aside>}
         </div>
       </div>
     </div>
   );
 }
 
-/* ────────────────────────── guided connection review ────────────────────────── */
-
-function ConnectionReview({
-  candidate,
-  position,
-  total,
-  onAccept,
-  onReject,
-}: {
-  candidate: ConnectionCandidate;
-  position: number;
-  total: number;
-  onAccept: () => void;
-  onReject: () => void;
+function NoteEditor({ state, cortexes, saving, error, onChange, onCreateMuse, onClose, onSave, onDelete }: {
+  state: NoteEditorState; cortexes: CortexMeta[]; saving: boolean; error: string;
+  onChange: (state: NoteEditorState) => void; onCreateMuse: (title: string) => void;
+  onClose: () => void; onSave: () => void; onDelete?: () => void;
 }) {
-  const left = candidate.note;
-  const right = candidate.relation.related_note;
+  const bodyRef = useRef<HTMLTextAreaElement>(null);
+  const speechRef = useRef<SpeechRecognitionLike | null>(null);
+  const [dictating, setDictating] = useState(false);
+  const [museOpen, setMuseOpen] = useState(false);
+  const [newMuse, setNewMuse] = useState('');
 
+  const applyFormat = (kind: 'bold' | 'italic' | 'h1' | 'h2' | 'h3' | 'body' | 'bullet' | 'number') => {
+    const field = bodyRef.current;
+    if (!field) return;
+    const start = field.selectionStart; const end = field.selectionEnd;
+    const selection = state.body.slice(start, end);
+    let replacement = selection;
+    if (kind === 'bold') replacement = `**${selection || 'bold text'}**`;
+    if (kind === 'italic') replacement = `*${selection || 'italic text'}*`;
+    if (kind === 'h1') replacement = `# ${selection || 'Heading'}`;
+    if (kind === 'h2') replacement = `## ${selection || 'Heading'}`;
+    if (kind === 'h3') replacement = `### ${selection || 'Heading'}`;
+    if (kind === 'body') replacement = selection.replace(/^#{1,3}\s+/gm, '');
+    if (kind === 'bullet') replacement = (selection || 'List item').split('\n').map((line) => `• ${line.replace(/^[-•]\s*/, '')}`).join('\n');
+    if (kind === 'number') replacement = (selection || 'List item').split('\n').map((line, index) => `${index + 1}. ${line.replace(/^\d+\.\s*/, '')}`).join('\n');
+    onChange({ ...state, body: `${state.body.slice(0, start)}${replacement}${state.body.slice(end)}` });
+    requestAnimationFrame(() => { field.focus(); field.setSelectionRange(start, start + replacement.length); });
+  };
+
+  const toggleDictation = () => {
+    if (speechRef.current && dictating) { speechRef.current.stop(); return; }
+    const speechWindow = window as typeof window & { SpeechRecognition?: new () => SpeechRecognitionLike; webkitSpeechRecognition?: new () => SpeechRecognitionLike };
+    const Recognition = speechWindow.SpeechRecognition ?? speechWindow.webkitSpeechRecognition;
+    if (!Recognition) return;
+    const recognition = new Recognition();
+    recognition.lang = 'en-US'; recognition.continuous = true; recognition.interimResults = false;
+    recognition.onresult = (event) => {
+      const transcript = Array.from(event.results).map((result) => result[0].transcript).join(' ').trim();
+      if (transcript) onChange({ ...state, body: `${state.body}${state.body ? ' ' : ''}${transcript}` });
+    };
+    recognition.onerror = () => setDictating(false); recognition.onend = () => setDictating(false);
+    speechRef.current = recognition; setDictating(true); recognition.start();
+  };
+
+  const museLabel = state.muse === AUTOMATIC_MUSE ? 'Automatically organize' : state.muse;
   return (
-    <div className="fixed inset-0 z-[90] flex items-center justify-center bg-black/25 p-4 backdrop-blur-[2px]">
-      <section className="animate-ocreda-fade-up flex min-h-[600px] w-full max-w-[1340px] flex-col items-center rounded-[28px] bg-card px-6 py-14 text-foreground shadow-2xl sm:px-12">
-        <p className="text-xs font-medium uppercase tracking-[0.16em] text-muted-foreground">Connection {position} of {total}</p>
-        <h1 className="mt-4 text-3xl font-medium tracking-tight sm:text-4xl">Found a connection</h1>
-        <p className="mt-4 max-w-2xl text-center text-base text-primary sm:text-lg">
-          {candidate.relation.reason || 'They are connected because they reveal the same underlying pattern.'}
-        </p>
-
-        <div className="mt-20 flex w-full max-w-[900px] flex-col items-center gap-6 md:flex-row md:justify-between">
-          <ConnectionNoteCard note={left} />
-          <div className="flex shrink-0 items-center gap-3 text-primary">
-            <span className="h-px w-16 bg-primary" />
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img src="/ocreda-logo.png" alt="Connected" className="h-7 w-7 object-contain" />
-            <span className="h-px w-16 bg-primary" />
-          </div>
-          <ConnectionNoteCard note={{ ...left, id: right.id, raw_text: right.raw_text, summary: right.summary }} />
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/25 p-4 backdrop-blur-[5px]" role="dialog" aria-modal="true" aria-label={state.note ? 'Edit note' : 'Create note'}>
+      <button type="button" onClick={onClose} aria-label="Close note editor" className="absolute right-5 top-5 z-10 text-white drop-shadow sm:right-8 sm:top-7"><X className="h-7 w-7" /></button>
+      <div className="flex h-[min(78vh,780px)] min-h-[530px] w-[min(88vw,1340px)] flex-col overflow-visible rounded-[20px] border-[9px] border-[#f5f5f7] bg-white shadow-2xl">
+        <div className="min-h-0 flex-1 px-8 pb-5 pt-10 sm:px-16 sm:pt-12">
+          <input autoFocus value={state.title} onChange={(event) => onChange({ ...state, title: event.target.value })} placeholder="What’s on your mind?" aria-label="Note title" className="w-full bg-transparent text-xl font-medium italic outline-none placeholder:text-[#252525] sm:text-2xl" />
+          <p className="mt-4 text-sm leading-relaxed text-[#777]">For example: Someone made the point that we mostly don&apos;t choose our beliefs, we absorb them and backfill reasons after.<br className="hidden sm:block" /> Uncomfortable but I can&apos;t argue with it. Makes me wonder how much of what I think is actually mine.</p>
+          <textarea ref={bodyRef} value={state.body} onChange={(event) => onChange({ ...state, body: event.target.value })} aria-label="Note body" className="mt-6 h-[calc(100%-112px)] w-full resize-none bg-transparent text-base leading-relaxed outline-none" />
         </div>
-
-        <p className="mt-20 max-w-3xl text-center text-sm italic leading-relaxed text-muted-foreground">
-          <strong className="text-foreground">Note:</strong> These aren&apos;t based on words in common or tagging. As you use Ocreda, the connections get sharper. This will show you connections you didn&apos;t even expect. Only connections based on how you used Ocreda will be suggested; the rest will be automatically connected.
-        </p>
-
-        <div className="mt-auto flex items-center gap-5 pt-12">
-          <button type="button" onClick={onAccept} className="inline-flex items-center gap-3 text-sm font-medium text-primary">
-            Accept
-            <span className="flex h-11 w-11 items-center justify-center rounded-full bg-primary text-white"><Check className="h-6 w-6" /></span>
-          </button>
-          <button type="button" onClick={onReject} className="inline-flex items-center gap-3 text-sm font-medium text-foreground">
-            <span className="flex h-11 w-11 items-center justify-center rounded-full border border-foreground"><X className="h-6 w-6" /></span>
-            Reject
-          </button>
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function ConnectionNoteCard({ note }: { note: Pick<Note, 'id' | 'raw_text' | 'summary'> }) {
-  return (
-    <article className="w-full max-w-[350px] rounded-xl border border-primary bg-card p-6 shadow-md">
-      <h2 className="text-lg font-bold">{note.summary || truncate(firstLine(note.raw_text), 48)}</h2>
-      <p className="mt-3 line-clamp-5 text-sm leading-relaxed text-muted-foreground">{note.raw_text}</p>
-    </article>
-  );
-}
-
-/* ────────────────────────── one-time guided chat ────────────────────────── */
-
-function GuidedChat({
-  displayName,
-  step,
-  messages,
-  value,
-  busy,
-  error,
-  drafts,
-  onChange,
-  onSubmit,
-  onSkip,
-  onBack,
-  onAddNote,
-  onDraftsChange,
-  onSaveDrafts,
-}: {
-  displayName: string;
-  step: number;
-  messages: Array<{ answer: string; response: string }>;
-  value: string;
-  busy: boolean;
-  error: string;
-  drafts: GuidedDraft[];
-  onChange: (value: string) => void;
-  onSubmit: () => void;
-  onSkip: () => void;
-  onBack: () => void;
-  onAddNote: () => void;
-  onDraftsChange: (drafts: GuidedDraft[]) => void;
-  onSaveDrafts: () => void;
-}) {
-  const firstName = displayName.split(/\s+/)[0] || 'there';
-
-  return (
-    <div className="fixed inset-0 z-[60] overflow-hidden bg-[#e8e8e8] p-3 sm:p-5">
-      <div className="flex h-full min-h-0 bg-card text-foreground">
-        <nav className="flex w-[72px] shrink-0 flex-col items-center py-5 sm:w-[86px]">
-          <button type="button" onClick={onBack} aria-label="Back home" className="rounded-lg p-2 text-foreground hover:bg-accent"><ArrowLeft className="h-7 w-7" /></button>
-          <button type="button" onClick={onAddNote} aria-label="Add note" className="mt-5 rounded-md bg-primary p-2 text-primary-foreground"><Plus className="h-5 w-5" /></button>
-          <button type="button" onClick={onBack} aria-label="Search" className="mt-3 rounded-lg p-2 text-foreground hover:bg-accent"><Search className="h-6 w-6" /></button>
-          <button type="button" aria-label="Recent" className="mt-auto rounded-lg p-2 text-foreground hover:bg-accent"><Clock3 className="h-5 w-5" /></button>
-        </nav>
-
-        <div className="flex min-w-0 flex-1 flex-col border-r border-border/50">
-          <div className="flex h-[70px] shrink-0 items-center justify-end px-5 sm:px-7">
-            <div className="inline-flex overflow-hidden rounded-md border border-primary/35 text-sm">
-              <span className="bg-primary/10 px-5 py-1.5 text-primary">Beta</span>
-              <a href="mailto:feedback@ocreda.com" className="px-3 py-1.5 hover:bg-accent">Send feedback</a>
-            </div>
+        <div className="relative flex min-h-[58px] flex-wrap items-center gap-1 border-t border-[#eee] bg-[#f8f8fa] px-3 py-2 text-sm text-[#555] sm:px-5">
+          <button type="button" onClick={toggleDictation} aria-label={dictating ? 'Stop dictation' : 'Start dictation'} className={`mr-3 rounded p-2 hover:bg-white ${dictating ? 'text-red-600' : ''}`}><Mic className="h-4 w-4" /></button><span className="mr-3 h-7 w-px bg-[#ddd]" />
+          <button type="button" onClick={() => applyFormat('bold')} aria-label="Bold" className="rounded p-2 font-bold hover:bg-white"><Bold className="h-4 w-4" /></button>
+          <button type="button" onClick={() => applyFormat('italic')} aria-label="Italic" className="rounded p-2 italic hover:bg-white"><Italic className="h-4 w-4" /></button><span className="mx-2 h-7 w-px bg-[#ddd]" />
+          <button type="button" onClick={() => applyFormat('h1')} className="rounded px-2 py-1.5 font-semibold hover:bg-white">H1</button><button type="button" onClick={() => applyFormat('h2')} className="rounded px-2 py-1.5 font-semibold hover:bg-white">H2</button><button type="button" onClick={() => applyFormat('h3')} className="rounded px-2 py-1.5 font-semibold hover:bg-white">H3</button><button type="button" onClick={() => applyFormat('body')} className="rounded px-2 py-1.5 hover:bg-white">Body</button><span className="mx-2 hidden h-7 w-px bg-[#ddd] lg:block" />
+          <button type="button" onClick={() => applyFormat('bullet')} className="hidden items-center gap-1 rounded px-2 py-1.5 hover:bg-white sm:flex"><List className="h-4 w-4" /> Bullet list</button><button type="button" onClick={() => applyFormat('number')} className="hidden items-center gap-1 rounded px-2 py-1.5 hover:bg-white md:flex"><ListOrdered className="h-4 w-4" /> Numbered list</button>
+          <div className="relative ml-auto">
+            <button type="button" onClick={() => setMuseOpen((value) => !value)} className="flex items-center text-sm"><span className="text-[#477bea]">Muse:</span>&nbsp;<span className="border-b border-[#999]">{museLabel}</span><ChevronDown className="ml-1 h-3.5 w-3.5" /></button>
+            {museOpen && <div className="absolute bottom-9 right-0 z-[60] w-[285px] overflow-hidden rounded-lg border border-[#ddd] bg-white py-2 shadow-xl">
+              <button type="button" onClick={() => { onChange({ ...state, muse: AUTOMATIC_MUSE }); setMuseOpen(false); }} className="flex w-full items-center justify-between px-5 py-3 text-left text-sm hover:bg-[#f6f6f6]">Automatically organize {state.muse === AUTOMATIC_MUSE && <Check className="h-4 w-4 text-[#477bea]" />}</button>
+              {cortexes.map((cortex) => <button key={cortex.title} type="button" onClick={() => { onChange({ ...state, muse: cortex.title }); setMuseOpen(false); }} className="flex w-full items-center justify-between px-5 py-3 text-left text-sm hover:bg-[#f6f6f6]">{cortex.title} {state.muse === cortex.title && <Check className="h-4 w-4 text-[#477bea]" />}</button>)}
+              <div className="flex items-center gap-2 border-t border-[#eee] px-4 py-2">
+                <Plus className="h-4 w-4 shrink-0 text-[#777]" />
+                <input value={newMuse} onChange={(event) => setNewMuse(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && newMuse.trim()) { event.preventDefault(); onCreateMuse(newMuse); setNewMuse(''); setMuseOpen(false); } }} placeholder="New Muse" className="min-w-0 flex-1 py-1 text-sm outline-none" />
+                <button type="button" disabled={!newMuse.trim()} onClick={() => { onCreateMuse(newMuse); setNewMuse(''); setMuseOpen(false); }} aria-label="Create Muse" className="rounded bg-[#477bea] p-1 text-white disabled:opacity-35"><Check className="h-3.5 w-3.5" /></button>
+              </div>
+            </div>}
           </div>
-
-          <main className="min-h-0 flex-1 overflow-y-auto px-5 pb-5 scrollbar-thin sm:px-10 lg:px-16">
-            <div className="mx-auto flex min-h-full max-w-[760px] flex-col">
-              <div className="flex-1 py-8 sm:py-10">
-                {messages.length === 0 ? (
-                  <div className="space-y-7 text-base font-semibold leading-relaxed sm:text-lg">
-                    <p>Hey {firstName}, I am you. This is where you ask your notes anything.</p>
-                    <p>Before that, three quick things about you. It&apos;ll make what comes back actually useful.</p>
-                    <p>{GUIDED_QUESTIONS[0]}</p>
-                  </div>
-                ) : (
-                  <div className="space-y-8">
-                    {messages.map((message, index) => (
-                      <div key={`${index}:${message.answer.slice(0, 12)}`} className="space-y-7">
-                        <div className="ml-auto max-w-[610px] rounded-xl bg-muted/55 px-6 py-5 text-base font-semibold leading-relaxed sm:text-lg">
-                          {message.answer}
-                          <Check className="ml-2 inline h-4 w-4 text-muted-foreground/40" />
-                        </div>
-                        <p className="text-base font-semibold leading-relaxed sm:text-lg">{message.response}</p>
-                      </div>
-                    ))}
-                    {drafts.length > 0 && (
-                      <p className="text-base font-semibold leading-relaxed sm:text-lg">
-                        On the right you can see what we pulled out. You can edit and check the ones you want to save.
-                      </p>
-                    )}
-                  </div>
-                )}
-
-                {drafts.length === 0 && <button type="button" onClick={onSkip} className="mt-10 text-base italic text-muted-foreground underline underline-offset-2 hover:text-foreground">Skip</button>}
-                <div className="mt-9">
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src="/ocreda-logo.png" alt="Ocreda" className="h-9 w-9 object-contain" />
-                </div>
-              </div>
-
-              <div className="shrink-0 rounded-2xl border border-primary bg-muted/25 p-4 shadow-sm">
-                <textarea
-                  autoFocus
-                  disabled={drafts.length > 0}
-                  value={value}
-                  onChange={(e) => onChange(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSubmit(); } }}
-                  placeholder={drafts.length > 0 ? 'Review the notes on the right' : 'Reply to your Ocreda'}
-                  rows={3}
-                  className="w-full resize-none bg-transparent text-sm italic focus:outline-none placeholder:text-muted-foreground/65"
-                />
-                <div className="mt-2 flex items-center gap-2">
-                  <button type="button" onClick={onAddNote} aria-label="Add note" className="rounded-md p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground"><Plus className="h-5 w-5" /></button>
-                  <button type="button" disabled aria-label="Record audio" title="Voice capture coming soon" className="rounded-md p-1.5 text-muted-foreground opacity-50"><Mic className="h-4 w-4" /></button>
-                  <button type="button" aria-label="Save draft" title="Draft is saved automatically" className="ml-auto rounded-md p-1.5 text-primary"><Save className="h-5 w-5" /></button>
-                  <button type="button" onClick={onSubmit} disabled={!value.trim() || busy || drafts.length > 0} aria-label="Send reply" className="rounded-md bg-primary p-2 text-primary-foreground disabled:opacity-40">
-                    {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUp className="h-4 w-4" />}
-                  </button>
-                </div>
-                {error && <p className="mt-2 text-sm font-medium text-destructive">{error}</p>}
-              </div>
-            </div>
-          </main>
+          {onDelete && <button type="button" onClick={onDelete} disabled={saving} aria-label="Delete note" className="ml-3 rounded p-2 text-red-600 hover:bg-red-50"><Trash2 className="h-4 w-4" /></button>}
+          <button type="button" onClick={onSave} disabled={saving || (!state.title.trim() && !state.body.trim())} className="ml-3 flex h-8 w-32 items-center justify-center rounded-md bg-[#477bea] text-white hover:bg-[#3d6ed7] disabled:opacity-45 sm:w-40">{saving ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Save'}</button>
+          {error && <p role="alert" className="absolute bottom-full right-0 mb-2 max-w-[420px] rounded-md bg-red-600 px-3 py-2 text-xs text-white">{error}</p>}
         </div>
-
-        <aside className="hidden w-[29%] min-w-[300px] shrink-0 p-3 lg:block">
-          <div className="relative flex h-full flex-col overflow-hidden rounded-xl border border-border/35 bg-background/20 shadow-inner">
-            {drafts.length === 0 ? (
-              <div className="flex flex-1 items-center justify-center px-8 text-center text-base text-muted-foreground/45">
-                Retrieved notes will show up here<br />when you ask something.
-              </div>
-            ) : (
-              <div className="flex-1 space-y-4 overflow-y-auto p-3 pb-20 scrollbar-thin">
-                {drafts.map((draft) => (
-                  <article key={draft.id} className={`overflow-hidden rounded-xl border bg-card shadow-sm ${draft.selected ? 'border-primary/25' : 'border-border opacity-60'}`}>
-                    <div className="p-5">
-                      <div className="flex items-start gap-3">
-                        {draft.editing ? (
-                          <input
-                            value={draft.title}
-                            onChange={(e) => onDraftsChange(drafts.map((item) => item.id === draft.id ? { ...item, title: e.target.value } : item))}
-                            className="min-w-0 flex-1 border-b border-primary/30 bg-transparent text-base font-bold focus:outline-none"
-                          />
-                        ) : <h3 className="min-w-0 flex-1 text-base font-bold">{draft.title}</h3>}
-                        <button
-                          type="button"
-                          onClick={() => onDraftsChange(drafts.map((item) => item.id === draft.id ? { ...item, selected: !item.selected } : item))}
-                          aria-label={draft.selected ? 'Reject note' : 'Accept note'}
-                          className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-sm border ${draft.selected ? 'border-primary bg-primary text-white' : 'border-primary/50'}`}
-                        >
-                          {draft.selected && <Check className="h-3.5 w-3.5" />}
-                        </button>
-                      </div>
-                      {draft.editing ? (
-                        <textarea
-                          value={draft.body}
-                          onChange={(e) => onDraftsChange(drafts.map((item) => item.id === draft.id ? { ...item, body: e.target.value } : item))}
-                          rows={4}
-                          className="mt-3 w-full resize-none rounded-md border border-border bg-transparent p-2 text-sm leading-relaxed focus:border-primary/40 focus:outline-none"
-                        />
-                      ) : <p className="mt-3 line-clamp-4 text-sm leading-relaxed text-muted-foreground">{draft.body}</p>}
-                    </div>
-                    <div className="flex border-t border-border/50">
-                      <button type="button" onClick={() => onDraftsChange(drafts.map((item) => item.id === draft.id ? { ...item, editing: !item.editing } : item))} className="flex-1 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-foreground">
-                        {draft.editing ? 'Done' : 'Edit'}
-                      </button>
-                      <button type="button" onClick={() => onDraftsChange(drafts.filter((item) => item.id !== draft.id))} aria-label="Delete draft" className="border-l border-border/50 px-3 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"><Trash2 className="h-4 w-4" /></button>
-                    </div>
-                  </article>
-                ))}
-              </div>
-            )}
-            {drafts.length > 0 && (
-              <div className="absolute inset-x-0 bottom-0 flex border-t border-border bg-card">
-                <button type="button" onClick={onSaveDrafts} disabled={!drafts.some((draft) => draft.selected) || busy} className="flex-1 bg-primary px-4 py-3 text-sm font-medium text-primary-foreground disabled:opacity-40">
-                  {busy ? 'Adding…' : 'Add notes'}
-                </button>
-                <button type="button" onClick={onSkip} aria-label="Close drafts" className="bg-foreground px-4 text-background"><X className="h-5 w-5" /></button>
-              </div>
-            )}
-          </div>
-        </aside>
       </div>
     </div>
   );
 }
 
-/* ────────────────────────── ask results ────────────────────────── */
-
-function AskResultsView({
-  chat,
-  noteMap,
-  value,
-  busy,
-  error,
-  onChange,
-  onSubmit,
-  onAddNote,
-  onOpenNote,
-}: {
-  chat: ChatState;
-  noteMap: Record<string, Note>;
-  value: string;
-  busy: boolean;
-  error: string;
-  onChange: (value: string) => void;
-  onSubmit: () => void;
-  onAddNote: () => void;
-  onOpenNote: (noteId: string) => void;
+function CortexEditor({ state, saving, error, onChange, onClose, onSave }: {
+  state: CortexEditorState; saving: boolean; error: string; onChange: (state: CortexEditorState) => void; onClose: () => void; onSave: () => void;
 }) {
-  const sources = chat.sourceIds.map((id) => noteMap[id]).filter(Boolean);
-
   return (
-    <div className="flex min-h-0 flex-1 flex-col pt-20 lg:flex-row">
-      <main className="min-w-0 flex-1 overflow-y-auto px-5 pb-9 pt-5 scrollbar-thin sm:px-8 lg:pl-[180px] lg:pr-10 lg:pt-6">
-        <div className="mx-auto max-w-3xl">
-          <div className="flex items-start gap-4">
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-primary/25 bg-primary/10 text-primary">
-              <MessageCircle className="h-5 w-5" />
-            </div>
-            <div>
-              <h1 className="text-xl font-bold tracking-tight">Ask anything about your notes.</h1>
-              <p className="mt-1 text-sm text-muted-foreground">Ocreda uses your notes to find relevant answers and connections.</p>
-            </div>
-          </div>
-
-          <div className="mt-9 space-y-6">
-            {chat.messages.map((message) => message.role === 'user' ? (
-              <div key={message.id} className="flex justify-end">
-                <div className="max-w-[85%] rounded-2xl bg-primary/10 px-5 py-3 text-sm font-medium sm:text-base">{message.content}</div>
-              </div>
-            ) : (
-              <div key={message.id}>
-                <article className="rounded-2xl border border-border bg-background/20 p-5 shadow-sm sm:p-7">
-                  <div className="answer-prose text-sm leading-relaxed text-foreground sm:text-base" dangerouslySetInnerHTML={{ __html: renderAnswer(message.content) }} />
-                  {sources.length > 0 && (
-                    <div className="mt-6">
-                      <p className="text-xs font-medium text-muted-foreground">Used from your notes</p>
-                      <div className="mt-3 flex flex-wrap gap-2">
-                        {sources.map((note) => (
-                          <button key={note.id} type="button" onClick={() => onOpenNote(note.id)} className="inline-flex items-center gap-2 rounded-xl bg-primary/10 px-3 py-2 text-sm font-semibold text-foreground hover:bg-primary/15">
-                            <FileText className="h-4 w-4 text-primary" />
-                            {noteTitle(note)}
-                            <ExternalLink className="h-3.5 w-3.5 text-primary" />
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </article>
-                <div className="mt-3 flex items-center gap-1">
-                  <button type="button" aria-label="Helpful answer" className="rounded-lg p-2 text-muted-foreground hover:bg-accent hover:text-foreground"><ThumbsUp className="h-4 w-4" /></button>
-                  <button type="button" aria-label="Not helpful" className="rounded-lg p-2 text-muted-foreground hover:bg-accent hover:text-foreground"><ThumbsDown className="h-4 w-4" /></button>
-                </div>
-              </div>
-            ))}
-          </div>
-
-          <div className="mt-8 rounded-2xl border border-primary/30 bg-background/20 p-4 shadow-sm focus-within:border-primary/55 focus-within:ring-2 focus-within:ring-primary/10">
-            <textarea
-              value={value}
-              onChange={(e) => onChange(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSubmit(); } }}
-              placeholder="Ask another question..."
-              rows={2}
-              className="w-full resize-none bg-transparent text-sm focus:outline-none placeholder:text-muted-foreground/60 sm:text-base"
-            />
-            <div className="mt-2 flex items-center gap-2">
-              <button type="button" onClick={onAddNote} aria-label="Add a note" className="rounded-lg p-1.5 text-muted-foreground hover:bg-accent hover:text-foreground"><Plus className="h-5 w-5" /></button>
-              <button type="button" disabled title="Voice capture coming soon" aria-label="Record audio" className="rounded-lg p-1.5 text-muted-foreground opacity-45"><Mic className="h-5 w-5" /></button>
-              <button type="button" onClick={onSubmit} disabled={!value.trim() || busy} aria-label="Send question" className="ml-auto rounded-full bg-primary p-2.5 text-primary-foreground shadow-sm disabled:opacity-40">
-                {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ArrowUp className="h-4 w-4" />}
-              </button>
-            </div>
-          </div>
-          {error && <p className="mt-3 text-sm text-destructive">{error}</p>}
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/30 p-4 backdrop-blur-[6px]" role="dialog" aria-modal="true" aria-label={state.originalTitle ? 'Edit Muse' : 'Create Muse'}>
+      <div className="relative w-[min(92vw,570px)]">
+        <button type="button" onClick={onClose} aria-label="Close Muse editor" className="absolute right-2 top-2 z-10 text-[#777] sm:-right-10 sm:-top-8 sm:text-white"><X className="h-7 w-7" /></button>
+        <div className="rounded-xl border-[9px] border-[#f4f4f6] bg-white p-5 shadow-2xl">
+          <input autoFocus value={state.title} onChange={(event) => onChange({ ...state, title: event.target.value })} onKeyDown={(event) => { if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) onSave(); }} placeholder="Muse title" aria-label="Muse title" className="w-full bg-transparent px-2 pb-5 text-2xl font-bold text-[#555] outline-none placeholder:text-[#777]" />
+          <textarea id="cortex-description" value={state.description} onChange={(event) => onChange({ ...state, description: event.target.value })} placeholder={'Describe what this muse is about, this will help Ocreda automatically organize your notes.\n\nE.g: This muse is about my personal experience with philosophy in daily life.'} className="h-[270px] w-full resize-none rounded-lg bg-[#f7f7f9] p-6 text-base leading-relaxed text-[#555] outline-none placeholder:text-[#aaa]" />
         </div>
-      </main>
-
-      <aside className="shrink-0 border-t border-border/60 bg-background/15 p-5 lg:w-[340px] lg:overflow-y-auto lg:border-l lg:border-t-0 lg:px-7 lg:pb-7 lg:pt-6">
-        <h2 className="text-base font-semibold">Relevant from your notes</h2>
-        <div className="mt-5 space-y-4">
-          {sources.slice(0, 3).map((note) => (
-            <button key={note.id} type="button" onClick={() => onOpenNote(note.id)} className="group block w-full rounded-2xl border border-border bg-card p-5 text-left transition-colors hover:border-primary/35 hover:bg-accent/30">
-              <strong className="block text-sm sm:text-base">{noteTitle(note)}</strong>
-              <span className="mt-3 block text-sm leading-relaxed text-muted-foreground line-clamp-3">{truncate(note.raw_text, 110)}</span>
-              <span className="mt-4 block text-xs text-muted-foreground/70">{relTime(note.created_at)}</span>
-            </button>
-          ))}
-          {sources.length === 0 && <p className="rounded-2xl border border-dashed border-border p-5 text-sm text-muted-foreground">No source notes were needed for this answer.</p>}
-        </div>
-        <Link href="/notes" className="mt-5 flex w-full items-center justify-center rounded-xl border border-border px-4 py-3 text-sm font-medium hover:bg-accent">View more notes</Link>
-      </aside>
+        <button type="button" onClick={onSave} disabled={saving || !state.title.trim()} className="mx-auto mt-9 flex h-9 w-[180px] max-w-[80vw] items-center justify-center rounded-md bg-[#477bea] text-white hover:bg-[#3d6ed7] disabled:opacity-45">{saving ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Save'}</button>
+        {error && <p role="alert" className="mt-3 text-center text-sm text-red-600">{error}</p>}
+      </div>
     </div>
   );
 }
 
-/* ────────────────────────── note view ────────────────────────── */
-
-function NoteView({
-  note,
-  relations,
-  editing,
-  editText,
-  savingEdit,
-  onEditText,
-  onStartEdit,
-  onCancelEdit,
-  onSaveEdit,
-  onOpenNote,
-}: {
-  note: Note;
-  relations: RelatedNote[];
-  editing: boolean;
-  editText: string;
-  savingEdit: boolean;
-  onEditText: (v: string) => void;
-  onStartEdit: () => void;
-  onCancelEdit: () => void;
-  onSaveEdit: () => void;
-  onOpenNote: (id: string) => void;
-}) {
-  return (
-    <div className="animate-ocreda-fade-up max-w-2xl">
-      <div className="flex items-start justify-between gap-3 mb-6">
-        <span className="inline-flex rounded-xl bg-muted/60 px-4 py-2 text-sm font-semibold text-foreground">
-          {noteTitle(note)}
-        </span>
-        {!editing && (
-          <button
-            onClick={onStartEdit}
-            title="Edit note"
-            className="shrink-0 flex items-center gap-1.5 text-xs text-muted-foreground/70 hover:text-foreground px-2.5 py-1.5 rounded-lg hover:bg-accent transition-all"
-          >
-            <Pencil className="w-3 h-3" /> Edit
-          </button>
-        )}
-      </div>
-
-      {editing ? (
-        <div className="space-y-4">
-          <textarea
-            value={editText}
-            onChange={(e) => onEditText(e.target.value)}
-            rows={10}
-            className="w-full resize-none rounded-2xl border border-border bg-background/60 px-4 py-3.5 text-[15px] leading-relaxed text-foreground focus:outline-none focus:ring-2 focus:ring-primary/25 focus:border-primary/50 transition-all"
-          />
-          <div className="flex items-center gap-2 justify-end">
-            <button
-              onClick={onCancelEdit}
-              className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground px-3 py-2 rounded-lg border border-border hover:bg-accent transition-all"
-            >
-              <X className="w-3 h-3" /> Cancel
-            </button>
-            <button
-              onClick={onSaveEdit}
-              disabled={savingEdit || !editText.trim()}
-              className="flex items-center gap-1.5 text-xs text-white bg-primary hover:bg-primary/90 px-3 py-2 rounded-lg transition-all disabled:opacity-50"
-            >
-              {savingEdit ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
-              Save
-            </button>
-          </div>
-        </div>
-      ) : (
-        <p className="text-[15px] leading-[1.8] text-foreground whitespace-pre-wrap">{note.raw_text}</p>
-      )}
-
-      {!editing && relations.length > 0 && (
-        <div className="mt-10 space-y-5">
-          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/60">Connected notes</p>
-          {relations.map((rel) => (
-            <button
-              key={rel.id}
-              onClick={() => onOpenNote(rel.related_note_id)}
-              className="group block w-full text-left border-l-2 border-primary/70 pl-4 py-1 transition-colors hover:border-primary"
-            >
-              <p className="text-[15px] leading-[1.75] text-foreground/90 group-hover:text-foreground">
-                {rel.related_note?.summary || truncate(rel.related_note?.raw_text ?? '', 160)}
-              </p>
-              {rel.reason && <p className="mt-1 text-xs text-muted-foreground/60 leading-relaxed">{rel.reason}</p>}
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* ────────────────────────── chat view ────────────────────────── */
-
-function ChatView({
-  chat,
-  noteMap,
-  onOpenNote,
-}: {
-  chat: ChatState;
-  noteMap: Record<string, Note>;
-  onOpenNote: (id: string) => void;
-}) {
-  const question = chat.messages.find((m) => m.role === 'user')?.content ?? '';
-  const rest = chat.messages.filter((m) => m.id !== chat.messages.find((mm) => mm.role === 'user')?.id);
-  const sources = chat.sourceIds.map((id) => noteMap[id]).filter(Boolean);
-
-  return (
-    <div className="animate-ocreda-fade-up max-w-2xl">
-      <div className="mb-8">
-        <span className="inline-flex rounded-xl bg-primary/[0.08] px-4 py-2 text-sm font-semibold text-primary">
-          {question}
-        </span>
-      </div>
-
-      <div className="space-y-6">
-        {rest.map((m) =>
-          m.role === 'assistant' ? (
-            <div
-              key={m.id}
-              className="answer-prose text-[15px] leading-[1.8] text-foreground"
-              dangerouslySetInnerHTML={{ __html: renderAnswer(m.content) }}
-            />
-          ) : (
-            <div key={m.id} className="border-l-2 border-primary/70 pl-4">
-              <p className="text-[15px] leading-[1.75] text-foreground font-medium whitespace-pre-wrap">{m.content}</p>
-            </div>
-          )
-        )}
-      </div>
-
-      {sources.length > 0 && (
-        <div className="mt-10">
-          <p className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground/60 mb-3">Related notes</p>
-          <div className="flex flex-wrap gap-2">
-            {sources.map((n) => (
-              <button
-                key={n.id}
-                onClick={() => onOpenNote(n.id)}
-                className="rounded-lg border border-border bg-muted/40 px-3 py-1.5 text-xs font-medium text-foreground hover:border-primary/40 hover:bg-accent transition-all"
-              >
-                {noteTitle(n)}
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
-  );
+function SavedConfirmation() {
+  return <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/25 backdrop-blur-[5px]" role="status" aria-live="polite"><div className="flex h-[260px] w-[min(88vw,680px)] items-center justify-center rounded-lg bg-[#477bea] text-xl text-white shadow-2xl sm:text-2xl">Saved to you for you</div></div>;
 }

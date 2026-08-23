@@ -10,6 +10,8 @@ Deno.serve(async (req: Request) => {
 
 Rules:
 - Never mention or refer to an earlier saved note.
+- Never repeat, quote, or closely paraphrase the user's answer.
+- React to the underlying idea, not the wording they used.
 - Never ask a follow-up question beyond the supplied question.
 - Never offer advice or interpretation.
 - Maximum 2 sentences total.

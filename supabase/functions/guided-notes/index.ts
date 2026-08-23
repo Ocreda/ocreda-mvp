@@ -5,26 +5,36 @@ Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
 
   try {
-    const { answers } = await req.json() as { answers: string[] };
-    const prompt = `Convert these answers into atomic notes.
+    const { answers, corpus } = await req.json() as {
+      answers: string[];
+      corpus: Array<{ id: string; title: string | null; body: string }>;
+    };
+    if (!Array.isArray(corpus) || corpus.length === 0) {
+      return new Response(JSON.stringify({ notes: [] }), {
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+    const prompt = `Read the complete onboarding conversation and retrieve the best-matching EXISTING notes from the user's corpus.
 
 Rules:
-- One distinct claim or observation per note.
-- Use the user's own words and phrasing wherever possible.
-- Do not add interpretation, advice, or framing they didn't say.
-- Do not write notes about the person as a category ("interested in X"). Write the actual idea they stated.
-- Skip anything with no substance.
-- Create 1 to 2 notes per answer; fewer is fine.
-- Each note must have a short title and 1 to 3 sentences of body.
+- Never turn an answer into a new note.
+- Never repeat, quote, or paraphrase the chat as a result.
+- Return only notes whose IDs occur in the corpus below.
+- Rank by underlying meaning, not merely shared words.
+- Return at most 3 notes, strongest match first.
+- Copy each selected corpus note's title and body exactly.
 
-Answers:
+Conversation:
 ${answers.map((answer, index) => `${index + 1}. ${answer}`).join("\n")}
 
+Existing corpus:
+${corpus.map((note) => `ID: ${note.id}\nTitle: ${note.title ?? "Untitled"}\nBody: ${note.body}`).join("\n\n")}
+
 Return JSON only in this exact shape:
-{"notes":[{"title":"...","body":"...","source_answer":1}]}`;
+{"notes":[{"existing_note_id":"...","title":"...","body":"..."}]}`;
 
     const raw = await generateWithGemini(
-      "You extract faithful atomic notes and return only valid JSON.",
+      "You retrieve the most relevant existing notes from a supplied corpus and return only valid JSON.",
       [{ role: "user", content: prompt }],
       Deno.env.get("GEMINI_API_KEY")!
     );
@@ -34,7 +44,9 @@ Return JSON only in this exact shape:
     const notes = Array.isArray(parsed.notes) ? parsed.notes.filter((note: unknown) => {
       if (!note || typeof note !== "object") return false;
       const value = note as Record<string, unknown>;
-      return typeof value.title === "string" && typeof value.body === "string";
+      return typeof value.existing_note_id === "string" &&
+        corpus.some((candidate) => candidate.id === value.existing_note_id) &&
+        typeof value.title === "string" && typeof value.body === "string";
     }) : [];
 
     return new Response(JSON.stringify({ notes }), {

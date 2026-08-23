@@ -7,7 +7,7 @@ import SidebarMain from '@/components/SidebarMain';
 import { useAuth } from '@/lib/auth-context';
 import { supabase } from '@/lib/supabase';
 import { useTheme, ThemePreference } from '@/lib/theme-context';
-import { getNotes, getQuestions } from '@/lib/notes-api';
+import { getNotes } from '@/lib/notes-api';
 import {
   Camera,
   Check,
@@ -16,7 +16,6 @@ import {
   Trash2,
   Calendar,
   FileText,
-  MessageSquare,
 } from 'lucide-react';
 import { format } from 'date-fns';
 
@@ -27,7 +26,6 @@ interface ProfileData {
 
 interface Stats {
   totalNotes: number;
-  totalQuestions: number;
   createdAt: string;
 }
 
@@ -76,10 +74,9 @@ export default function ProfilePage() {
     if (!user) return;
     setLoadingStats(true);
     try {
-      const [notes, questions] = await Promise.all([getNotes(), getQuestions()]);
+      const notes = await getNotes();
       setStats({
         totalNotes: notes.length,
-        totalQuestions: questions.length,
         createdAt: user.created_at,
       });
     } finally {
@@ -256,7 +253,6 @@ export default function ProfilePage() {
             ) : stats ? (
               <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
                 <StatTile icon={FileText} label="Total Notes" value={stats.totalNotes} />
-                <StatTile icon={MessageSquare} label="Questions Asked" value={stats.totalQuestions} />
                 <StatTile
                   icon={Calendar}
                   label="Member Since"
