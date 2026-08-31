@@ -9,7 +9,7 @@ import { supabase } from '@/lib/supabase';
 import { useEffect, useState } from 'react';
 
 const NAV_ITEMS = [
-  { href: '/', label: 'Your cortex', icon: Sparkles },
+  { href: '/', label: 'Your projects', icon: Sparkles },
 ];
 
 // Sidebar toggle icon: rounded rect split vertically with a chevron on the left half
