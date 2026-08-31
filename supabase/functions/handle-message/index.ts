@@ -1,9 +1,17 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
-import { corsHeaders, generateWithGemini, extractJson } from "../_shared/gemini.ts";
+import {
+  authenticateRequest,
+  isAuthenticationError,
+  type UntypedSupabaseClient,
+} from "../_shared/auth.ts";
+import {
+  corsHeaders,
+  extractJson,
+  generateWithGemini,
+} from "../_shared/gemini.ts";
 
 interface HandleMessageRequest {
-  user_id: string;
   raw_text: string;
   local_date: string; // user's local YYYY-MM-DD
 }
@@ -31,11 +39,14 @@ interface QuestionResult {
 }
 
 async function getConnectionCounts(
-  supabase: ReturnType<typeof createClient>,
-  noteIds: string[]
+  supabase: UntypedSupabaseClient,
+  noteIds: string[],
 ): Promise<Record<string, number>> {
   if (noteIds.length === 0) return {};
-  const { data } = await supabase.from("note_relations").select("note_id").in("note_id", noteIds);
+  const { data } = await supabase.from("note_relations").select("note_id").in(
+    "note_id",
+    noteIds,
+  );
   const counts: Record<string, number> = {};
   for (const row of (data ?? []) as Array<{ note_id: string }>) {
     counts[row.note_id] = (counts[row.note_id] ?? 0) + 1;
@@ -49,18 +60,19 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
+    const { user } = await authenticateRequest(req);
     const supabase = createClient(
       Deno.env.get("SUPABASE_URL")!,
-      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+      Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
     );
 
-    const { user_id, raw_text, local_date }: HandleMessageRequest = await req.json();
+    const { raw_text, local_date }: HandleMessageRequest = await req.json();
     const apiKey = Deno.env.get("GEMINI_API_KEY")!;
 
     const { data: allNotes, error: notesErr } = await supabase
       .from("notes")
       .select("id, raw_text, summary, target_date, time_of_day")
-      .eq("user_id", user_id)
+      .eq("user_id", user.id)
       .order("created_at", { ascending: false })
       .limit(300);
 
@@ -71,11 +83,13 @@ Deno.serve(async (req: Request) => {
 
     const notesContext = hasNotes
       ? notesToUse.map((n, i) => {
-          const dateInfo = n.target_date
-            ? ` | date: ${n.target_date}${n.time_of_day ? ` (${n.time_of_day})` : ""}`
-            : "";
-          return `[Note ${i + 1}] ID:${n.id}${dateInfo}\n${n.summary || n.raw_text}`;
-        }).join("\n\n---\n\n")
+        const dateInfo = n.target_date
+          ? ` | date: ${n.target_date}${
+            n.time_of_day ? ` (${n.time_of_day})` : ""
+          }`
+          : "";
+        return `[Note ${i + 1}] ID:${n.id}${dateInfo}\n${n.raw_text}`;
+      }).join("\n\n---\n\n")
       : "No notes saved yet.";
 
     const prompt = `Today's date (the user's local date) is ${local_date}.
@@ -112,7 +126,7 @@ If it's a QUESTION, respond with exactly this shape:
     const raw = await generateWithGemini(
       "You are Ocreda, a personal second-brain assistant. You always respond with a single valid JSON object and nothing else.",
       [{ role: "user", content: prompt }],
-      apiKey
+      apiKey,
     );
 
     const jsonText = extractJson(raw);
@@ -124,11 +138,19 @@ If it's a QUESTION, respond with exactly this shape:
       const { data: savedNote, error: saveErr } = await supabase
         .from("notes")
         .insert({
-          user_id,
+          user_id: user.id,
           raw_text,
-          summary: typeof result.summary === "string" && result.summary.trim() ? result.summary.trim() : raw_text,
-          target_date: typeof result.target_date === "string" ? result.target_date : null,
-          time_of_day: ["morning", "afternoon", "evening", "night"].includes(result.time_of_day as string) ? result.time_of_day : null,
+          summary: typeof result.summary === "string" && result.summary.trim()
+            ? result.summary.trim()
+            : raw_text,
+          target_date: typeof result.target_date === "string"
+            ? result.target_date
+            : null,
+          time_of_day: ["morning", "afternoon", "evening", "night"].includes(
+              result.time_of_day as string,
+            )
+            ? result.time_of_day
+            : null,
         })
         .select()
         .single();
@@ -137,7 +159,7 @@ If it's a QUESTION, respond with exactly this shape:
 
       return new Response(
         JSON.stringify({ success: true, type: "note", note: savedNote }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        { headers: { ...corsHeaders, "Content-Type": "application/json" } },
       );
     }
 
@@ -152,7 +174,9 @@ If it's a QUESTION, respond with exactly this shape:
       : [];
 
     const noteIndexMap: Record<number, string> = {};
-    notesToUse.forEach((n, i) => { noteIndexMap[i + 1] = n.id; });
+    notesToUse.forEach((n, i) => {
+      noteIndexMap[i + 1] = n.id;
+    });
 
     const inlineSources: Array<{ marker: string; noteId: string }> = [];
     const markerRegex = /\[Note (\d+)\]/g;
@@ -160,7 +184,10 @@ If it's a QUESTION, respond with exactly this shape:
     while ((markerMatch = markerRegex.exec(answer)) !== null) {
       const idx = parseInt(markerMatch[1]);
       if (noteIndexMap[idx]) {
-        inlineSources.push({ marker: markerMatch[0], noteId: noteIndexMap[idx] });
+        inlineSources.push({
+          marker: markerMatch[0],
+          noteId: noteIndexMap[idx],
+        });
       }
     }
 
@@ -170,12 +197,22 @@ If it's a QUESTION, respond with exactly this shape:
       .filter((id) => noteMap.has(id))
       .map((id) => {
         const n = noteMap.get(id)!;
-        return { id: n.id, summary: n.summary, raw_text: n.raw_text, connection_count: connectionCounts[id] ?? 0 };
+        return {
+          id: n.id,
+          summary: n.summary,
+          raw_text: n.raw_text,
+          connection_count: connectionCounts[id] ?? 0,
+        };
       });
 
     const { data: savedQuestion, error: saveErr } = await supabase
       .from("questions")
-      .insert({ user_id, question: raw_text, answer, relevant_note_ids: sourceNoteIds })
+      .insert({
+        user_id: user.id,
+        question: raw_text,
+        answer,
+        relevant_note_ids: sourceNoteIds,
+      })
       .select()
       .single();
 
@@ -191,16 +228,34 @@ If it's a QUESTION, respond with exactly this shape:
         key_points: keyPoints,
         inline_sources: inlineSources,
         note_title_map: Object.fromEntries(
-          notesToUse.map((n, i) => [`Note ${i + 1}`, { id: n.id, title: n.summary || n.raw_text.slice(0, 40) }])
+          notesToUse.map((
+            n,
+            i,
+          ) => [`Note ${i + 1}`, {
+            id: n.id,
+            title: n.summary || n.raw_text.slice(0, 40),
+          }]),
         ),
       }),
-      { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      { headers: { ...corsHeaders, "Content-Type": "application/json" } },
     );
   } catch (error) {
+    if (isAuthenticationError(error)) {
+      return new Response(
+        JSON.stringify({ success: false, error: "Invalid or expired session" }),
+        {
+          status: 401,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        },
+      );
+    }
     const message = error instanceof Error ? error.message : "Unknown error";
     return new Response(
       JSON.stringify({ success: false, error: message }),
-      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      },
     );
   }
 });

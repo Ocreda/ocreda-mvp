@@ -39,6 +39,99 @@ async function getAuthenticatedOwnerId(): Promise<string> {
   return data.user.id;
 }
 
+async function getAccessToken(): Promise<string> {
+  const { data, error } = await supabase.auth.getSession();
+  const accessToken = data.session?.access_token;
+  if (error || !accessToken) {
+    throw new Error('Your session has expired. Sign in again to continue.');
+  }
+  return accessToken;
+}
+
+async function invokeAuthenticatedFunction<T>(functionName: string, body: Record<string, unknown>): Promise<T> {
+  const response = await fetch(`${SUPABASE_URL}/functions/v1/${functionName}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${await getAccessToken()}`,
+      apikey: SUPABASE_ANON_KEY,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
+  if (!response.ok) {
+    throw new Error(typeof payload?.error === 'string' ? payload.error : `${functionName} failed (${response.status})`);
+  }
+  return payload as T;
+}
+
+export interface EmbeddingBatchResult {
+  success: true;
+  embedding_version: string;
+  processed: number;
+  failed: number;
+  results: Array<{ note_id: string; status: 'ready' | 'failed' | 'skipped' | 'stale'; error?: string; reason?: string }>;
+}
+
+/**
+ * Runs the idempotent semantic-embedding worker. The Edge Function derives
+ * ownership from this session's JWT; no browser-supplied user id is trusted.
+ */
+export async function embedNotes(
+  noteIds: string[] = [],
+  options: { retryFailed?: boolean; retryStaleProcessing?: boolean; limit?: number } = {}
+): Promise<EmbeddingBatchResult[]> {
+  const batches = noteIds.length
+    ? Array.from({ length: Math.ceil(noteIds.length / 20) }, (_, index) => noteIds.slice(index * 20, (index + 1) * 20))
+    : [[]];
+  const results: EmbeddingBatchResult[] = [];
+  for (const batch of batches) {
+    results.push(await invokeAuthenticatedFunction<EmbeddingBatchResult>('embed-notes', {
+      ...(batch.length ? { note_ids: batch } : {}),
+      limit: options.limit ?? 25,
+      retry_failed: options.retryFailed ?? false,
+      retry_stale_processing: options.retryStaleProcessing ?? false,
+    }));
+  }
+  return results;
+}
+
+export async function backfillSemanticEmbeddings(options: {
+  batchSize?: number;
+  maxBatches?: number;
+  retryFailed?: boolean;
+  retryStaleProcessing?: boolean;
+  onBatch?: (completedBatches: number, latest: EmbeddingBatchResult) => void;
+} = {}): Promise<{ batches: number; processed: number; failed: number }> {
+  const batchSize = Math.min(Math.max(options.batchSize ?? 25, 1), 50);
+  const maxBatches = Math.min(Math.max(options.maxBatches ?? 20, 1), 100);
+  let processed = 0;
+  let failed = 0;
+  let batches = 0;
+
+  for (let index = 0; index < maxBatches; index += 1) {
+    const [result] = await embedNotes([], {
+      limit: batchSize,
+      retryFailed: options.retryFailed,
+      retryStaleProcessing: options.retryStaleProcessing,
+    });
+    batches += 1;
+    processed += result.processed;
+    failed += result.failed;
+    options.onBatch?.(batches, result);
+    if (result.results.length < batchSize || result.results.length === 0) break;
+  }
+
+  return { batches, processed, failed };
+}
+
+function startEmbeddingLifecycle(noteIds: string[]): void {
+  if (!noteIds.length) return;
+  void embedNotes(noteIds).catch((error) => {
+    if (process.env.NODE_ENV !== 'production') console.error('Semantic embedding request failed:', error);
+  });
+}
+
 function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -143,7 +236,9 @@ export async function createNote(rawText: string, category: string | null = null
     }).select(CATEGORY_NOTE_FIELDS).single();
     if (!result.error) {
       categoryColumnsAvailable = true;
-      return normalizeNote(result.data as Record<string, unknown>);
+      const note = normalizeNote(result.data as Record<string, unknown>);
+      startEmbeddingLifecycle([note.id]);
+      return note;
     }
     if (!isMissingCategoryColumn(result.error)) throw result.error;
     categoryColumnsAvailable = false;
@@ -151,7 +246,9 @@ export async function createNote(rawText: string, category: string | null = null
 
   const { data, error } = await supabase.from('notes').insert({ user_id: ownerId, raw_text: rawText }).select(LEGACY_NOTE_FIELDS).single();
   if (error) throw error;
-  return normalizeNote(data as Record<string, unknown>);
+  const note = normalizeNote(data as Record<string, unknown>);
+  startEmbeddingLifecycle([note.id]);
+  return note;
 }
 
 const NOTE_IMPORT_BATCH_SIZE = 50;
@@ -196,6 +293,7 @@ export async function importNotes(
       onProgress?.(Math.min(start + batch.length, rawTexts.length), rawTexts.length);
     }
 
+    startEmbeddingLifecycle(importedIds);
     return imported;
   } catch (error) {
     if (importedIds.length > 0) {
@@ -239,7 +337,11 @@ export async function extractGuidedNotes(answers: string[], corpus: Note[]): Pro
     },
     body: JSON.stringify({
       answers,
-      corpus: corpus.map((note) => ({ id: note.id, title: note.summary, body: note.raw_text })),
+      corpus: corpus.map((note) => ({
+        id: note.id,
+        title: note.raw_text.split('\n', 1)[0]?.trim() || 'Untitled',
+        body: note.raw_text,
+      })),
     }),
   });
   if (!response.ok) throw new Error(await response.text());
@@ -282,7 +384,9 @@ export async function updateNote(
     }).eq('id', noteId).select(CATEGORY_NOTE_FIELDS).single();
     if (!result.error) {
       categoryColumnsAvailable = true;
-      return normalizeNote(result.data as Record<string, unknown>);
+      const note = normalizeNote(result.data as Record<string, unknown>);
+      startEmbeddingLifecycle([note.id]);
+      return note;
     }
     if (!isMissingCategoryColumn(result.error)) throw result.error;
     categoryColumnsAvailable = false;
@@ -290,7 +394,9 @@ export async function updateNote(
 
   const { data, error } = await supabase.from('notes').update({ raw_text: rawText }).eq('id', noteId).select(LEGACY_NOTE_FIELDS).single();
   if (error) throw error;
-  return normalizeNote(data as Record<string, unknown>);
+  const note = normalizeNote(data as Record<string, unknown>);
+  startEmbeddingLifecycle([note.id]);
+  return note;
 }
 
 export async function moveNotesToCategory(
@@ -321,16 +427,7 @@ export async function deleteNote(noteId: string): Promise<void> {
 
 /** Fire-and-forget after a note is saved: finds related notes. */
 export async function processNote(noteId: string): Promise<{ relations_count: number }> {
-  const response = await fetch(`${SUPABASE_URL}/functions/v1/process-note`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ note_id: noteId, user_id: await getAuthenticatedOwnerId() }),
-  });
-  if (!response.ok) throw new Error(await response.text());
-  return response.json();
+  return invokeAuthenticatedFunction<{ relations_count: number }>('process-note', { note_id: noteId });
 }
 
 /** The single entry point for the "My Brain" input: classifies the text as a note to save or a question to answer. */
@@ -346,16 +443,46 @@ export async function handleMessage(rawText: string): Promise<
       note_title_map: Record<string, { id: string; title: string }>;
     }
 > {
-  const response = await fetch(`${SUPABASE_URL}/functions/v1/handle-message`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ user_id: await getOwnerId(), raw_text: rawText, local_date: getLocalDateString() }),
-  });
-  if (!response.ok) throw new Error(await response.text());
-  return response.json();
+  const result = await invokeAuthenticatedFunction<
+    | { type: 'note'; note: Note }
+    | {
+        type: 'question';
+        answer: string;
+        relevant_notes: Array<{ id: string; summary: string | null; raw_text: string; connection_count: number }>;
+        question_id: string;
+        key_points: string[];
+        inline_sources: Array<{ marker: string; noteId: string }>;
+        note_title_map: Record<string, { id: string; title: string }>;
+      }
+  >('handle-message', { raw_text: rawText, local_date: getLocalDateString() });
+  if (result.type === 'note' && typeof result.note?.id === 'string') startEmbeddingLifecycle([result.note.id]);
+  return result;
+}
+
+export type SemanticRetrievalExperimentRequest =
+  | { experiment: 'q1_subset'; entry_text: string; target_note_ids: string[]; subset_size?: number; seed?: string }
+  | {
+      experiment: 'q1_record_result';
+      experiment_id: string;
+      provider: string;
+      model: string;
+      run_label?: string;
+      response_text: string;
+      selected_note_ids?: string[];
+      metrics?: Record<string, unknown>;
+    }
+  | { experiment: 'q2_full_rank'; entry_text: string; target_note_ids?: string[] }
+  | {
+      experiment: 'q5_short_note';
+      note_id: string;
+      entry_texts: string[];
+      variants?: Array<{ name: string; context_note_ids?: string[]; context_text?: string }>;
+    };
+
+export async function runSemanticRetrievalExperiment<T = Record<string, unknown>>(
+  request: SemanticRetrievalExperimentRequest
+): Promise<T> {
+  return invokeAuthenticatedFunction<T>('semantic-retrieval-experiment', request);
 }
 
 export async function getNoteRelations(
@@ -437,19 +564,9 @@ export async function sendChatMessage(
   relevant_notes: Array<{ id: string; summary: string | null; raw_text: string; connection_count: number }>;
   messages: ConversationMessage[];
 }> {
-  const response = await fetch(`${SUPABASE_URL}/functions/v1/chat-message`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      question_id: questionId,
-      user_id: await getOwnerId(),
-      message,
-      local_date: getLocalDateString(),
-    }),
+  return invokeAuthenticatedFunction('chat-message', {
+    question_id: questionId,
+    message,
+    local_date: getLocalDateString(),
   });
-  if (!response.ok) throw new Error(await response.text());
-  return response.json();
 }

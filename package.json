@@ -9,7 +9,8 @@
     "start": "next start",
     "start:isolated": "NEXT_DIST_DIR=.next-build next start",
     "lint": "next lint",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:stage1": "npx --yes deno@2.5.0 test --allow-read supabase/functions/_shared/stage1_test.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.0",
