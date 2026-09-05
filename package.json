@@ -10,7 +10,8 @@
     "start:isolated": "NEXT_DIST_DIR=.next-build next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "test:stage1": "npx --yes deno@2.5.0 test --allow-read supabase/functions/_shared/stage1_test.ts"
+    "test:stage1": "npx --yes deno@2.5.0 test --allow-read supabase/functions/_shared/stage1_test.ts",
+    "test:stages": "npx --yes deno@2.5.0 test --allow-read supabase/functions/_shared/stage1_test.ts supabase/functions/_shared/stage2_stage3_test.ts"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.0",
