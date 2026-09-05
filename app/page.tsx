@@ -5,13 +5,26 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, ArrowUp, Bold, Check, ChevronDown, ChevronLeft, ChevronRight, Filter, FolderPlus, Grid2X2, Italic, Layers3, List, ListOrdered, Loader as Loader2, Mic, MoreHorizontal, PanelRightOpen, Plus, Rows3, ScanSearch, Search, Trash2, Upload, X } from 'lucide-react';
 import NoteImporter, { ImportNoteDraft } from '@/components/NoteImporter';
 import { useAuth } from '@/lib/auth-context';
-import { createNote, deleteNote, getNotes, importNotes, moveNotesToCategory, processNote, updateNote } from '@/lib/notes-api';
+import { backfillSemanticEmbeddings, createNote, deleteNote, getNotes, importNotes, moveNotesToCategory, processNote, retrieveSemanticNotes, updateNote } from '@/lib/notes-api';
 import { supabase } from '@/lib/supabase';
 import { Note } from '@/lib/types';
+import {
+  createDomain as createStoredDomain,
+  createProject as createStoredProject,
+  createProjectPage as createStoredProjectPage,
+  deleteDomain as deleteStoredDomain,
+  deleteProject as deleteStoredProject,
+  deleteProjectPage as deleteStoredProjectPage,
+  migrateBrowserWorkspace,
+  setNotesDomain,
+  updateDomain as updateStoredDomain,
+  updateProject as updateStoredProject,
+  updateProjectPage as updateStoredProjectPage,
+  type CortexProject,
+  type Domain as MuseMeta,
+  type ProjectPage,
+} from '@/lib/workspace-api';
 
-type MuseMeta = { title: string; description: string; createdAt: string };
-type ProjectPage = { id: string; title: string; content: string; sourceNoteIds: string[]; createdAt: string; updatedAt: string };
-type CortexProject = { id: string; title: string; description: string; content: string; pages: ProjectPage[]; createdAt: string; updatedAt: string };
 type NoteEditorState = { note: Note | null; title: string; body: string; muse: string };
 type MuseEditorState = { originalTitle: string | null; title: string; description: string };
 type ProjectEditorState = { project: CortexProject | null; title: string; description: string };
@@ -59,48 +72,6 @@ function safeErrorMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
-function readMuseAssignments(userId: string): Record<string, string> {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(`ocreda-note-muses:${userId}`) ?? '{}') as Record<string, unknown>;
-    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === 'string'));
-  } catch {
-    return {};
-  }
-}
-
-function readStoredList<T>(key: string): T[] {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(key) ?? '[]') as unknown;
-    return Array.isArray(parsed) ? parsed as T[] : [];
-  } catch {
-    return [];
-  }
-}
-
-function createProjectId(): string {
-  return typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `project-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-
-function createPageId(): string {
-  return typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `page-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-}
-
-function normalizeProject(project: Omit<CortexProject, 'pages'> & { pages?: ProjectPage[] }): CortexProject {
-  const pages = Array.isArray(project.pages)
-    ? project.pages.filter((page) => page && typeof page.id === 'string' && typeof page.title === 'string').map((page) => ({
-      ...page,
-      content: typeof page.content === 'string' ? page.content : '',
-      sourceNoteIds: Array.isArray(page.sourceNoteIds) ? page.sourceNoteIds.filter((id): id is string => typeof id === 'string') : [],
-      createdAt: page.createdAt || project.createdAt,
-      updatedAt: page.updatedAt || project.updatedAt,
-    }))
-    : [];
-  if (!pages.length && project.content?.trim()) {
-    pages.push({ id: `${project.id}-legacy-page`, title: project.title, content: project.content, sourceNoteIds: [], createdAt: project.createdAt, updatedAt: project.updatedAt });
-  }
-  return { ...project, content: project.content ?? '', pages };
-}
-
 function inferMuse(text: string, muses: MuseMeta[]): string | null {
   if (!muses.length) return null;
   const ignored = new Set(['this', 'that', 'with', 'from', 'have', 'will', 'your', 'about', 'into', 'were', 'when']);
@@ -143,78 +114,27 @@ export default function OcredaHome() {
   const [importProgress, setImportProgress] = useState<{ completed: number; total: number } | null>(null);
 
   const load = useCallback(async () => {
+    if (!user) { setLoading(false); return; }
     try {
-      const loaded = await getNotes();
-      const localMuses = user ? readMuseAssignments(user.id) : {};
-      setNotes(loaded.map((note) => localMuses[note.id] ? { ...note, category: localMuses[note.id] } : note));
+      const [loaded, workspace] = await Promise.all([getNotes(), migrateBrowserWorkspace(user.id)]);
+      setMuseMeta(workspace.domains);
+      setProjects(workspace.projects);
+      setNotes(loaded.map((note) => ({ ...note, category: workspace.noteDomainNames[note.id] ?? null })));
+      void backfillSemanticEmbeddings({ batchSize: 25, maxBatches: 2, retryStaleProcessing: true }).catch(() => {});
+      const { data } = await supabase.from('user_settings').select('full_name').eq('user_id', user.id).maybeSingle();
+      const authName = String(user.user_metadata?.full_name ?? user.user_metadata?.name ?? '').trim();
+      setDisplayName(data?.full_name?.trim() || authName || user.email?.split('@')[0] || 'you');
     }
-    catch (err) { setError(safeErrorMessage(err, 'Unable to load your notes.')); }
+    catch (err) { setError(safeErrorMessage(err, 'Unable to load your workspace.')); }
     finally { setLoading(false); }
   }, [user]);
   useEffect(() => { void load(); }, [load]);
 
-  useEffect(() => {
-    if (!user) return;
-    const museKey = `ocreda-muses:${user.id}`;
-    const projectKey = `ocreda-projects:${user.id}`;
-    const legacy = readStoredList<MuseMeta>(`ocreda-cortexes:${user.id}`).filter((item) => item && typeof item.title === 'string');
-    const storedMuses = readStoredList<MuseMeta>(museKey).filter((item) => item && typeof item.title === 'string');
-    const nextMuses = storedMuses.length ? storedMuses : legacy;
-    setMuseMeta(nextMuses);
-    if (!storedMuses.length && legacy.length) localStorage.setItem(museKey, JSON.stringify(legacy));
-
-    const storedProjects = readStoredList<CortexProject>(projectKey).filter((item) => item && typeof item.id === 'string' && typeof item.title === 'string').map(normalizeProject);
-    if (storedProjects.length) {
-      setProjects(storedProjects);
-    } else if (legacy.length) {
-      const migrated = legacy.map((item) => ({
-        id: createProjectId(),
-        title: item.title,
-        description: item.description,
-        content: '',
-        pages: [],
-        createdAt: item.createdAt,
-        updatedAt: item.createdAt,
-      }));
-      setProjects(migrated);
-      localStorage.setItem(projectKey, JSON.stringify(migrated));
-    }
-    supabase.from('user_settings').select('full_name').eq('user_id', user.id).maybeSingle().then(({ data }) => {
-      const authName = String(user.user_metadata?.full_name ?? user.user_metadata?.name ?? '').trim();
-      setDisplayName(data?.full_name?.trim() || authName || user.email?.split('@')[0] || 'you');
-    });
-  }, [user]);
-
-  const persistMuseMeta = useCallback((next: MuseMeta[]) => {
-    setMuseMeta(next);
-    if (user) localStorage.setItem(`ocreda-muses:${user.id}`, JSON.stringify(next));
-  }, [user]);
-
-  const persistProjects = useCallback((next: CortexProject[]) => {
-    setProjects(next);
-    if (user) localStorage.setItem(`ocreda-projects:${user.id}`, JSON.stringify(next));
-  }, [user]);
-
-  const persistMuseAssignments = useCallback((noteIds: string[], category: string | null) => {
-    if (!user || !noteIds.length) return;
-    const assignments = readMuseAssignments(user.id);
-    noteIds.forEach((noteId) => {
-      if (category) assignments[noteId] = category;
-      else delete assignments[noteId];
-    });
-    localStorage.setItem(`ocreda-note-muses:${user.id}`, JSON.stringify(assignments));
-    setNotes((current) => current.map((note) => noteIds.includes(note.id) ? { ...note, category, category_updated_at: new Date().toISOString() } : note));
-  }, [user]);
-
   const muses = useMemo(() => {
     const map = new Map<string, MuseMeta>();
     museMeta.forEach((item) => { const title = cleanCategory(item.title); if (title) map.set(title.toLowerCase(), { ...item, title }); });
-    notes.forEach((note) => {
-      const title = cleanCategory(note.category);
-      if (title && !map.has(title.toLowerCase())) map.set(title.toLowerCase(), { title, description: '', createdAt: note.created_at });
-    });
     return Array.from(map.values()).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-  }, [museMeta, notes]);
+  }, [museMeta]);
 
   const notesByMuse = useMemo(() => {
     const grouped = new Map<string, Note[]>();
@@ -239,7 +159,6 @@ export default function OcredaHome() {
     if (!requested) return;
     const existing = muses.find((item) => item.title.toLowerCase() === requested.toLowerCase());
     const title = existing?.title ?? requested;
-    if (!existing) persistMuseMeta([...museMeta, { title, description: '', createdAt: new Date().toISOString() }]);
     setNoteEditor((current) => current ? { ...current, muse: title } : current);
   };
 
@@ -251,14 +170,19 @@ export default function OcredaHome() {
     const category = noteEditor.muse === AUTOMATIC_MUSE ? inferMuse(rawText, muses) : cleanCategory(noteEditor.muse);
     setSaving(true); setError('');
     try {
+      let domain = category ? muses.find((item) => item.title.toLowerCase() === category.toLowerCase()) : null;
+      if (category && !domain) {
+        domain = await createStoredDomain(category);
+        setMuseMeta((current) => [...current.filter((item) => item.title.toLowerCase() !== category.toLowerCase()), domain!]);
+      }
       if (noteEditor.note) {
         const updated = await updateNote(noteEditor.note.id, rawText, category);
+        await setNotesDomain([updated.id], domain?.id ?? null);
         setNotes((current) => current.map((note) => note.id === updated.id ? { ...updated, category } : note));
-        persistMuseAssignments([updated.id], category);
       } else {
         const created = await createNote(rawText, category);
+        await setNotesDomain([created.id], domain?.id ?? null);
         setNotes((current) => [{ ...created, category }, ...current]);
-        persistMuseAssignments([created.id], category);
         processNote(created.id).catch(() => {});
       }
       setNoteEditor(null); flashSaved();
@@ -269,7 +193,7 @@ export default function OcredaHome() {
   const removeNote = async () => {
     if (!noteEditor?.note || !confirm('Delete this note? This cannot be undone.')) return;
     setSaving(true);
-    try { const noteId = noteEditor.note.id; await deleteNote(noteId); persistMuseAssignments([noteId], null); setNotes((current) => current.filter((note) => note.id !== noteId)); setNoteEditor(null); }
+    try { const noteId = noteEditor.note.id; await deleteNote(noteId); setNotes((current) => current.filter((note) => note.id !== noteId)); setNoteEditor(null); }
     catch (err) { setError(safeErrorMessage(err, 'Unable to delete this note.')); }
     finally { setSaving(false); }
   };
@@ -290,7 +214,6 @@ export default function OcredaHome() {
     setSaving(true); setError('');
     try {
       await deleteNote(note.id);
-      persistMuseAssignments([note.id], null);
       setNotes((items) => items.filter((item) => item.id !== note.id));
       if (activeNoteId === note.id) setActiveNoteId(null);
     } catch (err) { setError(safeErrorMessage(err, 'Unable to delete this page.')); }
@@ -300,29 +223,27 @@ export default function OcredaHome() {
   const saveInstantRetrieval = async (queryText: string, resultNotes: Note[], projectId: string, newProjectTitle?: string) => {
     setSaving(true); setError('');
     try {
-      const now = new Date().toISOString();
       let target = projects.find((project) => project.id === projectId);
-      let nextProjects = projects;
       if (!target) {
         const title = cleanCategory(newProjectTitle);
         if (!title) throw new Error('Choose a project or create a new one first.');
-        target = { id: createProjectId(), title, description: `Pages saved from Instant Retrieval.`, content: '', pages: [], createdAt: now, updatedAt: now };
-        nextProjects = [...projects, target];
+        target = await createStoredProject(title, 'Pages saved from Instant Retrieval.');
       }
       const closest = resultNotes[0];
       const closestContent = closest ? splitNote(closest) : null;
-      const page: ProjectPage = {
-        id: createPageId(),
-        title: queryText.trim().replace(/[.!?]+$/, '').slice(0, 100) || 'Instant retrieval',
-        content: closestContent
+      const page = await createStoredProjectPage(
+        target.id,
+        queryText.trim().replace(/[.!?]+$/, '').slice(0, 100) || 'Instant retrieval',
+        closestContent
           ? `${closestContent.title}\n\n${closestContent.body || notePreview(closest)}`
           : `Instant retrieval\n\n${queryText.trim()}`,
-        sourceNoteIds: resultNotes.slice(0, 6).map((note) => note.id),
-        createdAt: now,
-        updatedAt: now,
-      };
-      nextProjects = nextProjects.map((project) => project.id === target!.id ? { ...project, pages: [...project.pages, page], updatedAt: now } : project);
-      persistProjects(nextProjects);
+      );
+      page.sourceNoteIds = resultNotes.slice(0, 6).map((note) => note.id);
+      setProjects((current) => {
+        const exists = current.some((project) => project.id === target!.id);
+        const base = exists ? current : [...current, target!];
+        return base.map((project) => project.id === target!.id ? { ...project, pages: [...project.pages, page], updatedAt: page.updatedAt } : project);
+      });
       setActiveProjectId(target.id);
       setActivePageId(page.id);
       flashSaved();
@@ -337,17 +258,16 @@ export default function OcredaHome() {
     if (muses.some((item) => item.title.toLowerCase() === title.toLowerCase() && item.title !== museEditor.originalTitle)) { setError('A Domain with this title already exists.'); return; }
     setSaving(true); setError('');
     try {
+      const original = museEditor.originalTitle ? muses.find((item) => item.title === museEditor.originalTitle) : null;
+      const saved = original
+        ? await updateStoredDomain(original.id, title, museEditor.description)
+        : await createStoredDomain(title, museEditor.description);
       if (museEditor.originalTitle && museEditor.originalTitle !== title) {
         const affected = notesByMuse.get(museEditor.originalTitle) ?? [];
-        const updated = await moveNotesToCategory(affected.map((note) => note.id), title);
-        const updates = new Map(updated.map((note) => [note.id, note]));
-        setNotes((current) => current.map((note) => updates.get(note.id) ?? note));
-        persistMuseAssignments(affected.map((note) => note.id), title);
+        setNotes((current) => current.map((note) => affected.some((item) => item.id === note.id) ? { ...note, category: title } : note));
+        void moveNotesToCategory(affected.map((note) => note.id), title).catch(() => {});
       }
-      const originalKey = museEditor.originalTitle?.toLowerCase();
-      const next = museMeta.filter((item) => item.title.toLowerCase() !== originalKey && item.title.toLowerCase() !== title.toLowerCase());
-      next.push({ title, description: museEditor.description.trim(), createdAt: museMeta.find((item) => item.title.toLowerCase() === originalKey)?.createdAt ?? new Date().toISOString() });
-      persistMuseMeta(next);
+      setMuseMeta((current) => [...current.filter((item) => item.id !== original?.id && item.title.toLowerCase() !== title.toLowerCase()), saved]);
       if (activeMuse === museEditor.originalTitle) setActiveMuse(title);
       setMuseEditor(null); flashSaved();
     } catch (err) { setError(safeErrorMessage(err, 'Unable to save this Domain.')); }
@@ -358,61 +278,77 @@ export default function OcredaHome() {
     if (!confirm(`Delete “${title}”? Its notes will return to Instant retrieval.`)) return;
     setSaving(true);
     try {
-      const updated = await moveNotesToCategory((notesByMuse.get(title) ?? []).map((note) => note.id), null);
-      const updates = new Map(updated.map((note) => [note.id, note]));
-      setNotes((current) => current.map((note) => updates.get(note.id) ?? note));
-      persistMuseAssignments((notesByMuse.get(title) ?? []).map((note) => note.id), null);
-      persistMuseMeta(museMeta.filter((item) => item.title.toLowerCase() !== title.toLowerCase())); setActiveMuse(null);
+      const domain = muses.find((item) => item.title === title);
+      if (domain) await deleteStoredDomain(domain.id);
+      const affectedIds = (notesByMuse.get(title) ?? []).map((note) => note.id);
+      setNotes((current) => current.map((note) => affectedIds.includes(note.id) ? { ...note, category: null } : note));
+      void moveNotesToCategory(affectedIds, null).catch(() => {});
+      setMuseMeta((current) => current.filter((item) => item.title.toLowerCase() !== title.toLowerCase())); setActiveMuse(null);
     } catch (err) { setError(safeErrorMessage(err, 'Unable to delete this Domain.')); }
     finally { setSaving(false); }
   };
 
-  const saveProject = () => {
+  const saveProject = async () => {
     if (!projectEditor) return;
     const title = cleanCategory(projectEditor.title);
     if (!title) { setError('Add a title for this project.'); return; }
-    const now = new Date().toISOString();
-    const nextProject: CortexProject = projectEditor.project
-      ? { ...projectEditor.project, title, description: projectEditor.description.trim(), updatedAt: now }
-      : { id: createProjectId(), title, description: projectEditor.description.trim(), content: '', pages: [], createdAt: now, updatedAt: now };
-    persistProjects(projectEditor.project
-      ? projects.map((project) => project.id === nextProject.id ? nextProject : project)
-      : [...projects, nextProject]);
-    setProjectEditor(null);
-    setActiveProjectId(nextProject.id);
-    setActivePageId(null);
-    flashSaved();
+    setSaving(true); setError('');
+    try {
+      const saved = projectEditor.project
+        ? await updateStoredProject(projectEditor.project.id, title, projectEditor.description)
+        : await createStoredProject(title, projectEditor.description);
+      const nextProject = projectEditor.project ? { ...projectEditor.project, ...saved, pages: projectEditor.project.pages } : saved;
+      setProjects((current) => projectEditor.project
+        ? current.map((project) => project.id === nextProject.id ? nextProject : project)
+        : [...current, nextProject]);
+      setProjectEditor(null); setActiveProjectId(nextProject.id); setActivePageId(null); flashSaved();
+    } catch (err) { setError(safeErrorMessage(err, 'Unable to save this project.')); }
+    finally { setSaving(false); }
   };
 
-  const updateProject = (updated: CortexProject) => {
-    persistProjects(projects.map((project) => project.id === updated.id ? { ...updated, updatedAt: new Date().toISOString() } : project));
+  const createProjectPage = async (projectId: string) => {
+    setSaving(true); setError('');
+    try {
+      const page = await createStoredProjectPage(projectId);
+      setProjects((current) => current.map((project) => project.id === projectId ? { ...project, pages: [...project.pages, page], updatedAt: page.updatedAt } : project));
+      setActivePageId(page.id);
+    } catch (err) { setError(safeErrorMessage(err, 'Unable to create this page.')); }
+    finally { setSaving(false); }
   };
 
-  const createProjectPage = (projectId: string) => {
-    const now = new Date().toISOString();
-    const page: ProjectPage = { id: createPageId(), title: 'Untitled page', content: '', sourceNoteIds: [], createdAt: now, updatedAt: now };
-    persistProjects(projects.map((project) => project.id === projectId ? { ...project, pages: [...project.pages, page], updatedAt: now } : project));
-    setActivePageId(page.id);
+  const updateProjectPage = async (projectId: string, updatedPage: ProjectPage) => {
+    try {
+      const saved = await updateStoredProjectPage(projectId, updatedPage);
+      setProjects((current) => current.map((project) => project.id === projectId ? { ...project, pages: project.pages.map((page) => page.id === saved.id ? saved : page), updatedAt: saved.updatedAt } : project));
+    } catch (err) {
+      setError(safeErrorMessage(err, 'Unable to save this page.'));
+      throw err;
+    }
   };
 
-  const updateProjectPage = (projectId: string, updatedPage: ProjectPage) => {
-    persistProjects(projects.map((project) => project.id === projectId ? { ...project, pages: project.pages.map((page) => page.id === updatedPage.id ? { ...updatedPage, updatedAt: new Date().toISOString() } : page), updatedAt: new Date().toISOString() } : project));
-  };
-
-  const removeProjectPage = (projectId: string, pageId: string) => {
+  const removeProjectPage = async (projectId: string, pageId: string) => {
     const project = projects.find((item) => item.id === projectId);
     const page = project?.pages.find((item) => item.id === pageId);
     if (!project || !page || !confirm(`Delete “${page.title}”?`)) return;
-    persistProjects(projects.map((item) => item.id === projectId ? { ...item, pages: item.pages.filter((candidate) => candidate.id !== pageId), updatedAt: new Date().toISOString() } : item));
-    setActivePageId(null);
+    setSaving(true); setError('');
+    try {
+      await deleteStoredProjectPage(pageId);
+      setProjects((current) => current.map((item) => item.id === projectId ? { ...item, pages: item.pages.filter((candidate) => candidate.id !== pageId), updatedAt: new Date().toISOString() } : item));
+      setActivePageId(null);
+    } catch (err) { setError(safeErrorMessage(err, 'Unable to delete this page.')); }
+    finally { setSaving(false); }
   };
 
-  const removeProject = (projectId: string) => {
+  const removeProject = async (projectId: string) => {
     const project = projects.find((item) => item.id === projectId);
     if (!project || !confirm(`Delete “${project.title}”?`)) return;
-    persistProjects(projects.filter((item) => item.id !== projectId));
-    setActiveProjectId(null);
-    setActivePageId(null);
+    setSaving(true); setError('');
+    try {
+      await deleteStoredProject(projectId);
+      setProjects((current) => current.filter((item) => item.id !== projectId));
+      setActiveProjectId(null); setActivePageId(null);
+    } catch (err) { setError(safeErrorMessage(err, 'Unable to delete this project.')); }
+    finally { setSaving(false); }
   };
 
   const handleImport = async (drafts: ImportNoteDraft[]) => {
@@ -568,17 +504,19 @@ function ProjectPagesGrid({ project, onBack, onAddPage, onOpenPage, onEdit, onDe
 
 function ProjectPageWorkspace({ project, page, notes, muses, projects, saving, onBack, onChange, onAddNote, onOpenNote, onOpenPage, onDelete, onSaveRetrieval }: {
   project: CortexProject; page: ProjectPage; notes: Note[]; muses: MuseMeta[]; projects: CortexProject[]; saving: boolean;
-  onBack: () => void; onChange: (page: ProjectPage) => void;
+  onBack: () => void; onChange: (page: ProjectPage) => Promise<void>;
   onAddNote: () => void; onOpenNote: (note: Note) => void; onOpenPage: (project: CortexProject, page: ProjectPage) => void; onDelete: () => void;
   onSaveRetrieval: (queryText: string, resultNotes: Note[], projectId: string, newProjectTitle?: string) => Promise<void>;
 }) {
   const [title, setTitle] = useState(page.title);
   const [content, setContent] = useState(page.content);
-  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved'>('idle');
+  const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [contextOpen, setContextOpen] = useState(true);
   const [selectedNoteId, setSelectedNoteId] = useState<string | null>(null);
   const [searchRequest, setSearchRequest] = useState<KnowledgeSearchRequest | null>(null);
   const [instantRetrievalOpen, setInstantRetrievalOpen] = useState(false);
+  const [surfacedNotes, setSurfacedNotes] = useState<Note[]>([]);
+  const [retrievalState, setRetrievalState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const latestChangeRef = useRef(onChange);
   latestChangeRef.current = onChange;
 
@@ -586,19 +524,30 @@ function ProjectPageWorkspace({ project, page, notes, muses, projects, saving, o
     if (content === page.content && title === page.title) return;
     setSaveState('saving');
     const timeout = window.setTimeout(() => {
-      latestChangeRef.current({ ...page, title: title.trim() || 'Untitled page', content });
-      setSaveState('saved');
+      void latestChangeRef.current({ ...page, title: title.trim() || 'Untitled page', content })
+        .then(() => setSaveState('saved'))
+        .catch(() => setSaveState('error'));
     }, 550);
     return () => window.clearTimeout(timeout);
   }, [content, page, title]);
 
-  const surfacedNotes = useMemo(() => {
-    const context = `${project.title} ${project.description} ${title} ${content}`;
-    const ranked = notes.map((note) => ({ note, score: sharedWordScore(context, note.raw_text) }))
-      .sort((left, right) => right.score - left.score || right.note.created_at.localeCompare(left.note.created_at));
-    const related = ranked.filter((item) => item.score > 0);
-    return (related.length ? related : ranked).slice(0, 8).map((item) => item.note);
-  }, [content, notes, project.description, project.title, title]);
+  useEffect(() => {
+    const pageText = `${title.trim()}\n\n${content.trim()}`.trim();
+    if (pageText.length < 3) { setSurfacedNotes([]); setRetrievalState('idle'); return; }
+    let cancelled = false;
+    setRetrievalState('loading');
+    const timeout = window.setTimeout(() => {
+      void retrieveSemanticNotes(pageText, { candidateLimit: 60 }).then((result) => {
+        if (cancelled) return;
+        const byId = new Map(notes.map((note) => [note.id, note]));
+        setSurfacedNotes(result.candidates.map((candidate) => byId.get(candidate.note_id)).filter((note): note is Note => !!note).slice(0, 8));
+        setRetrievalState('ready');
+      }).catch(() => {
+        if (!cancelled) { setSurfacedNotes([]); setRetrievalState('error'); }
+      });
+    }, 650);
+    return () => { cancelled = true; window.clearTimeout(timeout); };
+  }, [content, notes, title]);
 
   useEffect(() => {
     setSelectedNoteId((current) => surfacedNotes.some((note) => note.id === current) ? current : surfacedNotes[0]?.id ?? null);
@@ -608,7 +557,9 @@ function ProjectPageWorkspace({ project, page, notes, muses, projects, saving, o
   const selectedContent = selectedNote ? splitNote(selectedNote) : null;
 
   const leave = () => {
-    if (content !== page.content || title !== page.title) latestChangeRef.current({ ...page, title: title.trim() || 'Untitled page', content });
+    if (content !== page.content || title !== page.title) {
+      void latestChangeRef.current({ ...page, title: title.trim() || 'Untitled page', content }).catch(() => {});
+    }
     onBack();
   };
 
@@ -623,7 +574,7 @@ function ProjectPageWorkspace({ project, page, notes, muses, projects, saving, o
         <button type="button" onClick={() => setContextOpen((open) => !open)} aria-label={contextOpen ? 'Close retrieved knowledge panels' : 'Open retrieved knowledge panels'} title={contextOpen ? 'Close retrieved knowledge panels' : 'Open retrieved knowledge panels'} aria-expanded={contextOpen} className="ml-1 flex h-9 items-center gap-2 rounded-md px-2 text-xs text-[#777] hover:bg-[#f4f4f4]"><PanelRightOpen className={`h-5 w-5 transition-transform ${contextOpen ? '' : 'rotate-180'}`} /><span className="hidden lg:inline">{contextOpen ? 'Hide retrieval' : 'Show retrieval'}</span></button>
         <span className="pointer-events-none absolute left-1/2 hidden -translate-x-1/2 text-sm text-[#aaa] sm:block">{project.title}</span>
         <div className="relative ml-auto flex items-center gap-2">
-          <span className="text-xs text-[#aaa]">{saveState === 'saving' ? 'Saving...' : saveState === 'saved' ? 'Saved' : ''}</span>
+          <span className={`text-xs ${saveState === 'error' ? 'text-red-600' : 'text-[#aaa]'}`}>{saveState === 'saving' ? 'Saving...' : saveState === 'saved' ? 'Saved' : saveState === 'error' ? 'Save failed' : ''}</span>
           <button type="button" onClick={onDelete} aria-label="Delete page" title="Delete page" className="flex h-9 w-9 items-center justify-center rounded-md text-red-600 hover:bg-red-50"><Trash2 className="h-4 w-4" /></button>
         </div>
       </header>
@@ -643,7 +594,7 @@ function ProjectPageWorkspace({ project, page, notes, muses, projects, saving, o
           <h2 className="mb-4 text-center text-sm font-normal text-[#999]">Retrieved for this page</h2>
           <div className="space-y-4">
             {surfacedNotes.map((note) => { const noteContent = splitNote(note); return <button key={note.id} type="button" onMouseEnter={() => setSelectedNoteId(note.id)} onFocus={() => setSelectedNoteId(note.id)} onClick={() => onOpenNote(note)} className={`block h-[190px] w-full overflow-hidden rounded-md border bg-[#f7f7f9] p-2 text-left shadow-sm transition hover:border-[#8fb1ff] ${selectedNoteId === note.id ? 'border-[#7ca2ff] ring-1 ring-[#7ca2ff]/30' : 'border-[#e0e0e0]'}`}><span className="block h-[142px] overflow-hidden rounded bg-white p-4"><span className="float-right text-[11px] text-[#477bea]">note</span><strong className="block max-w-[80%] truncate text-sm">{noteContent.title}</strong><span className="mt-3 block line-clamp-4 text-xs leading-relaxed text-[#777]">{noteContent.body || notePreview(note)}</span></span><span className="mt-2 flex items-center justify-between px-2 text-[11px] text-[#aaa]"><span className="truncate">Domain: {cleanCategory(note.category) || 'Instant retrieval'}</span><span>{formatDate(note.created_at)}</span></span></button>; })}
-            {!surfacedNotes.length && <p className="px-4 py-12 text-center text-sm leading-relaxed text-[#999]">Related notes will appear here as your knowledge base grows.</p>}
+            {!surfacedNotes.length && <p className="px-4 py-12 text-center text-sm leading-relaxed text-[#999]">{retrievalState === 'loading' ? 'Finding semantic connections…' : retrievalState === 'error' ? 'Semantic retrieval is temporarily unavailable.' : 'Related notes will appear here as your knowledge base grows.'}</p>}
           </div>
         </aside>}
       </div>
@@ -792,14 +743,6 @@ function MuseDetail({ title, notes, isUnsorted, busy, onClose, onAddNote, onOpen
 
 type KnowledgeFilter = { kind: 'muse' | 'date'; value: string; label: string };
 type KnowledgeSearchRequest = { query: string; filter?: KnowledgeFilter };
-
-function sharedWordScore(left: string, right: string): number {
-  const ignored = new Set(['about', 'after', 'again', 'because', 'before', 'being', 'could', 'from', 'have', 'into', 'just', 'more', 'that', 'their', 'there', 'these', 'they', 'this', 'what', 'when', 'where', 'which', 'will', 'with', 'would', 'your']);
-  const words = (value: string) => new Set((value.toLowerCase().match(/[a-z0-9']{4,}/g) ?? []).filter((word) => !ignored.has(word)));
-  const first = words(left); const second = words(right);
-  let score = 0; first.forEach((word) => { if (second.has(word)) score += 1; });
-  return score;
-}
 
 function fullNoteDate(value: string): string {
   return new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', year: 'numeric' }).format(new Date(value));
@@ -1089,15 +1032,9 @@ function InstantRetrievalOverlay({ notes, projects, initialQuery = '', saving, o
   const [newProject, setNewProject] = useState('');
   const [saveMessage, setSaveMessage] = useState('');
   const [saveError, setSaveError] = useState('');
-
-  const results = useMemo(() => {
-    const keywords = retrievalKeywords(query);
-    return [...notes].map((note) => {
-      const haystack = `${note.raw_text} ${note.category ?? ''}`.toLowerCase();
-      const keywordScore = keywords.reduce((score, word) => score + (haystack.includes(word) ? 2 : 0), 0);
-      return { note, score: keywordScore + sharedWordScore(query, note.raw_text) };
-    }).sort((left, right) => right.score - left.score || right.note.created_at.localeCompare(left.note.created_at)).filter((item, index) => item.score > 0 || index < 2).slice(0, 6).map((item) => item.note);
-  }, [notes, query]);
+  const [results, setResults] = useState<Note[]>([]);
+  const [retrievalState, setRetrievalState] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [retrievalError, setRetrievalError] = useState('');
 
   useEffect(() => { setSelectedId(results[0]?.id ?? null); }, [results]);
 
@@ -1112,8 +1049,21 @@ function InstantRetrievalOverlay({ notes, projects, initialQuery = '', saving, o
     setClarificationRound(0); setPhase('clarify'); setSaveMessage(''); setSaveError('');
   };
 
+  const runRetrieval = async () => {
+    setPhase('results'); setRetrievalState('loading'); setRetrievalError('');
+    try {
+      const result = await retrieveSemanticNotes(query, { candidateLimit: 60 });
+      const byId = new Map(notes.map((note) => [note.id, note]));
+      setResults(result.candidates.map((candidate) => byId.get(candidate.note_id)).filter((note): note is Note => !!note).slice(0, 6));
+      setRetrievalState('ready');
+    } catch (error) {
+      setResults([]); setRetrievalState('error');
+      setRetrievalError(safeErrorMessage(error, 'Semantic retrieval is temporarily unavailable.'));
+    }
+  };
+
   const answerClarification = (yes: boolean) => {
-    if (yes || clarificationRound > 0) setPhase('results');
+    if (yes || clarificationRound > 0) void runRetrieval();
     else setClarificationRound(1);
   };
 
@@ -1149,11 +1099,11 @@ function InstantRetrievalOverlay({ notes, projects, initialQuery = '', saving, o
         </div>
         <div className={`grid min-h-0 flex-1 overflow-y-auto rounded-xl border border-[#cfcfcf] bg-white shadow-[0_2px_9px_rgba(0,0,0,0.16)] lg:overflow-hidden ${phase === 'results' ? 'lg:grid-cols-[minmax(0,1.05fr)_minmax(360px,.95fr)_360px]' : 'lg:grid-cols-2'}`}>
           <section className="relative min-h-[430px] overflow-hidden bg-[#f7f7f9] px-8 py-16 shadow-[4px_0_12px_rgba(0,0,0,0.14)] sm:px-14 lg:min-h-0">
-            <textarea autoFocus value={query} onChange={(event) => { setQuery(event.target.value); if (phase === 'results') setPhase('clarify'); }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); beginClarification(); } }} placeholder="Ask for a specific note or explore a broad idea…" aria-label="Instant retrieval request" className="h-full min-h-[300px] w-full resize-none bg-transparent text-lg leading-relaxed outline-none placeholder:text-[#aaa]" />
+            <textarea autoFocus value={query} onChange={(event) => { setQuery(event.target.value); if (phase === 'results') { setPhase('clarify'); setResults([]); setRetrievalState('idle'); } }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); beginClarification(); } }} placeholder="Ask for a specific note or explore a broad idea…" aria-label="Instant retrieval request" className="h-full min-h-[300px] w-full resize-none bg-transparent text-lg leading-relaxed outline-none placeholder:text-[#aaa]" />
             <span className="absolute bottom-5 left-1/2 -translate-x-1/2 text-xs text-[#aaa]">Press Enter to continue · Shift+Enter for a new line</span>
           </section>
           <section className="relative min-h-[430px] overflow-y-auto bg-white px-8 py-16 sm:px-14 lg:min-h-0">
-            {!query.trim() ? <p className="text-base text-[#aaa]">Start typing what you want to find.</p> : phase === 'clarify' ? <div><p className="text-lg leading-relaxed">{clarification}</p><div className="mt-8 flex gap-6"><button type="button" onClick={() => answerClarification(true)} aria-label="Yes" className="flex h-10 w-10 items-center justify-center rounded-full bg-[#477bea] text-white hover:bg-[#3d6ed7]"><Check className="h-5 w-5" /></button><button type="button" onClick={() => answerClarification(false)} aria-label="No" className="flex h-10 w-10 items-center justify-center rounded-full border-2 border-[#222] hover:bg-[#f5f5f5]"><X className="h-5 w-5" /></button></div></div> : <div><Check className="h-10 w-10 rounded-full bg-[#477bea] p-2 text-white" /><p className="mt-10 text-lg">I have found {results.length} {results.length === 1 ? 'note' : 'notes'} that are close to your request.</p>{results[0] && <div className="mt-12 border-t border-[#eee] pt-7"><strong className="text-base">Closest match: <HighlightedText text={splitNote(results[0]).title} query={query} /></strong><p className="mt-4 line-clamp-8 whitespace-pre-wrap text-sm leading-relaxed text-[#555]"><HighlightedText text={splitNote(results[0]).body || notePreview(results[0])} query={query} /></p></div>}</div>}
+            {!query.trim() ? <p className="text-base text-[#aaa]">Start typing what you want to find.</p> : phase === 'clarify' ? <div><p className="text-lg leading-relaxed">{clarification}</p><div className="mt-8 flex gap-6"><button type="button" onClick={() => answerClarification(true)} aria-label="Yes" className="flex h-10 w-10 items-center justify-center rounded-full bg-[#477bea] text-white hover:bg-[#3d6ed7]"><Check className="h-5 w-5" /></button><button type="button" onClick={() => answerClarification(false)} aria-label="No" className="flex h-10 w-10 items-center justify-center rounded-full border-2 border-[#222] hover:bg-[#f5f5f5]"><X className="h-5 w-5" /></button></div></div> : retrievalState === 'loading' ? <div className="flex h-full items-center justify-center"><Loader2 className="h-7 w-7 animate-spin text-[#477bea]" /></div> : retrievalState === 'error' ? <div><h2 className="text-lg font-semibold">Retrieval unavailable</h2><p role="alert" className="mt-4 text-sm leading-relaxed text-red-600">{retrievalError}</p><button type="button" onClick={() => void runRetrieval()} className="mt-6 rounded-md bg-[#477bea] px-4 py-2 text-sm text-white">Try again</button></div> : <div><Check className="h-10 w-10 rounded-full bg-[#477bea] p-2 text-white" /><p className="mt-10 text-lg">I have found {results.length} {results.length === 1 ? 'note' : 'notes'} that are close to your request.</p>{results[0] && <div className="mt-12 border-t border-[#eee] pt-7"><strong className="text-base">Closest match: <HighlightedText text={splitNote(results[0]).title} query={query} /></strong><p className="mt-4 line-clamp-8 whitespace-pre-wrap text-sm leading-relaxed text-[#555]"><HighlightedText text={splitNote(results[0]).body || notePreview(results[0])} query={query} /></p></div>}</div>}
           </section>
           {phase === 'results' && <aside className="min-h-[430px] overflow-y-auto border-l border-[#d6d6d6] bg-white p-5 lg:min-h-0"><div className="mb-4 flex items-center justify-between"><h2 className="text-sm text-[#999]">Retrieved notes</h2><span className="rounded border border-[#bbb] px-3 py-1 text-xs text-[#477bea]">See notes</span></div><div className="space-y-5">{results.map((item) => { const content = splitNote(item); return <button key={item.id} type="button" onMouseEnter={() => setSelectedId(item.id)} onFocus={() => setSelectedId(item.id)} onClick={() => onOpenNote(item)} className={`block min-h-[200px] w-full rounded-lg border bg-white p-5 text-left shadow-[0_2px_8px_rgba(0,0,0,0.13)] transition hover:-translate-y-0.5 ${selectedId === item.id ? 'border-[#6f9cff] ring-1 ring-[#6f9cff]/40' : 'border-[#e2e2e2]'}`}><span className="float-right text-xs text-[#477bea]">note</span><strong className="block max-w-[82%] text-base"><HighlightedText text={content.title} query={query} /></strong><p className="mt-4 line-clamp-6 whitespace-pre-wrap text-sm leading-relaxed text-[#777]"><HighlightedText text={content.body || notePreview(item)} query={query} /></p><div className="mt-7 flex justify-between text-xs text-[#aaa]"><span>{cleanCategory(item.category) || 'Instant retrieval'}</span><span>{formatDate(item.created_at)}</span></div></button>; })}{!results.length && <p className="text-sm text-[#999]">No close notes yet. Try a broader request.</p>}</div></aside>}
         </div>

@@ -485,6 +485,30 @@ export async function runSemanticRetrievalExperiment<T = Record<string, unknown>
   return invokeAuthenticatedFunction<T>('semantic-retrieval-experiment', request);
 }
 
+export interface SemanticRetrievalCandidate {
+  note_id: string;
+  similarity: number;
+  raw_rank: number;
+  diversified_rank: number;
+  mmr_score: number;
+  note_length: number;
+  token_count: number;
+  raw_text: string;
+}
+
+export async function retrieveSemanticNotes(
+  pageText: string,
+  options: { candidateLimit?: number; similarityFloor?: number; duplicateThreshold?: number; diversityLambda?: number } = {}
+): Promise<{ candidates: SemanticRetrievalCandidate[]; near_duplicates: SemanticRetrievalCandidate[] }> {
+  return invokeAuthenticatedFunction('semantic-retrieval', {
+    page_text: pageText,
+    candidate_limit: options.candidateLimit ?? 60,
+    similarity_floor: options.similarityFloor ?? 0,
+    duplicate_threshold: options.duplicateThreshold ?? 0.95,
+    diversity_lambda: options.diversityLambda ?? 0.72,
+  });
+}
+
 export async function getNoteRelations(
   noteId: string
 ): Promise<Array<{ id: string; related_note_id: string; reason: string | null; confidence?: number; weight?: number; related_note: { id: string; summary: string | null; raw_text: string } }>> {
