@@ -1,6 +1,6 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
-import { corsHeaders, generateWithGemini, isRetryableGeminiError } from "../_shared/gemini.ts";
+import { corsHeaders, generateWithGemini, generateWithGeminiResult, isRetryableGeminiError } from "../_shared/gemini.ts";
 import {
   condenseDraft,
   mergeAgentResults,
@@ -15,6 +15,14 @@ import {
 
 const MAX_NOTES = 1000;
 const MAX_RESULTS = 50;
+/**
+ * A ceiling, not a target: only generated tokens are billed, and the summary
+ * itself needs ~150. The headroom is for a thinking model's reasoning, which
+ * shares this budget - at 320 the reasoning consumed it and the summary arrived
+ * cut off after one line. Kept finite only so a runaway generation cannot bill
+ * indefinitely.
+ */
+const SUMMARY_TOKEN_BUDGET = 3000;
 
 const AGENT_SYSTEM_PROMPT =
   "You identify meaningful relationships between a person's notes. You respond with a JSON array and nothing else.";
@@ -26,14 +34,24 @@ async function summarizeMatches(results: RelevanceResult[], apiKey: string): Pro
   if (!gists.length) return "";
   const fallback = gists.join(" ");
   try {
-    const summary = await generateWithGemini(
+    const { text, truncated } = await generateWithGeminiResult(
       "These are the person's own notes. Talk to them about what the notes add up to, the way a thoughtful friend would, in 2-4 plain sentences. Speak directly to them in the second person: \"you wrote\", \"you keep coming back to\", \"you seem torn between\". Never call them \"the author\", \"the writer\", or \"the user\", and never describe the notes from the outside (\"these notes discuss\"). Anyone else mentioned keeps their name. Cover the distinct ideas across all of them, including any tension between them. Use only the supplied facts. Do not mention the search, relevance scores, or the act of summarizing. Return only the summary text.",
       [{ role: "user", content: gists.map((gist, index) => `Note ${index + 1}: ${gist}`).join("\n") }],
       apiKey,
       undefined,
-      { temperature: 0.2, maxOutputTokens: 320 },
+      // The budget covers the model's reasoning as well as the sentences the
+      // reader sees. A thinking model spent most of 320 on reasoning and left
+      // the summary cut off after one line, so keep the ceiling well clear of
+      // the handful of sentences actually asked for.
+      { temperature: 0.2, maxOutputTokens: SUMMARY_TOKEN_BUDGET },
     );
-    return summary.trim().slice(0, 1600) || fallback;
+    const summary = text.trim();
+    // Half a sentence reads as a bug. The gists are whole, so prefer them.
+    if (!summary || truncated) {
+      if (truncated) console.error("find-relevant-notes summary hit the token budget; using gists");
+      return fallback;
+    }
+    return summary.slice(0, 1600);
   } catch (error) {
     console.error("find-relevant-notes summary failed:", error instanceof Error ? error.message : error);
     return fallback;

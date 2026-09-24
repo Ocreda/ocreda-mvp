@@ -38,6 +38,17 @@ export function isRetryableGeminiError(error: unknown): boolean {
   return error.status === 429 || error.status >= 500;
 }
 
+export interface GeminiGeneration {
+  text: string;
+  /**
+   * The model hit its token budget mid-answer. On OpenRouter that budget covers
+   * a thinking model's reasoning as well as the words the user sees, so a reply
+   * can arrive cut off rather than empty. Callers that would otherwise show a
+   * half sentence check this and fall back.
+   */
+  truncated: boolean;
+}
+
 export async function generateWithGemini(
   systemPrompt: string,
   messages: GeminiMessage[],
@@ -45,6 +56,16 @@ export async function generateWithGemini(
   model: string = DEFAULT_MODEL,
   generationConfig?: GeminiGenerationConfig
 ): Promise<string> {
+  return (await generateWithGeminiResult(systemPrompt, messages, apiKey, model, generationConfig)).text;
+}
+
+export async function generateWithGeminiResult(
+  systemPrompt: string,
+  messages: GeminiMessage[],
+  apiKey: string,
+  model: string = DEFAULT_MODEL,
+  generationConfig?: GeminiGenerationConfig
+): Promise<GeminiGeneration> {
   const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -71,7 +92,11 @@ export async function generateWithGemini(
   }
 
   const data = await res.json();
-  return data.choices?.[0]?.message?.content ?? "";
+  const choice = data.choices?.[0];
+  return {
+    text: choice?.message?.content ?? "",
+    truncated: choice?.finish_reason === "length",
+  };
 }
 
 /** Pulls a JSON object out of a Gemini response, tolerating a ```json fence around it. */
