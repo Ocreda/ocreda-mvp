@@ -1837,21 +1837,21 @@ function NoteEditor({ state, muses, notes, saving, error, onChange, onCreateMuse
     <div className={`fixed inset-0 z-50 flex items-center justify-center ${domainCapture ? 'bg-[#e5e5e5] p-3 sm:p-6' : 'bg-black/25 p-4 backdrop-blur-[5px]'}`} role="dialog" aria-modal="true" aria-label={state.note ? 'Edit note' : 'Create note'} onMouseDown={(event) => { if (!domainCapture && event.target === event.currentTarget && !saving) onClose(); }}>
       {!domainCapture && <button type="button" onClick={onClose} aria-label="Close note editor" className="absolute right-5 top-5 z-10 text-white drop-shadow sm:right-8 sm:top-7"><X className="h-7 w-7" /></button>}
       <div className={`flex min-h-[530px] flex-col bg-white ${domainCapture ? 'h-full w-full overflow-hidden shadow-[0_8px_24px_rgba(0,0,0,0.12)]' : 'h-[min(78vh,780px)] w-[min(88vw,1340px)] overflow-visible rounded-[20px] border-[9px] border-[#f5f5f7] shadow-2xl'}`}>
-        {domainCapture && <header className="relative z-30 flex h-16 shrink-0 items-center border-b border-[#eeeeef] bg-white px-4 text-[#aaa] sm:px-6">
-          <div className="flex items-center gap-2">
+        {domainCapture && <header className="relative z-30 grid shrink-0 grid-cols-[1fr_auto] grid-rows-[64px_44px] items-center border-b border-[#eeeeef] bg-white px-2 text-[#aaa] sm:flex sm:h-16 sm:px-6">
+          <div className="flex min-w-0 items-center gap-1 sm:gap-2">
             <button type="button" onClick={onClose} aria-label="Close note editor" title="Close note editor" className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-[#f5f5f6] hover:text-[#555]"><ArrowLeft className="h-5 w-5" /></button>
             <span aria-hidden="true" className="flex h-8 w-8 items-center justify-center rounded-md bg-[#477bea] text-white"><Plus className="h-4 w-4" /></span>
             <button type="button" onClick={onImport} aria-label="Import notes" title="Import notes" className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-[#f5f5f6] hover:text-[#555]"><Upload className="h-5 w-5" /></button>
             <button type="button" onClick={onFindRelevantNotes} disabled={draftTooShort || saving} aria-label="Find relevant notes" title={draftTooShort ? `Write at least ${MIN_RELEVANCE_DRAFT_CHARS} characters to search your notes` : 'Find relevant notes'} className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-[#f5f5f6] hover:text-[#477bea] disabled:opacity-35">{saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-5 w-5" />}</button>
           </div>
-          <div ref={museMenuRef} className="absolute left-1/2 z-40 -translate-x-1/2">
-            <button type="button" onClick={() => setMuseOpen((value) => !value)} aria-expanded={museOpen} className="flex items-center rounded px-2 py-1 text-xs text-[#555] hover:bg-[#f5f5f6]"><span>Domain:&nbsp;</span><span className="border-b border-[#999]">{museLabel}</span><ChevronDown className="ml-1 h-3.5 w-3.5" /></button>
+          <div ref={museMenuRef} className="relative col-span-2 row-start-2 z-40 max-w-full justify-self-center sm:absolute sm:left-1/2 sm:-translate-x-1/2">
+            <button type="button" onClick={() => setMuseOpen((value) => !value)} aria-expanded={museOpen} className="flex max-w-[calc(100vw-3rem)] items-center rounded px-2 py-1 text-xs text-[#555] hover:bg-[#f5f5f6] sm:max-w-[40vw]"><span className="shrink-0">Domain:&nbsp;</span><span className="truncate border-b border-[#999]">{museLabel}</span><ChevronDown className="ml-1 h-3.5 w-3.5 shrink-0" /></button>
             {museOpen && <div className="absolute left-1/2 top-8 z-50 w-[285px] -translate-x-1/2 overflow-hidden rounded-lg border border-[#ddd] bg-white py-2 text-left text-[#555] shadow-xl">
               <button type="button" onClick={() => { onChange({ ...state, muse: AUTOMATIC_MUSE }); setMuseOpen(false); }} className="flex w-full items-center justify-between px-5 py-3 text-left text-sm hover:bg-[#f6f6f6] focus:bg-[#f6f6f6] focus:outline-none">Automatically organize {state.muse === AUTOMATIC_MUSE && <Check className="h-4 w-4 text-[#477bea]" />}</button>
               {muses.map((muse) => <button key={muse.title} type="button" onClick={() => { onChange({ ...state, muse: muse.title }); setMuseOpen(false); }} className="flex w-full items-center justify-between px-5 py-3 text-left text-sm hover:bg-[#f6f6f6] focus:bg-[#f6f6f6] focus:outline-none">{muse.title} {state.muse === muse.title && <Check className="h-4 w-4 text-[#477bea]" />}</button>)}
             </div>}
           </div>
-          <div className="ml-auto flex items-center gap-1 text-xs">
+          <div className="flex items-center gap-1 justify-self-end text-xs sm:ml-auto">
             <ChevronLeft className="h-4 w-4 opacity-40" /><span className="min-w-[54px] text-center">{formatDate(new Date().toISOString())}</span><ChevronRight className="h-4 w-4 opacity-40" />
             <MoreHorizontal className="ml-3 h-5 w-5 text-[#555]" />
           </div>
@@ -1863,17 +1863,20 @@ function NoteEditor({ state, muses, notes, saving, error, onChange, onCreateMuse
           </div>
           {panelOpen && <RelevantNotesPanel notes={notes} relevance={relevance} loading={relevanceLoading} progress={relevanceProgress} error={relevanceError} stale={draftChangedSinceSearch} page={relevancePage} onPageChange={setRelevancePage} onRetry={() => void runRelevanceSearch()} onClose={() => setPanelOpen(false)} />}
         </div>
-        <div className={`relative flex flex-wrap items-center gap-1 border-t border-[#eee] bg-[#f8f8fa] px-3 py-2 text-sm text-[#555] sm:px-5 ${domainCapture ? 'min-h-[62px] xl:flex-nowrap xl:overflow-visible' : 'min-h-[58px]'}`}>
-          <button type="button" onClick={toggleDictation} aria-label={dictating ? 'Stop dictation' : 'Start dictation'} className={`mr-3 rounded p-2 hover:bg-white ${dictating ? 'text-red-600' : ''}`}><Mic className="h-4 w-4" /></button><span className="mr-3 h-7 w-px bg-[#ddd]" />
-          <button type="button" onClick={() => applyFormat('bold')} aria-label="Bold" className="rounded p-2 font-bold hover:bg-white"><Bold className="h-4 w-4" /></button>
-          <button type="button" onClick={() => applyFormat('italic')} aria-label="Italic" className="rounded p-2 italic hover:bg-white"><Italic className="h-4 w-4" /></button><span className="mx-2 h-7 w-px bg-[#ddd]" />
-          <button type="button" onClick={() => applyFormat('h1')} className="rounded px-2 py-1.5 font-semibold hover:bg-white">H1</button><button type="button" onClick={() => applyFormat('h2')} className="rounded px-2 py-1.5 font-semibold hover:bg-white">H2</button><button type="button" onClick={() => applyFormat('h3')} className="rounded px-2 py-1.5 font-semibold hover:bg-white">H3</button><button type="button" onClick={() => applyFormat('body')} className="rounded px-2 py-1.5 hover:bg-white">Body</button><span className="mx-2 hidden h-7 w-px bg-[#ddd] lg:block" />
-          <button type="button" onClick={() => applyFormat('bullet')} className="hidden items-center gap-1 rounded px-2 py-1.5 hover:bg-white sm:flex"><List className="h-4 w-4" /> Bullet list</button><button type="button" onClick={() => applyFormat('number')} className="hidden items-center gap-1 rounded px-2 py-1.5 hover:bg-white md:flex"><ListOrdered className="h-4 w-4" /> Numbered list</button>
-          <span className="mx-2 h-7 w-px bg-[#ddd]" />
-          <button type="button" onClick={onFindRelevantNotes} disabled={draftTooShort || saving} title={draftTooShort ? `Write at least ${MIN_RELEVANCE_DRAFT_CHARS} characters to search your notes` : 'Find relevant notes'} className="flex items-center gap-1.5 rounded px-2 py-1.5 font-medium text-[#477bea] hover:bg-white disabled:opacity-40">
-            {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScanSearch className="h-4 w-4" />}
-            <span className="hidden lg:inline">Find relevant notes</span>
-          </button>
+        <div className={`relative border-t border-[#eee] bg-[#f8f8fa] px-3 py-2 text-sm text-[#555] sm:px-5 ${domainCapture ? 'flex min-h-[62px] flex-col items-stretch gap-2 lg:flex-row lg:items-center lg:gap-1' : 'flex min-h-[58px] flex-wrap items-center gap-1'}`}>
+          <div className={`${domainCapture ? 'flex w-full min-w-0 items-center gap-1 overflow-x-auto pb-1 lg:flex-1 lg:overflow-visible lg:pb-0' : 'contents'}`}>
+            <button type="button" onClick={toggleDictation} aria-label={dictating ? 'Stop dictation' : 'Start dictation'} className={`mr-3 rounded p-2 hover:bg-white ${dictating ? 'text-red-600' : ''}`}><Mic className="h-4 w-4" /></button><span className="mr-3 h-7 w-px bg-[#ddd]" />
+            <button type="button" onClick={() => applyFormat('bold')} aria-label="Bold" className="rounded p-2 font-bold hover:bg-white"><Bold className="h-4 w-4" /></button>
+            <button type="button" onClick={() => applyFormat('italic')} aria-label="Italic" className="rounded p-2 italic hover:bg-white"><Italic className="h-4 w-4" /></button><span className="mx-2 h-7 w-px bg-[#ddd]" />
+            <button type="button" onClick={() => applyFormat('h1')} className="rounded px-2 py-1.5 font-semibold hover:bg-white">H1</button><button type="button" onClick={() => applyFormat('h2')} className="rounded px-2 py-1.5 font-semibold hover:bg-white">H2</button><button type="button" onClick={() => applyFormat('h3')} className="rounded px-2 py-1.5 font-semibold hover:bg-white">H3</button><button type="button" onClick={() => applyFormat('body')} className="rounded px-2 py-1.5 hover:bg-white">Body</button><span className="mx-2 hidden h-7 w-px bg-[#ddd] lg:block" />
+            <button type="button" onClick={() => applyFormat('bullet')} className="hidden items-center gap-1 rounded px-2 py-1.5 hover:bg-white sm:flex"><List className="h-4 w-4" /> Bullet list</button><button type="button" onClick={() => applyFormat('number')} className="hidden items-center gap-1 rounded px-2 py-1.5 hover:bg-white md:flex"><ListOrdered className="h-4 w-4" /> Numbered list</button>
+            <span className="mx-2 h-7 w-px bg-[#ddd]" />
+          </div>
+          <div className={`${domainCapture ? 'flex w-full items-center gap-2 lg:w-auto lg:gap-1' : 'contents'}`}>
+            <button type="button" onClick={onFindRelevantNotes} disabled={draftTooShort || saving} title={draftTooShort ? `Write at least ${MIN_RELEVANCE_DRAFT_CHARS} characters to search your notes` : 'Find relevant notes'} className="flex items-center gap-1.5 rounded px-2 py-1.5 font-medium text-[#477bea] hover:bg-white disabled:opacity-40">
+              {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScanSearch className="h-4 w-4" />}
+              <span className="hidden lg:inline">Find relevant notes</span>
+            </button>
           {!domainCapture && <div className="relative ml-auto shrink-0">
             <button type="button" onClick={() => setMuseOpen((value) => !value)} className="flex items-center text-sm"><span className="text-[#477bea]">Domain:</span>&nbsp;<span className="border-b border-[#999]">{museLabel}</span><ChevronDown className="ml-1 h-3.5 w-3.5" /></button>
             {museOpen && <div className="absolute bottom-9 right-0 z-[60] w-[285px] overflow-hidden rounded-lg border border-[#ddd] bg-white py-2 shadow-xl">
@@ -1887,7 +1890,8 @@ function NoteEditor({ state, muses, notes, saving, error, onChange, onCreateMuse
             </div>}
           </div>}
           {onDelete && <button type="button" onClick={onDelete} disabled={saving} aria-label="Delete note" className="ml-3 rounded p-2 text-red-600 hover:bg-red-50"><Trash2 className="h-4 w-4" /></button>}
-          <button type="button" onClick={onSave} disabled={saving || (!state.title.trim() && !state.body.trim())} className={`ml-3 flex shrink-0 items-center justify-center rounded-md bg-[#477bea] text-white hover:bg-[#3d6ed7] disabled:opacity-45 ${domainCapture ? 'h-10 w-36 sm:w-44' : 'h-8 w-32 sm:w-40'}`}>{saving ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Save'}</button>
+          <button type="button" onClick={onSave} disabled={saving || (!state.title.trim() && !state.body.trim())} className={`ml-3 flex shrink-0 items-center justify-center rounded-md bg-[#477bea] text-white hover:bg-[#3d6ed7] disabled:opacity-45 ${domainCapture ? 'h-10 flex-1 lg:w-44 lg:flex-none' : 'h-8 w-32 sm:w-40'}`}>{saving ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Save'}</button>
+          </div>
           {error && <p role="alert" className="absolute bottom-full right-0 mb-2 max-w-[420px] rounded-md bg-red-600 px-3 py-2 text-xs text-white">{error}</p>}
         </div>
       </div>
