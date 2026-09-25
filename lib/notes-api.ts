@@ -12,6 +12,7 @@ import {
 } from '@/dev/local-mode';  // DEV-LOCAL-MODE
 import {
   Note,
+  NoteImportInput,
   Question,
   ConversationMessage,
   RelevanceProgress,
@@ -176,16 +177,17 @@ export async function createNote(rawText: string, category: string | null = null
 const NOTE_IMPORT_BATCH_SIZE = 50;
 
 /**
- * Import plain-text notes without summarizing, rewriting, or otherwise
- * transforming their contents. Inserts are batched to keep large exports
- * within practical PostgREST request sizes.
+ * Import prepared plain-text notes without summarizing or rewriting them.
+ * Callers may add display metadata such as a generated title before this
+ * storage step. Inserts are batched to keep large exports within practical
+ * PostgREST request sizes.
  */
 export async function importNotes(
-  rawTexts: string[],
+  inputs: NoteImportInput[],
   onProgress?: (completed: number, total: number) => void
 ): Promise<Note[]> {
-  if (rawTexts.length === 0) return [];
-  if (IS_LOCAL_MODE) return localImportNotes(rawTexts, onProgress);  // DEV-LOCAL-MODE
+  if (inputs.length === 0) return [];
+  if (IS_LOCAL_MODE) return localImportNotes(inputs, onProgress);  // DEV-LOCAL-MODE
 
   const { data: authData, error: authError } = await supabase.auth.getUser();
   if (authError || !authData.user) {
@@ -194,26 +196,50 @@ export async function importNotes(
 
   const imported: Note[] = [];
   const importedIds: string[] = [];
-  onProgress?.(0, rawTexts.length);
+  onProgress?.(0, inputs.length);
 
   try {
-    for (let start = 0; start < rawTexts.length; start += NOTE_IMPORT_BATCH_SIZE) {
-      const batch = rawTexts.slice(start, start + NOTE_IMPORT_BATCH_SIZE);
-      const { data, error } = await supabase
+    for (let start = 0; start < inputs.length; start += NOTE_IMPORT_BATCH_SIZE) {
+      const batch = inputs.slice(start, start + NOTE_IMPORT_BATCH_SIZE);
+      const includeCategories = categoryColumnsAvailable !== false;
+      let categoriesSaved = includeCategories;
+      let result = await supabase
         .from('notes')
-        .insert(batch.map((rawText) => ({ user_id: authData.user.id, raw_text: rawText })))
-        .select(categoryColumnsAvailable === true ? CATEGORY_NOTE_FIELDS : LEGACY_NOTE_FIELDS);
+        .insert(batch.map((input) => ({
+          user_id: authData.user.id,
+          raw_text: input.rawText,
+          ...(includeCategories ? {
+            category: input.category,
+            category_updated_at: new Date().toISOString(),
+          } : {}),
+        })))
+        .select(includeCategories ? CATEGORY_NOTE_FIELDS : LEGACY_NOTE_FIELDS);
 
-      if (error) throw error;
+      if (result.error && includeCategories && isMissingCategoryColumn(result.error)) {
+        categoryColumnsAvailable = false;
+        categoriesSaved = false;
+        result = await supabase
+          .from('notes')
+          .insert(batch.map((input) => ({ user_id: authData.user.id, raw_text: input.rawText })))
+          .select(LEGACY_NOTE_FIELDS);
+      }
 
-      const savedBatch = normalizeNotes(data as unknown as Array<Record<string, unknown>> | null);
+      if (result.error) throw result.error;
+      if (categoriesSaved) categoryColumnsAvailable = true;
+
+      const savedBatch = normalizeNotes(result.data as unknown as Array<Record<string, unknown>> | null)
+        .map((note, index) => ({
+          ...note,
+          category: batch[index].category,
+          category_updated_at: note.category_updated_at ?? new Date().toISOString(),
+        }));
       if (savedBatch.length !== batch.length) {
         throw new Error('Supabase did not confirm every imported note.');
       }
 
       imported.push(...savedBatch);
       importedIds.push(...savedBatch.map((note) => note.id));
-      onProgress?.(Math.min(start + batch.length, rawTexts.length), rawTexts.length);
+      onProgress?.(Math.min(start + batch.length, inputs.length), inputs.length);
     }
 
     return imported;

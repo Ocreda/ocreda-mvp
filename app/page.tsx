@@ -4,12 +4,13 @@ import Link from 'next/link';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, ArrowUp, Bold, Check, ChevronDown, ChevronLeft, ChevronRight, Filter, FolderPlus, Grid2X2, Italic, Layers3, List, ListOrdered, Loader as Loader2, Mic, MoreHorizontal, PanelRightOpen, Pin, Plus, RefreshCw, Rows3, ScanSearch, Search, Trash2, Upload, X } from 'lucide-react';
 import type { RelevanceProgress } from '@/lib/types';
-import NoteImporter, { ImportNoteDraft } from '@/components/NoteImporter';
+import NoteImporter, { ImportDomainDraft, ImportNoteDraft } from '@/components/NoteImporter';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { useAuth } from '@/lib/auth-context';
 import { createNote, deleteNote, findRelevantNotes, findSimilarNotes, getNotes, importNotes, MIN_RELEVANCE_DRAFT_CHARS, moveNotesToCategory, processNote, updateNote } from '@/lib/notes-api';
 import { supabase } from '@/lib/supabase';
+import { prepareImportedNoteText } from '@/lib/import-note-content';
 import { IS_LOCAL_MODE } from '@/dev/local-mode';  // DEV-LOCAL-MODE
 import { Note, NoteRelationType, RelevanceCoverage, RelevanceResult } from '@/lib/types';
 
@@ -27,24 +28,19 @@ type SpeechRecognitionLike = {
 };
 
 const AUTOMATIC_MUSE = '__automatic__';
+const ORPHANS_MUSE = 'Orphans';
+const ORPHANS_DESCRIPTION = 'Imported notes that did not match another Domain.';
+const ORPHANS_MIGRATION_VERSION = 'v1';
 
 function cleanCategory(value: string | null | undefined): string | null {
   const clean = value?.trim().replace(/\s+/g, ' ') ?? '';
   return clean || null;
 }
 
-/** Longer than this, a first line is prose the writer never meant as a heading. */
-const MAX_TITLE_CHARS = 120;
-
 /**
- * A note is stored as one block of text, so its title is whatever the writer
- * put on the first line. Imported files and notes typed straight into the body
- * have no such line, and treating their opening sentence as a title used to
- * print the same words twice: once as a heading and again as the body.
- *
- * `hasTitle` says whether the first line is really a heading — short, with
- * something after it. When it is not, the whole note is body text and callers
- * show no heading at all.
+ * Existing notes keep the app's original storage convention: line one is the
+ * title and all later lines are the body. Title generation for titleless files
+ * happens only in the import path, before a new note is inserted.
  */
 function splitNote(note: Note): { title: string; body: string; hasTitle: boolean } {
   const text = note.raw_text.trim();
@@ -52,8 +48,7 @@ function splitNote(note: Note): { title: string; body: string; hasTitle: boolean
   const [first, ...rest] = text.split('\n');
   const heading = first.trim();
   const body = rest.join('\n').trim();
-  if (!body || heading.length > MAX_TITLE_CHARS) return { title: '', body: text, hasTitle: false };
-  return { title: heading, body, hasTitle: true };
+  return { title: heading, body, hasTitle: Boolean(heading) };
 }
 
 /** A one-line label for a note in lists and menus, where something must show. */
@@ -216,6 +211,7 @@ export default function OcredaHome() {
   const [importError, setImportError] = useState('');
   const [importProgress, setImportProgress] = useState<{ completed: number; total: number } | null>(null);
   const [importOpen, setImportOpen] = useState(false);
+  const orphanMigrationStartedRef = useRef(false);
 
   const load = useCallback(async () => {
     try {
@@ -301,6 +297,36 @@ export default function OcredaHome() {
     localStorage.setItem(`ocreda-note-muses:${user.id}`, JSON.stringify(assignments));
     setNotes((current) => current.map((note) => noteIds.includes(note.id) ? { ...note, category, category_updated_at: new Date().toISOString() } : note));
   }, [user]);
+
+  useEffect(() => {
+    if (!user || loading || orphanMigrationStartedRef.current) return;
+    const migrationKey = `ocreda-orphans-migration:${ORPHANS_MIGRATION_VERSION}:${user.id}`;
+    if (localStorage.getItem(migrationKey) === 'complete') return;
+
+    orphanMigrationStartedRef.current = true;
+    const uncategorizedIds = notes.filter((note) => !cleanCategory(note.category)).map((note) => note.id);
+    const existingOrphans = museMeta.find((muse) => muse.title.toLowerCase() === ORPHANS_MUSE.toLowerCase());
+    if (!existingOrphans) {
+      persistMuseMeta([
+        ...museMeta,
+        { title: ORPHANS_MUSE, description: ORPHANS_DESCRIPTION, createdAt: new Date().toISOString() },
+      ]);
+    }
+
+    const migrate = async () => {
+      try {
+        if (uncategorizedIds.length) {
+          await moveNotesToCategory(uncategorizedIds, ORPHANS_MUSE);
+          persistMuseAssignments(uncategorizedIds, ORPHANS_MUSE);
+        }
+        localStorage.setItem(migrationKey, 'complete');
+      } catch (err) {
+        orphanMigrationStartedRef.current = false;
+        setError(safeErrorMessage(err, 'Unable to move existing uncategorized notes to Orphans.'));
+      }
+    };
+    void migrate();
+  }, [loading, museMeta, notes, persistMuseAssignments, persistMuseMeta, user]);
 
   const muses = useMemo(() => {
     const map = new Map<string, MuseMeta>();
@@ -540,11 +566,55 @@ export default function OcredaHome() {
     setActivePageId(null);
   };
 
-  const handleImport = async (drafts: ImportNoteDraft[]) => {
+  const handleImport = async (drafts: ImportNoteDraft[], requestedDomains: ImportDomainDraft[]) => {
     setImportError('');
     try {
-      const imported = await importNotes(drafts.map((draft) => draft.rawText), (completed, total) => setImportProgress({ completed, total }));
-      setNotes((current) => [...imported, ...current]); imported.forEach((note) => processNote(note.id).catch(() => {}));
+      const now = new Date().toISOString();
+      const importDomainMap = new Map(muses.map((muse) => [muse.title.toLowerCase(), muse]));
+      requestedDomains.forEach((domain) => {
+        const title = cleanCategory(domain.title);
+        if (!title) return;
+        const key = title.toLowerCase();
+        if (!importDomainMap.has(key)) {
+          importDomainMap.set(key, {
+            title: key === ORPHANS_MUSE.toLowerCase() ? ORPHANS_MUSE : title,
+            description: domain.description.trim(),
+            createdAt: now,
+          });
+        }
+      });
+      if (!importDomainMap.has(ORPHANS_MUSE.toLowerCase())) {
+        importDomainMap.set(ORPHANS_MUSE.toLowerCase(), {
+          title: ORPHANS_MUSE,
+          description: ORPHANS_DESCRIPTION,
+          createdAt: now,
+        });
+      }
+
+      const importDomains = Array.from(importDomainMap.values());
+      const matchingDomains = importDomains.filter((domain) => domain.title.toLowerCase() !== ORPHANS_MUSE.toLowerCase());
+      const orphanTitle = importDomainMap.get(ORPHANS_MUSE.toLowerCase())?.title ?? ORPHANS_MUSE;
+      const inputs = drafts.map((draft) => {
+        const rawText = prepareImportedNoteText(draft.rawText);
+        return { rawText, category: inferMuse(rawText, matchingDomains) ?? orphanTitle };
+      });
+      const imported = await importNotes(
+        inputs,
+        (completed, total) => setImportProgress({ completed, total })
+      );
+
+      const nextMeta = new Map(museMeta.map((muse) => [muse.title.toLowerCase(), muse]));
+      importDomains.forEach((domain) => {
+        if (!nextMeta.has(domain.title.toLowerCase())) nextMeta.set(domain.title.toLowerCase(), domain);
+      });
+      persistMuseMeta(Array.from(nextMeta.values()));
+
+      const categorized = imported.map((note, index) => ({ ...note, category: inputs[index].category }));
+      setNotes((current) => [...categorized, ...current]);
+      const idsByDomain = new Map<string, string[]>();
+      categorized.forEach((note) => idsByDomain.set(note.category!, [...(idsByDomain.get(note.category!) ?? []), note.id]));
+      idsByDomain.forEach((noteIds, category) => persistMuseAssignments(noteIds, category));
+      categorized.forEach((note) => processNote(note.id).catch(() => {}));
       setImportProgress(null); setImportOpen(false); flashSaved();
     } catch (err) { setImportProgress(null); setImportError(safeErrorMessage(err, 'Your notes could not be imported.')); throw err; }
   };
@@ -560,7 +630,7 @@ export default function OcredaHome() {
         {activeNoteId && notes.find((note) => note.id === activeNoteId) ? <NoteReadingWorkspace key={activeNoteId} note={notes.find((note) => note.id === activeNoteId)!} allNotes={notes} muses={muses} projects={projects} saving={saving} userId={user?.id ?? 'local'} initialRetrievalMode={activeNoteRetrievalMode} onBack={() => setActiveNoteId(null)} onAddNote={() => openNewNote(cleanCategory(notes.find((note) => note.id === activeNoteId)?.category) ?? AUTOMATIC_MUSE)} onOpenNote={(note) => openExistingNote(note)} onOpenPage={(project, page) => { setActiveNoteId(null); setActiveProjectId(project.id); setActivePageId(page.id); }} onUpdate={updateReadingNote} onChangeDomain={(category) => void changeReadingNoteDomain(activeNoteId, category)} onDelete={removeReadingNote} onSaveRetrieval={saveInstantRetrieval} />
           : activeProject && activePage ? <ProjectPageWorkspace key={activePage.id} project={activeProject} page={activePage} notes={notes} muses={muses} projects={projects} saving={saving} onBack={() => setActivePageId(null)} onChange={(page) => updateProjectPage(activeProject.id, page)} onAddNote={() => openNewNote()} onOpenNote={openExistingNote} onOpenPage={(project, page) => { setActiveProjectId(project.id); setActivePageId(page.id); }} onDelete={() => removeProjectPage(activeProject.id, activePage.id)} onSaveRetrieval={saveInstantRetrieval} />
           : activeProject ? <ProjectPagesGrid project={activeProject} onBack={() => { setActiveProjectId(null); setActivePageId(null); }} onAddPage={() => createProjectPage(activeProject.id)} onOpenPage={(page) => setActivePageId(page.id)} onEdit={() => setProjectEditor({ project: activeProject, title: activeProject.title, description: activeProject.description })} onDelete={() => removeProject(activeProject.id)} />
-          : isEmpty ? <EmptyWorkspace displayName={displayName} userEmail={user?.email ?? ''} onAddNote={() => openNewNote()} onImport={handleImport} onOpenImport={() => setImportOpen(true)} importError={importError} progress={importProgress} />
+          : isEmpty ? <EmptyWorkspace displayName={displayName} userEmail={user?.email ?? ''} existingDomains={muses} onAddNote={() => openNewNote()} onImport={handleImport} onOpenImport={() => setImportOpen(true)} importError={importError} progress={importProgress} />
           : activeMuse || showUnsorted ? <MuseDetail title={showUnsorted ? 'Instant retrieval' : activeMuse ?? ''} notes={showUnsorted ? unsortedNotes : notesByMuse.get(activeMuse ?? '') ?? []} isUnsorted={showUnsorted} busy={saving} onClose={closeLibrary} onAddNote={() => openNewNote(showUnsorted ? AUTOMATIC_MUSE : activeMuse ?? AUTOMATIC_MUSE)} onOpenNote={openExistingNote} onEdit={() => { const meta = muses.find((item) => item.title === activeMuse); if (meta) setMuseEditor({ originalTitle: meta.title, title: meta.title, description: meta.description }); }} onDelete={() => { if (activeMuse) void removeMuse(activeMuse); }} />
           : view === 'muses' ? <MuseGrid muses={muses} projects={projects} notes={notes} notesByMuse={notesByMuse} busy={saving} onClose={closeLibrary} onAddNote={(muse) => openNewNote(muse ?? AUTOMATIC_MUSE)} onAddMuse={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onEditMuse={(muse) => setMuseEditor({ originalTitle: muse.title, title: muse.title, description: muse.description })} onDeleteMuse={(title) => void removeMuse(title)} onOpenNote={openExistingNote} onSaveRetrieval={saveInstantRetrieval} />
           : <CortexHome projects={projects} muses={muses} pinnedMuseTitles={pinnedMuseTitles} notes={notes} notesByMuse={notesByMuse} userEmail={user?.email ?? ''} busy={saving} onOpenMuses={() => setView('muses')} onOpenMuse={openMuse} onTogglePin={togglePinnedMuse} onAddMuse={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onAddNote={() => openNewNote()} onOpenImport={() => setImportOpen(true)} onOpenPage={(project, page) => { setActiveProjectId(project.id); setActivePageId(page.id); }} onOpenNote={openExistingNote} onSaveRetrieval={saveInstantRetrieval} />}
@@ -573,7 +643,7 @@ export default function OcredaHome() {
         <DialogContent className="light w-[calc(100vw-48px)] max-w-[480px] overflow-visible border-[#e6e7eb] bg-white p-0 text-[#141414] shadow-xl [&>button]:!-right-4 [&>button]:!-top-4 [&>button]:flex [&>button]:h-9 [&>button]:w-9 [&>button]:items-center [&>button]:justify-center [&>button]:rounded-full [&>button]:border [&>button]:border-[#e6e7eb] [&>button]:bg-white [&>button]:opacity-100 [&>button]:shadow-md">
           <div className="max-h-[calc(100dvh-48px)] overflow-y-auto p-6">
             <DialogTitle className="sr-only">Import notes</DialogTitle>
-            <NoteImporter onImport={handleImport} importError={importError} centerActions />
+            <NoteImporter onImport={handleImport} importError={importError} existingDomains={muses} centerActions />
             {importProgress && <p className="text-center text-sm text-[#777]" aria-live="polite">Importing {importProgress.completed} of {importProgress.total} notes…</p>}
           </div>
         </DialogContent>
@@ -619,9 +689,10 @@ function BetaAndAvatar({ email, feedback = false, onOpenImport }: { email: strin
   );
 }
 
-function EmptyWorkspace({ displayName, userEmail, onAddNote, onImport, onOpenImport, importError, progress }: {
+function EmptyWorkspace({ displayName, userEmail, existingDomains, onAddNote, onImport, onOpenImport, importError, progress }: {
   displayName: string; userEmail: string; onAddNote: () => void;
-  onImport: (drafts: ImportNoteDraft[]) => Promise<void>; onOpenImport: () => void; importError: string;
+  existingDomains: ImportDomainDraft[];
+  onImport: (drafts: ImportNoteDraft[], domains: ImportDomainDraft[]) => Promise<void>; onOpenImport: () => void; importError: string;
   progress: { completed: number; total: number } | null;
 }) {
   return (
@@ -634,7 +705,7 @@ function EmptyWorkspace({ displayName, userEmail, onAddNote, onImport, onOpenImp
           <p className="mt-2 text-base text-[#777] sm:text-lg">Let your knowledge proactively come to you without asking</p>
         </div>
         <div className="mt-[clamp(32px,5vh,64px)] grid items-start gap-4 md:grid-cols-2">
-          <NoteImporter onImport={onImport} importError={importError} />
+          <NoteImporter onImport={onImport} importError={importError} existingDomains={existingDomains} />
           <div className="flex min-h-[338px] flex-col items-center rounded-[20px] bg-[#f6f6f8] px-8 py-8 text-center">
             <h2 className="text-[17px] font-semibold">Add one note to start.</h2>
             <p className="mt-2 max-w-[330px] text-base leading-relaxed text-[#777]">This way there is a cold start, but you will<br className="hidden sm:block" /> start cleanly.</p>
@@ -1561,8 +1632,6 @@ function AnnotationFlip({ summary, relevance, flipped, onFlip }: {
  */
 function SearchProgress({ notes, progress }: { notes: Note[]; progress: RelevanceProgress | null }) {
   const titles = useMemo(() => notes.map((note) => splitNote(note).title.trim()).filter(Boolean), [notes]);
-  // Notes without a heading contribute no title here on purpose: these values
-  // are matched against what the user types, and a whole paragraph never is.
   const [tick, setTick] = useState(() => Math.floor(Math.random() * 1000));
 
   useEffect(() => {
@@ -1670,10 +1739,6 @@ function RelevantNotesPanel({ notes, relevance, loading, progress, error, stale,
               const badge = result.relation_type ? RELATION_BADGES[result.relation_type] : null;
               const expanded = expandedId === result.note_id;
               const flipped = Boolean(flippedById[result.note_id]);
-              // splitNote treats the first line as a title. For a note written
-              // as one block that "title" is just its opening words, which the
-              // preview underneath already shows — so only head the card when
-              // the note really has a separate heading.
               const hasHeading = content.hasTitle;
               return (
                 // A div rather than a <button>, because the flip link inside

@@ -1,13 +1,22 @@
 'use client';
 
 import { DragEvent, KeyboardEvent, useEffect, useRef, useState } from 'react';
-import { Check, Download, FileText, Loader as Loader2, X } from 'lucide-react';
+import { Check, Download, FileText, Loader as Loader2, Plus, Trash2, X } from 'lucide-react';
 import { extractDocumentText, type DocumentExtractionMethod } from '@/lib/notes-api';
 
 export interface ImportNoteDraft {
   fileName: string;
   rawText: string;
   extractionMethod: 'exact' | DocumentExtractionMethod;
+}
+
+export interface ImportDomainDraft {
+  title: string;
+  description: string;
+}
+
+interface EditableDomainDraft extends ImportDomainDraft {
+  key: string;
 }
 
 interface SelectedNoteFile extends ImportNoteDraft {
@@ -54,12 +63,19 @@ export default function NoteImporter({
   onImport,
   importError,
   centerActions = false,
+  existingDomains = [],
 }: {
-  onImport: (notes: ImportNoteDraft[]) => Promise<void>;
+  onImport: (notes: ImportNoteDraft[], domains: ImportDomainDraft[]) => Promise<void>;
   importError?: string;
   centerActions?: boolean;
+  existingDomains?: ImportDomainDraft[];
 }) {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const domainKeyRef = useRef(1);
+  const [step, setStep] = useState<'domains' | 'files'>('domains');
+  const [domainDrafts, setDomainDrafts] = useState<EditableDomainDraft[]>([
+    { key: 'import-domain-0', title: '', description: '' },
+  ]);
   const [selectedFiles, setSelectedFiles] = useState<SelectedNoteFile[]>([]);
   const [reading, setReading] = useState(false);
   const [readingProgress, setReadingProgress] = useState<{ current: number; total: number } | null>(null);
@@ -67,6 +83,37 @@ export default function NoteImporter({
   const [selectionError, setSelectionError] = useState('');
   const [importing, setImporting] = useState(false);
   const [successMessage, setSuccessMessage] = useState('');
+
+  const addDomainDraft = () => {
+    const key = `import-domain-${domainKeyRef.current}`;
+    domainKeyRef.current += 1;
+    setDomainDrafts((current) => [...current, { key, title: '', description: '' }]);
+  };
+
+  const continueToFiles = () => {
+    setSelectionError('');
+    const requested = domainDrafts
+      .map((domain) => ({ ...domain, title: domain.title.trim(), description: domain.description.trim() }))
+      .filter((domain) => domain.title || domain.description);
+    if (requested.some((domain) => !domain.title)) {
+      setSelectionError('Add a name for every Domain, or remove the empty Domain.');
+      return;
+    }
+    if (requested.some((domain) => !domain.description)) {
+      setSelectionError('Add a description so Ocreda can organize notes into that Domain.');
+      return;
+    }
+    const known = new Set(existingDomains.map((domain) => domain.title.trim().toLowerCase()).filter(Boolean));
+    for (const domain of requested) {
+      const key = domain.title.toLowerCase();
+      if (known.has(key)) {
+        setSelectionError(`A Domain named “${domain.title}” already exists.`);
+        return;
+      }
+      known.add(key);
+    }
+    setStep('files');
+  };
 
   useEffect(() => {
     if (!successMessage) return;
@@ -171,11 +218,16 @@ export default function NoteImporter({
     setSelectionError('');
     setSuccessMessage('');
     try {
-      await onImport(selectedFiles.map(({ fileName, rawText, extractionMethod }) => ({
-        fileName,
-        rawText,
-        extractionMethod,
-      })));
+      await onImport(
+        selectedFiles.map(({ fileName, rawText, extractionMethod }) => ({
+          fileName,
+          rawText,
+          extractionMethod,
+        })),
+        domainDrafts
+          .map(({ title, description }) => ({ title: title.trim(), description: description.trim() }))
+          .filter((domain) => domain.title && domain.description)
+      );
       setSelectedFiles([]);
       setSuccessMessage('Your notes were imported successfully.');
     } catch {
@@ -195,6 +247,69 @@ export default function NoteImporter({
       openFilePicker();
     }
   };
+
+  if (step === 'domains') {
+    return (
+      <div className="w-full max-w-[424px] rounded-[20px] border border-[#e2e4e9] bg-white p-5 text-left sm:min-h-[338px] sm:p-6">
+        <h2 className="text-center text-base font-semibold sm:text-[17px]">Organize your import</h2>
+        <p className="mx-auto mt-2 max-w-[340px] text-center text-sm leading-relaxed text-muted-foreground">
+          Create Domains first and describe what belongs in each one. Ocreda will organize every imported note automatically.
+        </p>
+
+        {existingDomains.length > 0 && (
+          <div className="mt-5 rounded-lg bg-[#f5f7fb] px-3 py-2.5 text-xs leading-relaxed text-[#666]">
+            Existing Domains will also be used: {existingDomains.map((domain) => domain.title).join(', ')}.
+          </div>
+        )}
+
+        <div className="mt-5 max-h-[300px] space-y-3 overflow-y-auto pr-1">
+          {domainDrafts.map((domain, index) => (
+            <div key={domain.key} className="relative rounded-xl border border-[#e2e4e9] bg-[#fafafb] p-3">
+              <input
+                autoFocus={index === 0}
+                maxLength={80}
+                value={domain.title}
+                onChange={(event) => setDomainDrafts((current) => current.map((item) => item.key === domain.key ? { ...item, title: event.target.value } : item))}
+                placeholder="Domain name"
+                aria-label={`Domain ${index + 1} name`}
+                className="w-[calc(100%-32px)] bg-transparent text-sm font-semibold outline-none placeholder:font-normal placeholder:text-[#aaa]"
+              />
+              <textarea
+                maxLength={600}
+                value={domain.description}
+                onChange={(event) => setDomainDrafts((current) => current.map((item) => item.key === domain.key ? { ...item, description: event.target.value } : item))}
+                placeholder="Describe what notes belong here"
+                aria-label={`Domain ${index + 1} description`}
+                rows={2}
+                className="mt-2 w-full resize-none bg-transparent text-xs leading-relaxed text-[#555] outline-none placeholder:text-[#aaa]"
+              />
+              {domainDrafts.length > 1 && (
+                <button
+                  type="button"
+                  onClick={() => setDomainDrafts((current) => current.filter((item) => item.key !== domain.key))}
+                  aria-label={`Remove Domain ${index + 1}`}
+                  className="absolute right-2.5 top-2.5 flex h-7 w-7 items-center justify-center rounded-md text-[#aaa] hover:bg-red-50 hover:text-red-600"
+                >
+                  <Trash2 className="h-4 w-4" />
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+
+        <button type="button" onClick={addDomainDraft} className="mt-3 flex items-center gap-1.5 text-xs font-medium text-primary hover:underline">
+          <Plus className="h-4 w-4" /> Add another Domain
+        </button>
+
+        {selectionError && <p role="alert" className="mt-3 rounded-lg border border-destructive/20 bg-destructive/[0.05] px-3 py-2 text-xs text-destructive">{selectionError}</p>}
+
+        <button type="button" onClick={continueToFiles} className="mx-auto mt-5 flex h-9 min-w-[180px] items-center justify-center rounded-md bg-primary px-5 text-sm font-medium text-primary-foreground hover:bg-primary/90">
+          {existingDomains.length > 0 || domainDrafts.some((domain) => domain.title.trim() || domain.description.trim()) ? 'Continue to notes' : 'Continue with Orphans'}
+        </button>
+        <p className="mt-2 text-center text-[11px] text-muted-foreground">Notes that do not match a Domain will go to Orphans.</p>
+      </div>
+    );
+  }
 
   return (
     <div className="w-full max-w-[424px]">
@@ -258,7 +373,15 @@ export default function NoteImporter({
         </div>
       </div>
 
-      <div className={`mt-6 flex items-center gap-2 ${centerActions ? 'justify-center' : 'pl-5'}`}>
+      <div className={`mt-6 flex flex-wrap items-center gap-2 ${centerActions ? 'justify-center' : 'pl-5'}`}>
+        <button
+          type="button"
+          onClick={() => setStep('domains')}
+          disabled={reading || importing}
+          className="flex h-8 items-center justify-center rounded-md border border-border px-3 text-xs text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-40"
+        >
+          Back to Domains
+        </button>
         <button
           type="button"
           onClick={() => void importSelectedFiles()}
