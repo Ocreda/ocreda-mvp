@@ -12,6 +12,11 @@ export interface Note {
   created_at: string;
 }
 
+export interface NoteImportInput {
+  rawText: string;
+  category: string;
+}
+
 export interface Question {
   id: string;
   user_id: string;

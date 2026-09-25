@@ -8,7 +8,7 @@
  * file runs unless the flag is set.
  */
 
-import { Note, RelevanceProgress, RelevantNotesResponse } from '@/lib/types';
+import { Note, NoteImportInput, RelevanceProgress, RelevantNotesResponse } from '@/lib/types';
 import { readRelevanceResponse } from '@/lib/relevance-stream';
 
 export const IS_LOCAL_MODE = process.env.NEXT_PUBLIC_LOCAL_MODE === '1';
@@ -72,12 +72,12 @@ export function localCreateNote(rawText: string, category: string | null): Note 
 }
 
 export function localImportNotes(
-  rawTexts: string[],
+  inputs: NoteImportInput[],
   onProgress?: (completed: number, total: number) => void
 ): Note[] {
-  const created = rawTexts.map((text) => newNote(text, null));
+  const created = inputs.map((input) => newNote(input.rawText, input.category));
   writeAll([...created, ...readAll()]);
-  onProgress?.(rawTexts.length, rawTexts.length);
+  onProgress?.(inputs.length, inputs.length);
   return created;
 }
 
