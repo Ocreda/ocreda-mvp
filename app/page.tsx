@@ -10,6 +10,7 @@ import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSepara
 import { useAuth } from '@/lib/auth-context';
 import { createNote, deleteNote, findRelevantNotes, findSimilarNotes, getNotes, importNotes, MIN_RELEVANCE_DRAFT_CHARS, moveNotesToCategory, processNote, updateNote } from '@/lib/notes-api';
 import { supabase } from '@/lib/supabase';
+import { prepareImportedNoteText } from '@/lib/import-note-content';
 import { IS_LOCAL_MODE } from '@/dev/local-mode';  // DEV-LOCAL-MODE
 import { Note, NoteRelationType, RelevanceCoverage, RelevanceResult } from '@/lib/types';
 
@@ -33,18 +34,10 @@ function cleanCategory(value: string | null | undefined): string | null {
   return clean || null;
 }
 
-/** Longer than this, a first line is prose the writer never meant as a heading. */
-const MAX_TITLE_CHARS = 120;
-
 /**
- * A note is stored as one block of text, so its title is whatever the writer
- * put on the first line. Imported files and notes typed straight into the body
- * have no such line, and treating their opening sentence as a title used to
- * print the same words twice: once as a heading and again as the body.
- *
- * `hasTitle` says whether the first line is really a heading — short, with
- * something after it. When it is not, the whole note is body text and callers
- * show no heading at all.
+ * Existing notes keep the app's original storage convention: line one is the
+ * title and all later lines are the body. Title generation for titleless files
+ * happens only in the import path, before a new note is inserted.
  */
 function splitNote(note: Note): { title: string; body: string; hasTitle: boolean } {
   const text = note.raw_text.trim();
@@ -52,8 +45,7 @@ function splitNote(note: Note): { title: string; body: string; hasTitle: boolean
   const [first, ...rest] = text.split('\n');
   const heading = first.trim();
   const body = rest.join('\n').trim();
-  if (!body || heading.length > MAX_TITLE_CHARS) return { title: '', body: text, hasTitle: false };
-  return { title: heading, body, hasTitle: true };
+  return { title: heading, body, hasTitle: Boolean(heading) };
 }
 
 /** A one-line label for a note in lists and menus, where something must show. */
@@ -543,7 +535,10 @@ export default function OcredaHome() {
   const handleImport = async (drafts: ImportNoteDraft[]) => {
     setImportError('');
     try {
-      const imported = await importNotes(drafts.map((draft) => draft.rawText), (completed, total) => setImportProgress({ completed, total }));
+      const imported = await importNotes(
+        drafts.map((draft) => prepareImportedNoteText(draft.rawText)),
+        (completed, total) => setImportProgress({ completed, total })
+      );
       setNotes((current) => [...imported, ...current]); imported.forEach((note) => processNote(note.id).catch(() => {}));
       setImportProgress(null); setImportOpen(false); flashSaved();
     } catch (err) { setImportProgress(null); setImportError(safeErrorMessage(err, 'Your notes could not be imported.')); throw err; }
@@ -1561,8 +1556,6 @@ function AnnotationFlip({ summary, relevance, flipped, onFlip }: {
  */
 function SearchProgress({ notes, progress }: { notes: Note[]; progress: RelevanceProgress | null }) {
   const titles = useMemo(() => notes.map((note) => splitNote(note).title.trim()).filter(Boolean), [notes]);
-  // Notes without a heading contribute no title here on purpose: these values
-  // are matched against what the user types, and a whole paragraph never is.
   const [tick, setTick] = useState(() => Math.floor(Math.random() * 1000));
 
   useEffect(() => {
@@ -1670,10 +1663,6 @@ function RelevantNotesPanel({ notes, relevance, loading, progress, error, stale,
               const badge = result.relation_type ? RELATION_BADGES[result.relation_type] : null;
               const expanded = expandedId === result.note_id;
               const flipped = Boolean(flippedById[result.note_id]);
-              // splitNote treats the first line as a title. For a note written
-              // as one block that "title" is just its opening words, which the
-              // preview underneath already shows — so only head the card when
-              // the note really has a separate heading.
               const hasHeading = content.hasTitle;
               return (
                 // A div rather than a <button>, because the flip link inside

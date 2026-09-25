@@ -176,9 +176,10 @@ export async function createNote(rawText: string, category: string | null = null
 const NOTE_IMPORT_BATCH_SIZE = 50;
 
 /**
- * Import plain-text notes without summarizing, rewriting, or otherwise
- * transforming their contents. Inserts are batched to keep large exports
- * within practical PostgREST request sizes.
+ * Import prepared plain-text notes without summarizing or rewriting them.
+ * Callers may add display metadata such as a generated title before this
+ * storage step. Inserts are batched to keep large exports within practical
+ * PostgREST request sizes.
  */
 export async function importNotes(
   rawTexts: string[],
