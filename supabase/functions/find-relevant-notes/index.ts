@@ -48,6 +48,25 @@ const INSIGHT_SYSTEM_PROMPT =
  */
 const SUMMARY_TOKEN_BUDGET = 3000;
 
+const BASE_NOTE_COLUMNS = "id, raw_text, summary, created_at";
+
+/** The same test lib/notes-api.ts uses to detect a notes table without the category column. */
+function isMissingCategoryColumn(error: { message?: string; code?: string }): boolean {
+  const message = (error.message ?? "").toLowerCase();
+  return error.code === "42703" ||
+    (message.includes("category") && (message.includes("does not exist") || message.includes("schema cache")));
+}
+
+/**
+ * Supabase errors are plain objects rather than Error instances, so reading
+ * only Error.message logged them as "Unknown error" and hid the cause.
+ */
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === "object" && "message" in error) return String((error as { message: unknown }).message);
+  return String(error);
+}
+
 const AGENT_SYSTEM_PROMPT =
   "You identify meaningful relationships between a person's notes. You respond with a JSON array and nothing else.";
 
@@ -181,18 +200,25 @@ Deno.serve(async (req: Request) => {
     const apiKey = Deno.env.get("OPENROUTER_API_KEY");
     if (!apiKey) return json({ error: "Relevance search is not configured." }, 500);
 
-    let query = supabase
-      .from("notes")
-      .select("id, raw_text, summary, created_at, category")
-      .eq("user_id", userId)
-      .order("created_at", { ascending: false })
-      .limit(MAX_NOTES);
-    if (excludeNoteId) query = query.neq("id", excludeNoteId);
+    const loadNotes = (columns: string) => {
+      let query = supabase
+        .from("notes")
+        .select(columns)
+        .eq("user_id", userId)
+        .order("created_at", { ascending: false })
+        .limit(MAX_NOTES);
+      if (excludeNoteId) query = query.neq("id", excludeNoteId);
+      return query;
+    };
 
-    const { data, error: notesErr } = await query;
-    if (notesErr) throw notesErr;
+    // The rebuilt notes table (20260723080000_rebuild_as_second_brain.sql) has
+    // no category column, so fall back without it, as lib/notes-api.ts does.
+    // The goal still applies; only the Domain's recent notes go missing.
+    let loaded = await loadNotes(`${BASE_NOTE_COLUMNS}, category`);
+    if (loaded.error && isMissingCategoryColumn(loaded.error)) loaded = await loadNotes(BASE_NOTE_COLUMNS);
+    if (loaded.error) throw new Error(`Loading notes failed: ${loaded.error.message}`);
 
-    const notes = (data ?? []) as NoteLike[];
+    const notes = (loaded.data ?? []) as unknown as NoteLike[];
     if (notes.length === 0) {
       return json({
         results: [],
@@ -216,15 +242,22 @@ Deno.serve(async (req: Request) => {
       concurrency: DEFAULT_AGENT_CONCURRENCY,
       isRetryable: isRetryableGeminiError,
       generate: async (prompt: string) => {
-        const { text, usage: callUsage } = await generateWithGeminiResult(
-          AGENT_SYSTEM_PROMPT,
-          [{ role: "user", content: prompt }],
-          apiKey,
-          undefined,
-          { responseMimeType: "application/json", temperature: 0.2 },
-        );
-        addTokenUsage(usage, callUsage);
-        return text;
+        try {
+          const { text, usage: callUsage } = await generateWithGeminiResult(
+            AGENT_SYSTEM_PROMPT,
+            [{ role: "user", content: prompt }],
+            apiKey,
+            undefined,
+            { responseMimeType: "application/json", temperature: 0.2 },
+          );
+          addTokenUsage(usage, callUsage);
+          return text;
+        } catch (error) {
+          // Otherwise a dead key or empty balance only ever surfaces as
+          // "unavailable"; this line says which (401, 402, 429...).
+          console.error("find-relevant-notes agent call failed:", errorMessage(error));
+          throw error;
+        }
       },
     };
 
@@ -279,8 +312,7 @@ Deno.serve(async (req: Request) => {
       },
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    console.error("find-relevant-notes failed:", message);
+    console.error("find-relevant-notes failed:", errorMessage(error));
     return json({ error: "Relevance search failed. Please try again." }, 500);
   }
 });

@@ -36,6 +36,27 @@ const INSIGHT_SYSTEM_PROMPT =
 const AGENT_SYSTEM_PROMPT =
   "You identify meaningful relationships between a person's notes. You respond with a JSON array and nothing else.";
 
+/** Enough of the key to tell which one the server loaded, without printing it. */
+function maskKey(key: string): string {
+  return key.length > 16 ? `${key.slice(0, 12)}...${key.slice(-4)}` : '(too short to be a real key)';
+}
+
+/**
+ * Wraps a model call so a failure prints its real reason (a 401 for a dead
+ * key, a 402 for no credits, a 429 for rate limiting) before the shared code
+ * turns it into a generic "every agent failed".
+ */
+function withFailureLog(label: string, call: (prompt: string) => Promise<string>) {
+  return async (prompt: string) => {
+    try {
+      return await call(prompt);
+    } catch (error) {
+      console.error(`[local] ${label} failed:`, error instanceof Error ? error.message : error);
+      throw error;
+    }
+  };
+}
+
 function isNoteLike(value: unknown): value is NoteLike {
   if (!value || typeof value !== 'object') return false;
   const row = value as Record<string, unknown>;
@@ -81,6 +102,10 @@ export async function POST(request: Request) {
     });
   }
 
+  // Next.js prefers a variable already set in the shell over .env.local, so a
+  // stale key can hide here. Printing its ends shows which one is in use.
+  console.log(`[local] find-relevant-notes: ${notes.length} notes, OpenRouter key ${maskKey(apiKey)}`);
+
   const draft = condenseDraft(draftText);
   const insightFor = (results: RelevanceResult[]) =>
     findInsight({
@@ -89,12 +114,12 @@ export async function POST(request: Request) {
       notes,
       results,
       excludeNoteId,
-      generate: (prompt) =>
+      generate: withFailureLog('insight call', (prompt) =>
         generateWithGemini(INSIGHT_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], apiKey, undefined, {
           responseMimeType: 'application/json',
           temperature: 0.2,
           maxOutputTokens: 3000,
-        }),
+        })),
     });
   const agentOptions = {
     draft,
@@ -103,11 +128,11 @@ export async function POST(request: Request) {
     agentCount: DEFAULT_AGENT_COUNT,
     concurrency: DEFAULT_AGENT_CONCURRENCY,
     isRetryable: isRetryableGeminiError,
-    generate: (prompt: string) =>
+    generate: withFailureLog('agent call', (prompt: string) =>
       generateWithGemini(AGENT_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], apiKey, undefined, {
         responseMimeType: 'application/json',
         temperature: 0.2,
-      }),
+      })),
   };
 
   if (body?.stream === true) {
