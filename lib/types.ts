@@ -74,9 +74,36 @@ export interface RelevanceProgress {
   notes_total: number;
 }
 
+/** What the note being written is doing; it decides which kind of action helps. */
+export type InsightIntent = 'stuck' | 'planning' | 'deciding' | 'capturing' | 'reflecting';
+
+/** The one thing from past notes that should change what the person does next. */
+export interface NoteInsight {
+  /** Verbatim passage of the searched text the insight is about. Empty when none could be matched. */
+  anchor: string;
+  intent: InsightIntent;
+  text: string;
+  action: string;
+  /** The notes the insight rests on, all of them among the results. */
+  note_ids: string[];
+}
+
+/** The Domain a search is made from, and what the person said they want from it. */
+export interface DomainGoal {
+  name: string;
+  goal: string;
+}
+
 export interface RelevantNotesResponse {
   results: RelevanceResult[];
   coverage: RelevanceCoverage;
-  /** A short synthesis of the related notes as a group, when available. */
+  /** A short synthesis of the related notes as a group, when the server has it switched on. */
   summary?: string;
+  /**
+   * Undefined when the server ran no insight step (similar-notes mode, or an
+   * older server). Null when it ran and found nothing worth saying.
+   */
+  insight?: NoteInsight | null;
+  /** Guesses at the Domain's goal, offered only when it has none. */
+  goal_suggestions?: string[];
 }

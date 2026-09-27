@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, ArrowUp, Bold, Check, ChevronDown, ChevronLeft, ChevronRight, Filter, FolderPlus, Grid2X2, Italic, Layers3, List, ListOrdered, Loader as Loader2, Mic, MoreHorizontal, PanelRightOpen, Pin, Plus, RefreshCw, Rows3, ScanSearch, Search, Trash2, Upload, X } from 'lucide-react';
+import { ArrowLeft, ArrowUp, Bold, Check, ChevronDown, ChevronLeft, ChevronRight, Filter, FolderPlus, Grid2X2, Italic, Layers3, Lightbulb, List, ListOrdered, Loader as Loader2, Mic, MoreHorizontal, PanelRightOpen, Pin, Plus, RefreshCw, Rows3, ScanSearch, Search, Trash2, Upload, X } from 'lucide-react';
 import type { RelevanceProgress } from '@/lib/types';
 import NoteImporter, { ImportDomainDraft, ImportNoteDraft } from '@/components/NoteImporter';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
@@ -12,7 +12,8 @@ import { createNote, deleteNote, findRelevantNotes, findSimilarNotes, getNotes, 
 import { supabase } from '@/lib/supabase';
 import { prepareImportedNoteText } from '@/lib/import-note-content';
 import { IS_LOCAL_MODE } from '@/dev/local-mode';  // DEV-LOCAL-MODE
-import { Note, NoteRelationType, RelevanceCoverage, RelevanceResult } from '@/lib/types';
+import { DomainGoal, InsightIntent, Note, NoteInsight, NoteRelationType, RelevanceCoverage, RelevanceResult } from '@/lib/types';
+import { findAnchor } from '@/supabase/functions/_shared/relevance';
 
 type MuseMeta = { title: string; description: string; createdAt: string };
 type ProjectPage = { id: string; title: string; content: string; sourceNoteIds: string[]; createdAt: string; updatedAt: string };
@@ -35,6 +36,17 @@ const ORPHANS_MIGRATION_VERSION = 'v1';
 function cleanCategory(value: string | null | undefined): string | null {
   const clean = value?.trim().replace(/\s+/g, ' ') ?? '';
   return clean || null;
+}
+
+/**
+ * The Domain a search is made from, with its description standing in as the
+ * goal. Null for notes outside any Domain, which are searched on their text alone.
+ */
+function domainGoalFor(category: string | null | undefined, muses: MuseMeta[]): DomainGoal | null {
+  const name = cleanCategory(category);
+  if (!name || name === AUTOMATIC_MUSE) return null;
+  const meta = muses.find((muse) => muse.title.toLowerCase() === name.toLowerCase());
+  return { name, goal: meta?.description.trim() ?? '' };
 }
 
 /**
@@ -84,22 +96,24 @@ function stableHash(value: string): number {
 // Bump the version whenever the wording of saved summaries or reasons changes,
 // so notes opened before the change are retrieved again instead of showing the
 // old text. v2: summaries and gists speak to the user in the second person.
-const SAVED_RETRIEVAL_VERSION = 'v2';
+// v3: results carry a goal-aware insight, and the goal is part of the signature.
+const SAVED_RETRIEVAL_VERSION = 'v3';
 
 function savedRetrievalKey(userId: string, noteId: string): string {
   return `ocreda-saved-retrieval:${SAVED_RETRIEVAL_VERSION}:${userId}:${noteId}`;
 }
 
-function noteSignature(note: Note): string {
-  return `${note.raw_text.length}:${stableHash(note.raw_text)}`;
+/** Changing either the note or its Domain's goal changes what a search would return. */
+function noteSignature(note: Note, goal: string): string {
+  return `${note.raw_text.length}:${stableHash(note.raw_text)}:${stableHash(goal)}`;
 }
 
-function readSavedRetrieval(userId: string, note: Note): { mode: 'similar' | 'relevant'; search: RelevanceSearch } | null {
+function readSavedRetrieval(userId: string, note: Note, goal: string): { mode: 'similar' | 'relevant'; search: RelevanceSearch } | null {
   try {
     const saved = JSON.parse(localStorage.getItem(savedRetrievalKey(userId, note.id)) ?? 'null') as {
       signature?: string; mode?: string; search?: RelevanceSearch;
     } | null;
-    if (saved?.signature !== noteSignature(note) || !Array.isArray(saved.search?.results) || !saved.search?.coverage) return null;
+    if (saved?.signature !== noteSignature(note, goal) || !Array.isArray(saved.search?.results) || !saved.search?.coverage) return null;
     if (!saved.search.results.every((result) => result && typeof result.note_id === 'string' && typeof result.gist === 'string')) return null;
     if (saved.search.summary !== undefined && typeof saved.search.summary !== 'string') return null;
     if (saved.mode !== 'similar' && saved.mode !== 'relevant') return null;
@@ -112,9 +126,9 @@ function readSavedRetrieval(userId: string, note: Note): { mode: 'similar' | 're
   }
 }
 
-function persistSavedRetrieval(userId: string, note: Note, mode: 'similar' | 'relevant', search: RelevanceSearch): void {
+function persistSavedRetrieval(userId: string, note: Note, goal: string, mode: 'similar' | 'relevant', search: RelevanceSearch): void {
   try {
-    localStorage.setItem(savedRetrievalKey(userId, note.id), JSON.stringify({ signature: noteSignature(note), mode, search }));
+    localStorage.setItem(savedRetrievalKey(userId, note.id), JSON.stringify({ signature: noteSignature(note, goal), mode, search }));
   } catch {
     // A full or disabled browser store should not prevent the note itself from being saved.
   }
@@ -199,6 +213,9 @@ export default function OcredaHome() {
   const [noteEditor, setNoteEditor] = useState<NoteEditorState | null>(null);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
   const [activeNoteRetrievalMode, setActiveNoteRetrievalMode] = useState<'similar' | 'relevant'>('relevant');
+  // False when a note is only being looked at, e.g. opened from another note's
+  // related notes, so reading it does not spend an AI search.
+  const [activeNoteAutoSearch, setActiveNoteAutoSearch] = useState(true);
   const [museEditor, setMuseEditor] = useState<MuseEditorState | null>(null);
   const [projectEditor, setProjectEditor] = useState<ProjectEditorState | null>(null);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
@@ -338,6 +355,16 @@ export default function OcredaHome() {
     return Array.from(map.values()).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }, [museMeta, notes]);
 
+  /** Saves a goal picked from the one-tap suggestions as the Domain's description. */
+  const setDomainGoal = (domainTitle: string, goal: string) => {
+    const key = domainTitle.toLowerCase();
+    const existing = museMeta.find((item) => item.title.toLowerCase() === key);
+    persistMuseMeta(existing
+      ? museMeta.map((item) => item.title.toLowerCase() === key ? { ...item, description: goal } : item)
+      // A Domain that exists only through its notes' category gets its metadata now.
+      : [...museMeta, { title: domainTitle, description: goal, createdAt: muses.find((item) => item.title.toLowerCase() === key)?.createdAt ?? new Date().toISOString() }]);
+  };
+
   const notesByMuse = useMemo(() => {
     const grouped = new Map<string, Note[]>();
     muses.forEach((muse) => grouped.set(muse.title, []));
@@ -360,7 +387,7 @@ export default function OcredaHome() {
     setView('muses');
   }, []);
   const openNewNote = (muse = AUTOMATIC_MUSE) => { setError(''); setNoteEditor({ note: null, title: '', body: '', muse, context: 'domain' }); };
-  const openExistingNote = (note: Note) => { setError(''); setActiveNoteRetrievalMode('relevant'); setActiveNoteId(note.id); };
+  const openExistingNote = (note: Note, autoSearch = true) => { setError(''); setActiveNoteRetrievalMode('relevant'); setActiveNoteAutoSearch(autoSearch); setActiveNoteId(note.id); };
   const createMuseFromEditor = (value: string) => {
     const requested = cleanCategory(value);
     if (!requested) return;
@@ -391,7 +418,7 @@ export default function OcredaHome() {
         processNote(created.id).catch(() => {});
         savedNoteId = created.id;
       }
-      setNoteEditor(null); setActiveNoteRetrievalMode('relevant'); setActiveNoteId(savedNoteId);
+      setNoteEditor(null); setActiveNoteRetrievalMode('relevant'); setActiveNoteAutoSearch(true); setActiveNoteId(savedNoteId);
       if (!findRelevant) flashSaved();
     } catch (err) { setError(safeErrorMessage(err, 'Unable to save this note.')); }
     finally { setSaving(false); }
@@ -627,7 +654,7 @@ export default function OcredaHome() {
   return (
     <main className="light h-[100dvh] w-full overflow-hidden bg-white text-[#141414]">
       <section className="relative flex h-full w-full flex-col overflow-hidden bg-white">
-        {activeNoteId && notes.find((note) => note.id === activeNoteId) ? <NoteReadingWorkspace key={activeNoteId} note={notes.find((note) => note.id === activeNoteId)!} allNotes={notes} muses={muses} projects={projects} saving={saving} userId={user?.id ?? 'local'} initialRetrievalMode={activeNoteRetrievalMode} onBack={() => setActiveNoteId(null)} onAddNote={() => openNewNote(cleanCategory(notes.find((note) => note.id === activeNoteId)?.category) ?? AUTOMATIC_MUSE)} onOpenNote={(note) => openExistingNote(note)} onOpenPage={(project, page) => { setActiveNoteId(null); setActiveProjectId(project.id); setActivePageId(page.id); }} onUpdate={updateReadingNote} onChangeDomain={(category) => void changeReadingNoteDomain(activeNoteId, category)} onDelete={removeReadingNote} onSaveRetrieval={saveInstantRetrieval} />
+        {activeNoteId && notes.find((note) => note.id === activeNoteId) ? <NoteReadingWorkspace key={activeNoteId} note={notes.find((note) => note.id === activeNoteId)!} allNotes={notes} muses={muses} projects={projects} saving={saving} userId={user?.id ?? 'local'} initialRetrievalMode={activeNoteRetrievalMode} autoSearch={activeNoteAutoSearch} onBack={() => setActiveNoteId(null)} onAddNote={() => openNewNote(cleanCategory(notes.find((note) => note.id === activeNoteId)?.category) ?? AUTOMATIC_MUSE)} onOpenNote={(note, autoSearch) => openExistingNote(note, autoSearch)} onOpenPage={(project, page) => { setActiveNoteId(null); setActiveProjectId(project.id); setActivePageId(page.id); }} onUpdate={updateReadingNote} onChangeDomain={(category) => void changeReadingNoteDomain(activeNoteId, category)} onDelete={removeReadingNote} onSaveRetrieval={saveInstantRetrieval} onSetDomainGoal={setDomainGoal} />
           : activeProject && activePage ? <ProjectPageWorkspace key={activePage.id} project={activeProject} page={activePage} notes={notes} muses={muses} projects={projects} saving={saving} onBack={() => setActivePageId(null)} onChange={(page) => updateProjectPage(activeProject.id, page)} onAddNote={() => openNewNote()} onOpenNote={openExistingNote} onOpenPage={(project, page) => { setActiveProjectId(project.id); setActivePageId(page.id); }} onDelete={() => removeProjectPage(activeProject.id, activePage.id)} onSaveRetrieval={saveInstantRetrieval} />
           : activeProject ? <ProjectPagesGrid project={activeProject} onBack={() => { setActiveProjectId(null); setActivePageId(null); }} onAddPage={() => createProjectPage(activeProject.id)} onOpenPage={(page) => setActivePageId(page.id)} onEdit={() => setProjectEditor({ project: activeProject, title: activeProject.title, description: activeProject.description })} onDelete={() => removeProject(activeProject.id)} />
           : isEmpty ? <EmptyWorkspace displayName={displayName} userEmail={user?.email ?? ''} existingDomains={muses} onAddNote={() => openNewNote()} onImport={handleImport} onOpenImport={() => setImportOpen(true)} importError={importError} progress={importProgress} />
@@ -1119,11 +1146,12 @@ function NoteDomainPicker({ category, muses, saving, onChange, showPrefix = fals
   );
 }
 
-function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId, initialRetrievalMode, onBack, onAddNote, onOpenNote, onOpenPage, onUpdate, onChangeDomain, onDelete, onSaveRetrieval }: {
-  note: Note; allNotes: Note[]; muses: MuseMeta[]; projects: CortexProject[]; saving: boolean; userId: string; initialRetrievalMode: 'similar' | 'relevant';
-  onBack: () => void; onAddNote: () => void; onOpenNote: (note: Note) => void; onOpenPage: (project: CortexProject, page: ProjectPage) => void;
+function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId, initialRetrievalMode, autoSearch, onBack, onAddNote, onOpenNote, onOpenPage, onUpdate, onChangeDomain, onDelete, onSaveRetrieval, onSetDomainGoal }: {
+  note: Note; allNotes: Note[]; muses: MuseMeta[]; projects: CortexProject[]; saving: boolean; userId: string; initialRetrievalMode: 'similar' | 'relevant'; autoSearch: boolean;
+  onBack: () => void; onAddNote: () => void; onOpenNote: (note: Note, autoSearch?: boolean) => void; onOpenPage: (project: CortexProject, page: ProjectPage) => void;
   onUpdate: (noteId: string, rawText: string) => Promise<void>; onChangeDomain: (category: string | null) => void; onDelete: (note: Note) => Promise<void>;
   onSaveRetrieval: (queryText: string, resultNotes: Note[], projectId: string, newProjectTitle?: string) => Promise<void>;
+  onSetDomainGoal: (domainTitle: string, goal: string) => void;
 }) {
   const initial = splitNote(note);
   const [title, setTitle] = useState(initial.title);
@@ -1140,10 +1168,17 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
   const [retrievalError, setRetrievalError] = useState('');
   const [retrievalAttempt, setRetrievalAttempt] = useState(0);
   const [retrievalMode, setRetrievalMode] = useState(initialRetrievalMode);
+  // Starts false for a note opened just to read it. Asking for a search, or
+  // editing the note, turns it on.
+  const [searchRequested, setSearchRequested] = useState(autoSearch);
   const [searchRequest, setSearchRequest] = useState<KnowledgeSearchRequest | null>(null);
   const [instantRetrievalOpen, setInstantRetrievalOpen] = useState(false);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [insightPopover, setInsightPopover] = useState<{ top: number; left: number; width: number } | null>(null);
   const bodyRef = useRef<HTMLTextAreaElement>(null);
+  const articleRef = useRef<HTMLElement>(null);
+  const anchorRef = useRef<HTMLElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
   const latestSaveRef = useRef(onUpdate);
   latestSaveRef.current = onUpdate;
   const muse = cleanCategory(note.category) || 'Instant retrieval';
@@ -1164,6 +1199,10 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
   const nextNote = noteIndex > 0 ? orderedNotes[noteIndex - 1] : null;
   const noteTooShortForRetrieval = note.raw_text.trim().length < MIN_RELEVANCE_DRAFT_CHARS;
   const hasOtherNotes = allNotes.some((item) => item.id !== note.id);
+  const domainGoal = domainGoalFor(note.category, muses);
+  // Primitives, so a new muses array with the same content does not rerun the search.
+  const domainName = domainGoal?.name ?? '';
+  const goalText = domainGoal?.goal ?? '';
 
   useEffect(() => {
     // The editor autosaves while typing. Wait until editing finishes before
@@ -1171,21 +1210,24 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
     if (editing) return;
     let active = true;
     setRetrieval(null); setRetrievalError(''); setRetrievalProgress(null); setSelectedNoteId(null);
-    const saved = retrievalAttempt === 0 ? readSavedRetrieval(userId, note) : null;
+    const saved = retrievalAttempt === 0 ? readSavedRetrieval(userId, note, goalText) : null;
     if (saved && (retrievalMode === 'similar' || saved.mode === 'relevant')) {
       setRetrieval(saved.search);
       setRetrievalLoading(false);
       return;
     }
-    if (noteTooShortForRetrieval || !hasOtherNotes) { setRetrievalLoading(false); return; }
+    if (noteTooShortForRetrieval || !hasOtherNotes || !searchRequested) { setRetrievalLoading(false); return; }
     setRetrievalLoading(true);
-    const search = retrievalMode === 'relevant' ? findRelevantNotes : findSimilarNotes;
-    search(note.raw_text, note.id, (progress) => { if (active) setRetrievalProgress(progress); }, allNotes)
-      .then((response) => { if (active) { setRetrieval(response); persistSavedRetrieval(userId, note, retrievalMode, response); } })
+    const onProgress = (progress: RelevanceProgress) => { if (active) setRetrievalProgress(progress); };
+    const search = retrievalMode === 'relevant'
+      ? findRelevantNotes(note.raw_text, note.id, onProgress, domainName ? { name: domainName, goal: goalText } : null)
+      : findSimilarNotes(note.raw_text, note.id, onProgress, allNotes);
+    search
+      .then((response) => { if (active) { setRetrieval(response); persistSavedRetrieval(userId, note, goalText, retrievalMode, response); } })
       .catch((err) => { if (active) setRetrievalError(safeErrorMessage(err, 'Could not retrieve related notes.')); })
       .finally(() => { if (active) setRetrievalLoading(false); });
     return () => { active = false; };
-  }, [allNotes, editing, hasOtherNotes, note, noteTooShortForRetrieval, retrievalAttempt, retrievalMode, userId]);
+  }, [allNotes, domainName, editing, goalText, hasOtherNotes, note, noteTooShortForRetrieval, retrievalAttempt, retrievalMode, searchRequested, userId]);
 
   const surfacedNotes = useMemo(() => {
     const notesById = new Map(allNotes.map((item) => [item.id, item]));
@@ -1208,18 +1250,70 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
     .map((result) => result.gist.trim() || noteById.get(result.note_id)?.summary?.trim() || '')
     .filter(Boolean);
 
-  const leaveWorkspace = async (next?: Note | null) => {
+  const insight = retrieval?.insight ?? null;
+  const displayedBody = body || note.raw_text;
+  // Only highlight text the reader can see, and never while it is being edited.
+  const anchorSpan = !editing && insight?.anchor ? findAnchor(displayedBody, insight.anchor) : null;
+
+  // The popover belongs to one search's insight; a new search or editing closes it.
+  useEffect(() => { setInsightPopover(null); }, [insight, editing]);
+
+  useEffect(() => {
+    if (!insightPopover) return;
+    const close = (event: MouseEvent | KeyboardEvent) => {
+      if (event instanceof KeyboardEvent) {
+        if (event.key !== 'Escape') return;
+        setInsightPopover(null);
+        anchorRef.current?.focus();
+        return;
+      }
+      const target = event.target as Node;
+      if (!popoverRef.current?.contains(target) && !anchorRef.current?.contains(target)) setInsightPopover(null);
+    };
+    document.addEventListener('mousedown', close);
+    document.addEventListener('keydown', close);
+    return () => { document.removeEventListener('mousedown', close); document.removeEventListener('keydown', close); };
+  }, [insightPopover]);
+
+  const toggleInsightPopover = () => {
+    if (insightPopover) { setInsightPopover(null); return; }
+    const anchorEl = anchorRef.current; const article = articleRef.current;
+    if (!anchorEl || !article) return;
+    // Sit under the last line of the highlight, which may wrap across several.
+    const lines = anchorEl.getClientRects();
+    const line = lines[lines.length - 1] ?? anchorEl.getBoundingClientRect();
+    const box = article.getBoundingClientRect();
+    const width = Math.min(380, box.width);
+    setInsightPopover({ top: line.bottom - box.top + 8, left: Math.max(0, Math.min(line.left - box.left, box.width - width)), width });
+  };
+
+  const showCitedNote = (noteId: string) => { setNotesOpen(true); setSelectedNoteId(noteId); };
+
+  const [dismissedGoalDomains, setDismissedGoalDomains] = useState(() => readGoalPromptDismissed(userId));
+  const goalSuggestions = retrieval?.goal_suggestions ?? [];
+  const goalPrompt = domainName && !goalText && !dismissedGoalDomains.includes(domainName.toLowerCase()) && goalSuggestions.length
+    ? <GoalPrompt
+      domainTitle={domainName}
+      suggestions={goalSuggestions}
+      // Saving the goal changes the search signature, so the note is searched again with it.
+      onPick={(goal) => onSetDomainGoal(domainName, goal)}
+      onDismiss={() => { dismissGoalPrompt(userId, domainName); setDismissedGoalDomains(readGoalPromptDismissed(userId).concat(domainName.toLowerCase())); }}
+    />
+    : null;
+
+  const leaveWorkspace = async (next?: Note | null, autoSearch = true) => {
     if (rawText && rawText !== note.raw_text.trim()) {
       setSaveState('saving');
       try { await latestSaveRef.current(note.id, rawText); setSaveState('saved'); }
       catch { setSaveState('error'); return; }
     }
-    if (next) onOpenNote(next); else onBack();
+    if (next) onOpenNote(next, autoSearch); else onBack();
   };
 
   const finishEditing = () => {
     setEditing(false);
     if (!rawText || rawText === note.raw_text.trim()) return;
+    setSearchRequested(true);
     setSaveState('saving');
     latestSaveRef.current(note.id, rawText)
       .then(() => setSaveState('saved'))
@@ -1270,7 +1364,29 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
             {!summaryOpen && <button type="button" onClick={() => setNotesOpen((open) => !open)} aria-controls="related-notes-panel" aria-expanded={notesOpen} className="rounded-md border border-[#dedede] bg-white px-3 py-1.5 text-xs text-[#555] shadow-sm hover:border-[#adc3ff] hover:text-[#477bea] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">{notesOpen ? 'Hide notes' : 'See notes'}</button>}
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto px-7 pb-24 pt-12 sm:px-12 xl:px-[8%]">
-            {editing ? <div className="mx-auto max-w-3xl"><input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} aria-label="Note title" placeholder="Title (optional)" className="w-full bg-transparent text-2xl font-semibold outline-none placeholder:font-normal placeholder:text-[#c4c4c6]" /><textarea ref={bodyRef} value={body} onChange={(event) => setBody(event.target.value)} aria-label="Note text" className="mt-10 min-h-[520px] w-full resize-none bg-transparent text-base leading-[1.7] outline-none" /></div> : <article className="mx-auto max-w-3xl">{title.trim() && <button type="button" onClick={() => setEditing(true)} className="block w-full rounded-md px-2 py-1 text-left outline-none hover:bg-[#f8f8f8] focus-visible:ring-2 focus-visible:ring-[#477bea]/20"><h1 className="break-words text-2xl font-semibold">{title}</h1></button>}<div className="mt-2 flex flex-wrap gap-x-3 px-2 text-xs text-[#999]"><NoteDomainPicker category={note.category} muses={muses} saving={saving} onChange={onChangeDomain} showPrefix /><button type="button" onClick={openDate} className="hover:text-[#477bea]">{fullNoteDate(note.created_at)}</button></div><button type="button" onClick={() => { setEditing(true); requestAnimationFrame(() => bodyRef.current?.focus()); }} className="mt-9 block w-full rounded-md px-2 py-2 text-left text-base leading-[1.7] outline-none hover:bg-[#f8f8f8] focus-visible:ring-2 focus-visible:ring-[#477bea]/20"><span className="whitespace-pre-wrap break-words">{body || note.raw_text || 'Tap to start writing.'}</span></button></article>}
+            {editing ? <div className="mx-auto max-w-3xl"><input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} aria-label="Note title" placeholder="Title (optional)" className="w-full bg-transparent text-2xl font-semibold outline-none placeholder:font-normal placeholder:text-[#c4c4c6]" /><textarea ref={bodyRef} value={body} onChange={(event) => setBody(event.target.value)} aria-label="Note text" className="mt-10 min-h-[520px] w-full resize-none bg-transparent text-base leading-[1.7] outline-none" /></div> : <article ref={articleRef} className="relative mx-auto max-w-3xl">{title.trim() && <button type="button" onClick={() => setEditing(true)} className="block w-full rounded-md px-2 py-1 text-left outline-none hover:bg-[#f8f8f8] focus-visible:ring-2 focus-visible:ring-[#477bea]/20"><h1 className="break-words text-2xl font-semibold">{title}</h1></button>}<div className="mt-2 flex flex-wrap gap-x-3 px-2 text-xs text-[#999]"><NoteDomainPicker category={note.category} muses={muses} saving={saving} onChange={onChangeDomain} showPrefix /><button type="button" onClick={openDate} className="hover:text-[#477bea]">{fullNoteDate(note.created_at)}</button></div>{/* A div rather than a <button>, because the highlighted passage inside it is itself clickable. */}
+<div role="button" tabIndex={0} onClick={() => { setEditing(true); requestAnimationFrame(() => bodyRef.current?.focus()); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === 'Enter') { event.preventDefault(); setEditing(true); requestAnimationFrame(() => bodyRef.current?.focus()); } }} aria-label="Edit note text" className="mt-9 block w-full cursor-text rounded-md px-2 py-2 text-left text-base leading-[1.7] outline-none hover:bg-[#f8f8f8] focus-visible:ring-2 focus-visible:ring-[#477bea]/20"><span className="whitespace-pre-wrap break-words">{anchorSpan && insight ? <>
+  {displayedBody.slice(0, anchorSpan.start)}
+  <mark
+    ref={anchorRef}
+    role="button"
+    tabIndex={0}
+    onClick={(event) => { event.stopPropagation(); toggleInsightPopover(); }}
+    onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); toggleInsightPopover(); } }}
+    aria-expanded={Boolean(insightPopover)}
+    aria-haspopup="dialog"
+    title="See what your notes say about this"
+    className="cursor-pointer rounded-sm bg-[#fff1c2] px-0.5 text-inherit underline decoration-[#e3b341] decoration-2 underline-offset-4 [box-decoration-break:clone] hover:bg-[#ffe699] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]"
+  >{displayedBody.slice(anchorSpan.start, anchorSpan.end)}</mark>
+  {displayedBody.slice(anchorSpan.end)}
+</> : displayedBody || 'Tap to start writing.'}</span></div>
+{insightPopover && insight && <div ref={popoverRef} role="dialog" aria-label="What your notes suggest" className="absolute z-30" style={{ top: insightPopover.top, left: insightPopover.left, width: insightPopover.width }}>
+  <div className="relative shadow-xl">
+    <button type="button" onClick={() => { setInsightPopover(null); anchorRef.current?.focus(); }} aria-label="Close" className="absolute right-2 top-2 z-10 rounded p-1 text-[#999] hover:bg-[#f4f4f4] hover:text-[#555]"><X className="h-3.5 w-3.5" /></button>
+    <InsightCard compact showAnchor={false} insight={insight} notesById={noteById} onSelectNote={showCitedNote} />
+  </div>
+</div>}
+</article>}
           </div>
           <ReadingFormatBar onFormat={applyReadingFormat} onDone={finishEditing} editing={editing} />
           <span className="absolute bottom-3 right-5 text-[11px] text-[#999]">{saving || saveState === 'saving' ? 'Saving…' : saveState === 'saved' ? 'Saved' : saveState === 'error' ? 'Save failed' : ''}</span>
@@ -1280,7 +1396,17 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
           <button type="button" onClick={() => setNotesOpen((open) => !open)} aria-controls="related-notes-panel" aria-expanded={notesOpen} className="absolute right-4 top-3 rounded-md border border-[#dedede] bg-white px-3 py-1.5 text-xs text-[#477bea] shadow-sm hover:border-[#adc3ff] hover:bg-[#edf3ff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">{notesOpen ? 'Hide notes' : 'See notes'}</button>
           {retrievalLoading ? <div className="flex h-full items-center justify-center gap-3 text-sm text-[#777]" role="status"><Loader2 className="h-5 w-5 animate-spin text-[#477bea]" /> Finding related notes{retrievalProgress?.agents_total ? ` · ${retrievalProgress.agents_done}/${retrievalProgress.agents_total}` : '…'}</div>
             : retrievalError ? <div className="flex h-full items-center justify-center text-center" role="alert"><div><h2 className="text-lg font-semibold">Could not retrieve notes</h2><p className="mt-3 max-w-sm text-sm leading-relaxed text-[#777]">{retrievalError}</p><button type="button" onClick={() => setRetrievalAttempt((attempt) => attempt + 1)} className="mt-5 rounded-md bg-[#477bea] px-4 py-2 text-sm text-white hover:bg-[#3d6ed7]">Try again</button></div></div>
+            : insight ? <div className="mx-auto max-w-xl space-y-10">
+              <InsightCard insight={insight} notesById={noteById} onSelectNote={showCitedNote} />
+              {goalPrompt}
+              {retrieval?.summary && <article><h2 className="text-lg font-semibold leading-snug">Summary of related notes</h2><p className="mt-7 text-sm leading-[1.7] text-[#333]">{retrieval.summary}</p></article>}
+            </div>
+            // The insight step ran and found nothing worth acting on. Restating
+            // the related notes here instead is exactly the echo it avoids.
+            : retrieval?.insight === null && !retrieval.summary && surfacedNotes.length ? <div className="flex h-full items-center justify-center text-center"><div><h2 className="text-lg font-semibold">Nothing here changes your next step</h2><p className="mt-3 max-w-sm text-sm leading-relaxed text-[#777]">Your related notes are alongside, but none of them adds something this note doesn’t already say.</p>{goalPrompt && <div className="mx-auto mt-8 max-w-sm">{goalPrompt}</div>}</div></div>
             : retrieval?.summary || summaries.length ? <article className="mx-auto max-w-xl"><h2 className="text-lg font-semibold leading-snug">Summary of related notes</h2><div className="mt-7 space-y-4 text-sm leading-[1.7] text-[#333]">{retrieval?.summary ? <p>{retrieval.summary}</p> : summaries.map((summary, index) => <p key={index}>{summary}</p>)}</div></article>
+            // Opened just to read it, with nothing saved from an earlier search.
+            : !retrieval && !searchRequested && !noteTooShortForRetrieval && hasOtherNotes ? <div className="flex h-full items-center justify-center text-center"><div><h2 className="text-lg font-semibold">See what your notes say about this</h2><p className="mt-3 max-w-sm text-sm leading-relaxed text-[#777]">Search your other notes for anything that connects to this one.</p><button type="button" onClick={() => setSearchRequested(true)} className="mt-5 rounded-md bg-[#477bea] px-4 py-2 text-sm text-white hover:bg-[#3d6ed7]">Find related notes</button></div></div>
             : surfacedNotes.length ? <div className="flex h-full items-center justify-center text-center"><div><h2 className="text-lg font-semibold">Summarize related notes</h2><p className="mt-3 max-w-sm text-sm leading-relaxed text-[#777]">{retrievalMode === 'relevant' ? 'A summary was not returned for these notes.' : 'Find relevant notes to create a summary of the notes shown here.'}</p><button type="button" onClick={() => { setRetrievalMode('relevant'); setRetrievalAttempt((attempt) => attempt + 1); }} className="mt-5 rounded-md bg-[#477bea] px-4 py-2 text-sm text-white hover:bg-[#3d6ed7]">{retrievalMode === 'relevant' ? 'Try again' : 'Find relevant notes'}</button></div></div>
             : <div className="flex h-full items-center justify-center text-center"><div><h2 className="text-lg font-semibold">{noteTooShortForRetrieval ? 'Keep writing to retrieve notes' : !hasOtherNotes ? 'Your next note could connect here' : 'No related notes yet'}</h2><p className="mt-3 max-w-sm text-sm leading-relaxed text-[#777]">{noteTooShortForRetrieval ? `Write at least ${MIN_RELEVANCE_DRAFT_CHARS} characters, then save to find related notes.` : !hasOtherNotes ? 'Once you have another note, Ocreda can look for connections.' : 'No notes matched this one yet.'}</p></div></div>}
         </section>}
@@ -1302,8 +1428,8 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
                 onMouseEnter={() => setSelectedNoteId(item.id)}
                 onFocus={() => setSelectedNoteId(item.id)}
                 onClick={() => setSelectedNoteId(item.id)}
-                onDoubleClick={() => void leaveWorkspace(item)}
-                onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === 'Enter') { event.preventDefault(); void leaveWorkspace(item); } }}
+                onDoubleClick={() => void leaveWorkspace(item, false)}
+                onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === 'Enter') { event.preventDefault(); void leaveWorkspace(item, false); } }}
                 aria-label={`${noteLabel(item)}${retrievalReason ? `. Retrieval reason: ${retrievalReason}` : ''}. Double-click or press Enter to open`}
                 title="Double-click to open note"
                 aria-pressed={selectedNote?.id === item.id}
@@ -1326,7 +1452,7 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
                 <div className="mt-2.5 flex items-center justify-between text-[11px] text-[#aaa]"><span className="truncate">Domain: {cleanCategory(item.category) || 'Instant retrieval'}</span><span className="shrink-0">{formatDate(item.created_at)}</span></div>
               </div>;
             })}
-            {!surfacedNotes.length && !retrievalLoading && !retrievalError && !noteTooShortForRetrieval && hasOtherNotes && <p className="px-4 py-12 text-center text-sm leading-relaxed text-[#999]">No related notes found yet.</p>}
+            {!surfacedNotes.length && !retrievalLoading && !retrievalError && !noteTooShortForRetrieval && hasOtherNotes && <p className="px-4 py-12 text-center text-sm leading-relaxed text-[#999]">{retrieval || searchRequested ? 'No related notes found yet.' : 'Not searched yet.'}</p>}
           </div>
           {retrieval?.coverage.complete === false && <p className="mt-4 text-center text-xs text-[#999]">Only some notes could be searched. Results may be incomplete.</p>}
         </aside>}
@@ -1564,7 +1690,7 @@ function InstantRetrievalOverlay({ notes, projects, initialQuery = '', saving, o
   );
 }
 
-type RelevanceSearch = { results: RelevanceResult[]; coverage: RelevanceCoverage; summary?: string };
+type RelevanceSearch = { results: RelevanceResult[]; coverage: RelevanceCoverage; summary?: string; insight?: NoteInsight | null; goal_suggestions?: string[] };
 
 // Five per page rather than ten, so each card has room to preview the note's
 // own text under the explanation instead of only its title.
@@ -1582,6 +1708,87 @@ const RELATION_BADGES: Partial<Record<NoteRelationType, { label: string; classNa
   question: { label: 'Open question', className: 'bg-[#f1eafc] text-[#6b3fc0]' },
   parallel: { label: 'Parallel', className: 'bg-[#e3f4f1] text-[#1b7a6e]' },
 };
+
+const INTENT_LABELS: Record<InsightIntent, string> = {
+  stuck: 'You seem stuck',
+  planning: 'You’re planning',
+  deciding: 'You’re deciding',
+  capturing: 'You’re logging what happened',
+  reflecting: 'You’re thinking it through',
+};
+
+/**
+ * The one thing from past notes that should change what the person does next:
+ * what those notes add, and a step to take. The cited notes are listed so the
+ * claim can be checked against the person's own words.
+ */
+function InsightCard({ insight, notesById, compact = false, showAnchor = true, onSelectNote }: {
+  insight: NoteInsight; notesById: Map<string, Note>; compact?: boolean; showAnchor?: boolean; onSelectNote: (noteId: string) => void;
+}) {
+  const cited = insight.note_ids.map((id) => notesById.get(id)).filter((note): note is Note => note !== undefined);
+  return (
+    <section aria-label="What your notes suggest" className={`rounded-xl border border-[#dbe5fb] bg-white shadow-sm ${compact ? 'p-4' : 'p-6'}`}>
+      <p className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-[0.08em] text-[#477bea]"><Lightbulb className="h-3.5 w-3.5" aria-hidden="true" />{INTENT_LABELS[insight.intent]}</p>
+      {showAnchor && insight.anchor && <blockquote className="mt-3 border-l-2 border-[#f0c85a] pl-3 text-xs italic leading-relaxed text-[#777]">“{insight.anchor}”</blockquote>}
+      <p className={`mt-3 leading-relaxed text-[#222] ${compact ? 'text-[13px]' : 'text-[15px]'}`}>{insight.text}</p>
+      <div className="mt-4 rounded-lg bg-[#eef4ff] px-3 py-2.5">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.09em] text-[#6b8fd8]">Next step</p>
+        <p className="mt-1 text-[13px] leading-relaxed text-[#1f3b73]">{insight.action}</p>
+      </div>
+      {cited.length > 0 && <div className="mt-4">
+        <p className="text-[11px] text-[#999]">From your notes</p>
+        <ul className="mt-1.5 flex flex-wrap gap-1.5">
+          {cited.map((note) => <li key={note.id} className="min-w-0">
+            <button type="button" onClick={() => onSelectNote(note.id)} title={noteLabel(note)} className="block max-w-[240px] truncate rounded-md border border-[#e0e0e0] bg-[#fafafb] px-2 py-1 text-[11px] text-[#555] hover:border-[#8fb1ff] hover:text-[#477bea] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">{noteLabel(note)}</button>
+          </li>)}
+        </ul>
+      </div>}
+    </section>
+  );
+}
+
+// Domains where the person answered "Just logging", so the goal question is not asked again.
+function goalPromptDismissedKey(userId: string): string {
+  return `ocreda-goal-prompt-dismissed:${userId}`;
+}
+
+function readGoalPromptDismissed(userId: string): string[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(goalPromptDismissedKey(userId)) ?? '[]');
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function dismissGoalPrompt(userId: string, domainTitle: string): void {
+  try {
+    const next = [...new Set([...readGoalPromptDismissed(userId), domainTitle.toLowerCase()])];
+    localStorage.setItem(goalPromptDismissedKey(userId), JSON.stringify(next));
+  } catch {
+    // Without storage the question just comes back next time.
+  }
+}
+
+/**
+ * For a Domain with no stated goal: the model's guesses at one, answerable in
+ * a single tap. The pick becomes the Domain's description, which every later
+ * search uses as its goal.
+ */
+function GoalPrompt({ domainTitle, suggestions, onPick, onDismiss }: {
+  domainTitle: string; suggestions: string[]; onPick: (goal: string) => void; onDismiss: () => void;
+}) {
+  return (
+    <section aria-label={`Goal for ${domainTitle}`} className="rounded-xl border border-dashed border-[#d5d9e3] bg-white/60 p-5 text-left">
+      <p className="text-sm font-medium text-[#333]">What’s {domainTitle} for?</p>
+      <p className="mt-1 text-xs leading-relaxed text-[#888]">Pick one and Ocreda will look for notes that move you toward it.</p>
+      <div className="mt-3 flex flex-wrap gap-2">
+        {suggestions.map((goal) => <button key={goal} type="button" onClick={() => onPick(goal)} className="rounded-full border border-[#c9d8fb] bg-[#f4f7ff] px-3 py-1.5 text-xs text-[#315fc5] hover:border-[#477bea] hover:bg-[#e8efff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">{goal}</button>)}
+        <button type="button" onClick={onDismiss} className="rounded-full border border-[#e0e0e0] px-3 py-1.5 text-xs text-[#777] hover:bg-[#f4f4f4] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">Just logging</button>
+      </div>
+    </section>
+  );
+}
 
 /**
  * The tinted annotation under a relevant note, with why-it's-relevant on its
@@ -1732,6 +1939,17 @@ function RelevantNotesPanel({ notes, relevance, loading, progress, error, stale,
           <p className="px-2 py-12 text-center text-sm leading-relaxed text-[#999]">Nothing in your notes connects to this draft yet.</p>
         ) : (
           <div className="space-y-3">
+            {currentPage === 0 && relevance.insight && <InsightCard
+              compact
+              insight={relevance.insight}
+              notesById={noteById}
+              onSelectNote={(noteId) => {
+                const index = results.findIndex((result) => result.note_id === noteId);
+                if (index === -1) return;
+                onPageChange(Math.floor(index / RELEVANCE_PAGE_SIZE));
+                setExpandedId(noteId);
+              }}
+            />}
             {visible.map((result) => {
               const note = noteById.get(result.note_id);
               if (!note) return null;
@@ -1848,13 +2066,17 @@ function NoteEditor({ state, muses, notes, saving, error, onChange, onCreateMuse
     if (draftTooShort || relevanceLoading) return;
     setPanelOpen(true); setRelevanceError(''); setRelevancePage(0);
 
-    const cached = relevanceCache.current.get(draftText);
+    const domain = domainGoalFor(state.muse, muses);
+    const cacheKey = `${domain?.name ?? ''}
+${domain?.goal ?? ''}
+${draftText}`;
+    const cached = relevanceCache.current.get(cacheKey);
     if (cached) { setRelevance(cached); setSearchedDraft(draftText); return; }
 
     setRelevanceProgress(null); setRelevanceLoading(true);
     try {
-      const response = await findRelevantNotes(draftText, state.note?.id ?? null, setRelevanceProgress);
-      relevanceCache.current.set(draftText, response);
+      const response = await findRelevantNotes(draftText, state.note?.id ?? null, setRelevanceProgress, domain);
+      relevanceCache.current.set(cacheKey, response);
       setRelevance(response); setSearchedDraft(draftText);
     } catch (err) {
       setRelevance(null);
@@ -1972,7 +2194,7 @@ function MuseEditor({ state, saving, error, onChange, onClose, onSave }: {
       <div className="relative w-[min(92vw,570px)]">
         <button type="button" onClick={onClose} aria-label="Close Domain editor" className="absolute right-2 top-2 z-10 text-[#777] sm:-right-10 sm:-top-8 sm:text-white"><X className="h-7 w-7" /></button>
         <div className="rounded-xl border-[9px] border-[#f4f4f6] bg-[#f7f7f9] p-2 shadow-2xl">
-          <textarea autoFocus id="muse-description" maxLength={600} value={state.description} onChange={(event) => onChange({ ...state, description: event.target.value })} placeholder={'Describe how you want to use this Domain\n\nE.g: I will use this Domain to collect ideas about business, philosophy, or a project I am building.'} aria-label="Domain description" className="h-[300px] w-full resize-none rounded-lg bg-white p-6 text-base leading-relaxed text-[#555] outline-none placeholder:text-[#aaa]" />
+          <textarea autoFocus id="muse-description" maxLength={600} value={state.description} onChange={(event) => onChange({ ...state, description: event.target.value })} placeholder={'What are you trying to achieve in this Domain?\n\nE.g: Get my first 10 users, validate pricing with beta testers, or understand what makes a habit stick.\n\nOcreda uses this to decide which of your past notes will actually help.'} aria-label="Domain description" className="h-[300px] w-full resize-none rounded-lg bg-white p-6 text-base leading-relaxed text-[#555] outline-none placeholder:text-[#aaa]" />
           <input maxLength={80} value={state.title} onChange={(event) => onChange({ ...state, title: event.target.value })} onKeyDown={(event) => { if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) onSave(); }} placeholder="Title of the Domain" aria-label="Domain title" className="w-full bg-transparent px-4 py-5 text-2xl font-bold text-[#555] outline-none placeholder:text-[#777]" />
         </div>
         <button type="button" onClick={onSave} disabled={saving || !state.title.trim()} className="mx-auto mt-9 flex h-9 w-[180px] max-w-[80vw] items-center justify-center rounded-md bg-[#477bea] text-white hover:bg-[#3d6ed7] disabled:opacity-45">{saving ? <Loader2 className="h-4 w-4 animate-spin" /> : 'Save'}</button>

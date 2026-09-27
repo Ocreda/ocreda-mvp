@@ -12,6 +12,14 @@ const {
   streamRelevanceSearch,
   condenseDraft,
   truncate,
+  buildPrompt,
+  buildInsightPrompt,
+  parseInsightResponse,
+  findAnchor,
+  findInsight,
+  readGoalContext,
+  recentDomainNotes,
+  selectInsightMatches,
 } = require('../.relevance-build/relevance.js');
 
 let passed = 0;
@@ -397,6 +405,159 @@ test('a long draft keeps both the opening and the most recent writing', () => {
 test('truncate only trims past the limit', () => {
   assert.strictEqual(truncate('abc', 10), 'abc');
   assert.strictEqual(truncate('abcdef', 3), 'abc...');
+});
+
+// ------------------------------------------------------------------ goal
+
+test('goal context keeps trimmed strings and drops anything else', () => {
+  assert.deepStrictEqual(readGoalContext({ name: '  Beta  testing ', goal: ' Find users ' }), { domain: 'Beta testing', goal: 'Find users' });
+  assert.deepStrictEqual(readGoalContext({ name: '', goal: 42 }), { domain: null, goal: null });
+  assert.deepStrictEqual(readGoalContext(null), { domain: null, goal: null });
+  assert.strictEqual(readGoalContext({ goal: 'x'.repeat(1000) }).goal.length, 300);
+});
+
+test('the goal appears in the agent prompt only when there is one', () => {
+  const withGoal = buildPrompt('my draft', [note('a')], 'Validate pricing');
+  assert.ok(withGoal.includes('<goal>\nValidate pricing\n</goal>'));
+  assert.ok(!buildPrompt('my draft', [note('a')]).includes('<goal>'));
+});
+
+test('the goal does not disturb the shared prompt prefix that caching relies on', () => {
+  const prefix = (text) => text.slice(0, text.indexOf('<draft>'));
+  assert.strictEqual(prefix(buildPrompt('d', [note('a')], 'Some goal')), prefix(buildPrompt('d', [note('a')])));
+});
+
+// ------------------------------------------------------------------ anchor
+
+test('an anchor is found despite case, spacing and curly quotes', () => {
+  const text = 'Call went well.\nThe tester said she’d  pay $20/month for this.';
+  const span = findAnchor(text, "the tester said she'd pay $20/month");
+  assert.ok(span);
+  assert.strictEqual(text.slice(span.start, span.end), 'The tester said she’d  pay $20/month');
+});
+
+test('an anchor wrapped in quotes or trailing an ellipsis still matches', () => {
+  const text = 'I am struggling to find the first 10 users for the product.';
+  const span = findAnchor(text, '"struggling to find the first 10 users..."');
+  assert.strictEqual(text.slice(span.start, span.end), 'struggling to find the first 10 users');
+});
+
+test('an anchor that is not in the text, or is too short, is rejected', () => {
+  assert.strictEqual(findAnchor('I need more users', 'I need more customers'), null);
+  assert.strictEqual(findAnchor('I need more users', 'more'), null);
+});
+
+// ------------------------------------------------------------------ insight
+
+const DRAFT = 'Tester said she would pay $20/month for this if it synced with Notion.';
+const insightIds = new Set(['n1', 'n2']);
+const parseOpts = (askForGoal = false) => ({ draft: DRAFT, allowedNoteIds: insightIds, askForGoal });
+const insightJson = (over = {}) => JSON.stringify({
+  intent: 'capturing',
+  insight: { anchor: 'she would pay $20/month', text: 'Two testers said $10.', action: 'Ask the next tester to pick $10 or $20.', note_ids: ['n1'], ...over },
+});
+
+test('a well-formed insight is kept, with its anchor taken from the draft itself', () => {
+  const { insight } = parseInsightResponse(insightJson(), parseOpts());
+  assert.strictEqual(insight.anchor, 'she would pay $20/month');
+  assert.strictEqual(insight.intent, 'capturing');
+  assert.deepStrictEqual(insight.note_ids, ['n1']);
+});
+
+test('an explicit null insight is a valid answer', () => {
+  const raw = JSON.stringify({ intent: 'reflecting', insight: null });
+  assert.deepStrictEqual(parseInsightResponse(raw, parseOpts()), { insight: null, goal_suggestions: [] });
+});
+
+test('invented citations are dropped, and an insight with none left is dropped', () => {
+  assert.deepStrictEqual(parseInsightResponse(insightJson({ note_ids: ['n1', 'made-up'] }), parseOpts()).insight.note_ids, ['n1']);
+  assert.strictEqual(parseInsightResponse(insightJson({ note_ids: ['made-up'] }), parseOpts()).insight, null);
+});
+
+test('an insight without an action is dropped rather than shown half-formed', () => {
+  assert.strictEqual(parseInsightResponse(insightJson({ action: '  ' }), parseOpts()).insight, null);
+});
+
+test('a paraphrased anchor keeps the card but loses the highlight', () => {
+  const { insight } = parseInsightResponse(insightJson({ anchor: 'she is willing to spend twenty dollars' }), parseOpts());
+  assert.ok(insight);
+  assert.strictEqual(insight.anchor, '');
+});
+
+test('an unknown intent falls back to "reflecting"', () => {
+  const raw = JSON.stringify({ ...JSON.parse(insightJson()), intent: 'daydreaming' });
+  assert.strictEqual(parseInsightResponse(raw, parseOpts()).insight.intent, 'reflecting');
+});
+
+test('goal suggestions are kept only when asked for, deduplicated and capped at three', () => {
+  const raw = JSON.stringify({ intent: 'capturing', insight: null, goal_suggestions: ['Validate pricing', 'Validate pricing', 'Find users', 'Raise money', 'Hire'] });
+  assert.deepStrictEqual(parseInsightResponse(raw, parseOpts(true)).goal_suggestions, ['Validate pricing', 'Find users', 'Raise money']);
+  assert.deepStrictEqual(parseInsightResponse(raw, parseOpts(false)).goal_suggestions, []);
+});
+
+test('unparseable insight output yields nothing rather than throwing', () => {
+  assert.deepStrictEqual(parseInsightResponse('no json here', parseOpts(true)), { insight: null, goal_suggestions: [] });
+});
+
+const hit = (id, score) => ({ note_id: id, relevance_score: score, relation_type: 'supports', gist: '', explanation: 'why' });
+
+test('only strong matches feed the insight', () => {
+  const matches = selectInsightMatches([hit('a', 0.9), hit('b', 0.69), hit('c', 0.7)], [note('a'), note('b'), note('c')]);
+  assert.deepStrictEqual(matches.map((m) => m.note.id), ['a', 'c']);
+});
+
+test('recent Domain notes are newest first, same Domain only, without the note itself', () => {
+  const notes = [
+    { ...note('old', '2026-01-01'), category: 'Beta' },
+    { ...note('new', '2026-03-01'), category: ' beta ' },
+    { ...note('self', '2026-04-01'), category: 'Beta' },
+    { ...note('other', '2026-05-01'), category: 'Cooking' },
+  ];
+  assert.deepStrictEqual(recentDomainNotes(notes, 'Beta', 'self').map((n) => n.id), ['new', 'old']);
+  assert.deepStrictEqual(recentDomainNotes(notes, null, null), []);
+});
+
+test('the insight prompt asks for goal suggestions only when the Domain has no goal', () => {
+  const base = { draft: 'd', recentNotes: [], matches: [{ note: note('a'), result: hit('a', 0.9) }] };
+  assert.ok(buildInsightPrompt({ ...base, context: { domain: 'Beta', goal: null } }).includes('GOAL_SUGGESTIONS'));
+  assert.ok(!buildInsightPrompt({ ...base, context: { domain: 'Beta', goal: 'Find users' } }).includes('GOAL_SUGGESTIONS'));
+  assert.ok(!buildInsightPrompt({ ...base, context: { domain: null, goal: null } }).includes('GOAL_SUGGESTIONS'));
+});
+
+test('no strong matches means no insight call at all', async () => {
+  let calls = 0;
+  const out = await findInsight({
+    draft: 'd', context: { domain: null, goal: null }, notes: [note('a')], results: [hit('a', 0.6)], excludeNoteId: null,
+    generate: async () => { calls++; return '{}'; },
+  });
+  assert.strictEqual(calls, 0);
+  assert.deepStrictEqual(out, { insight: null, goal_suggestions: [] });
+});
+
+test('stream carries the insight and goal suggestions on "done"', async () => {
+  const events = await readEvents(streamRelevanceSearch(streamOptions({
+    findInsight: async () => ({ insight: null, goal_suggestions: ['Find users'] }),
+  })));
+  const done = events.at(-1);
+  assert.strictEqual(done.type, 'done');
+  assert.strictEqual(done.insight, null);
+  assert.deepStrictEqual(done.goal_suggestions, ['Find users']);
+  assert.strictEqual(done.summary, undefined);
+});
+
+test('a failing insight step still delivers the matches', async () => {
+  const events = await readEvents(streamRelevanceSearch(streamOptions({
+    findInsight: async () => { throw new Error('model down'); },
+  })));
+  const done = events.at(-1);
+  assert.strictEqual(done.type, 'done');
+  assert.ok(done.results.length > 0);
+  assert.strictEqual(done.insight, null);
+});
+
+test('without an insight step, "done" has no insight field at all', async () => {
+  const events = await readEvents(streamRelevanceSearch(streamOptions()));
+  assert.ok(!('insight' in events.at(-1)));
 });
 
 run();

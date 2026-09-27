@@ -44,6 +44,29 @@ export interface NoteLike {
   raw_text: string;
   summary: string | null;
   created_at: string;
+  /** The note's Domain name. Only read when building an insight's context. */
+  category?: string | null;
+}
+
+/**
+ * What the person is working toward in the Domain the draft belongs to. The
+ * goal is the Domain's description, which lives in the browser, so the caller
+ * sends it with each search rather than the server reading it.
+ */
+export interface GoalContext {
+  domain: string | null;
+  goal: string | null;
+}
+
+export const MAX_GOAL_CHARS = 300;
+export const MAX_DOMAIN_NAME_CHARS = 80;
+
+/** Cleans a caller-supplied goal context. Anything malformed becomes null. */
+export function readGoalContext(raw: unknown): GoalContext {
+  const row = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const clean = (value: unknown, limit: number) =>
+    typeof value === "string" && value.trim() ? value.trim().replace(/\s+/g, " ").slice(0, limit) : null;
+  return { domain: clean(row.name, MAX_DOMAIN_NAME_CHARS), goal: clean(row.goal, MAX_GOAL_CHARS) };
 }
 
 export interface RelevanceResult {
@@ -86,12 +109,16 @@ export function dealIntoChunks<T>(items: T[], chunkCount: number): T[][] {
  * The instructions come first and the draft and notes last, so that every agent
  * in a fan-out sends an identical multi-thousand-character prefix. That is what
  * makes the provider's implicit prefix caching usable; putting the variable
- * content first would give the calls nothing in common to cache.
+ * content first would give the calls nothing in common to cache. The goal is
+ * variable too, so it sits beside the draft; only its instructions are fixed.
  */
-export function buildPrompt(draft: string, notes: NoteLike[]): string {
+export function buildPrompt(draft: string, notes: NoteLike[], goal: string | null = null): string {
   const candidates = notes
     .map((note) => `ID: ${note.id}\n${truncate((note.summary || note.raw_text).trim(), MAX_NOTE_CHARS)}`)
     .join("\n\n---\n\n");
+  const goalBlock = goal
+    ? `\n\nWhat they are working toward in this area:\n<goal>\n${goal}\n</goal>`
+    : "";
 
   return `You will be given a draft that someone is writing, followed by a set of notes from their knowledge base. Decide which of those notes are genuinely relevant to the draft, and score each one on its own merits.
 
@@ -105,6 +132,8 @@ Score the strength of the connection, NOT how similar the subject matter is. A n
 0.70-0.89 - A clear, specific connection that adds something real: evidence, a concrete example, a counterweight, an unresolved snag, or a pattern the draft turns out to be an instance of.
 0.50-0.69 - A real but looser connection: it shares the draft's underlying concern or stance and is worth having nearby, without changing anything.
 Below 0.50 - Leave it out of your response entirely.
+
+GOAL - you may also be told what the person is working toward in this area. When you are, a note that would help them toward it - a past attempt and how it went, advice they recorded, a decision they made, a fact that changes the picture - deserves a higher score than one that is merely on the same subject. Never include a note only because it matches the goal; it must still bear on the draft.
 
 RELATION TYPE - pick exactly one:
 "supports" - the note gives grounds for what the draft says or feels: evidence, an example, a lived experience, or reasoning that makes it sturdier.
@@ -122,6 +151,7 @@ Do the thinking for them: spell the connection out rather than gesturing at it. 
 CRITICAL RULES:
 - Many candidate notes will be irrelevant. Returning [] is correct when nothing connects. Do not pad your response.
 - Never include a note merely because it shares words, names, or a broad category with the draft. The connection must be about substance.
+- Leave out echoes. A note that says what the draft already says, without adding a fact, example, outcome, consequence, or counterpoint the draft lacks, tells the person nothing new however close the topic is. A note is not an echo if it shows the same thing actually happening, or happening before.
 - A "parallel" must name the specific shared structure. An abstraction that both notes merely belong to - "both are about time", "both express awe" - is not a parallel. If the same explanation could be written about a dozen other pairs of notes, leave the note out.
 - Use the exact ID string as given. Never invent an ID, and never return one that is not listed above.
 
@@ -138,7 +168,7 @@ OUTPUT - a JSON array and nothing else, in this shape:
 Here is the draft:
 <draft>
 ${draft}
-</draft>
+</draft>${goalBlock}
 
 Here are the candidate notes:
 
@@ -244,6 +274,8 @@ async function runWithConcurrency<T, R>(
 export interface RunAgentsOptions {
   draft: string;
   notes: NoteLike[];
+  /** The Domain's stated goal, if the person gave one. */
+  goal?: string | null;
   agentCount: number;
   concurrency: number;
   /** Injected so this module stays free of any particular model client. */
@@ -261,11 +293,11 @@ export interface RunAgentsOptions {
 export async function runRelevanceAgents(
   options: RunAgentsOptions
 ): Promise<{ chunks: NoteLike[][]; outcomes: AgentOutcome[] }> {
-  const { draft, notes, agentCount, concurrency, generate, isRetryable, onAgentSettled } = options;
+  const { draft, notes, goal, agentCount, concurrency, generate, isRetryable, onAgentSettled } = options;
   const chunks = dealIntoChunks(notes, agentCount);
 
   const settled = await runWithConcurrency(chunks, concurrency, async (chunk, index) => {
-    const prompt = buildPrompt(draft, chunk);
+    const prompt = buildPrompt(draft, chunk, goal ?? null);
     const allowedIds = new Set(chunk.map((n) => n.id));
     // Reported the moment this agent finishes rather than after all of them, so
     // a caller can show progress while the rest are still running. Called
@@ -336,6 +368,282 @@ export function mergeAgentResults(
   return { results, notesSearched };
 }
 
+// ------------------------------------------------------------------ insight
+
+/**
+ * What the draft is doing. It shapes which kind of action is useful: a way
+ * forward when stuck, a missing consideration when deciding, a follow-up when
+ * logging what happened.
+ */
+export const INSIGHT_INTENTS = ["stuck", "planning", "deciding", "capturing", "reflecting"] as const;
+export type InsightIntent = (typeof INSIGHT_INTENTS)[number];
+
+/**
+ * The one thing from the person's past notes that should change what they do
+ * next, tied to the passage of the draft it is about.
+ */
+export interface Insight {
+  /** Verbatim text from the draft. Empty when the model's quote was not found in it. */
+  anchor: string;
+  intent: InsightIntent;
+  /** What their past notes add, in one or two sentences. */
+  text: string;
+  /** One concrete next step. */
+  action: string;
+  /** The notes the insight rests on; always a subset of the search results. */
+  note_ids: string[];
+}
+
+export interface InsightOutcome {
+  /** null means nothing in the notes would change their next step. */
+  insight: Insight | null;
+  /** Guesses at the Domain's goal, only when it has none. */
+  goal_suggestions: string[];
+}
+
+/** Only strong matches are worth building an insight on. */
+export const INSIGHT_MIN_SCORE = 0.7;
+export const MAX_INSIGHT_NOTES = 6;
+export const MAX_DOMAIN_CONTEXT_NOTES = 10;
+const MAX_CONTEXT_NOTE_CHARS = 200;
+const MAX_ANCHOR_CHARS = 240;
+const MIN_ANCHOR_CHARS = 8;
+const MAX_INSIGHT_TEXT_CHARS = 420;
+const MAX_ACTION_CHARS = 260;
+const MAX_GOAL_SUGGESTION_CHARS = 60;
+const MAX_GOAL_SUGGESTIONS = 3;
+
+/** Folds the differences a model introduces when it copies text: case, curly quotes, dashes. */
+function foldChar(ch: string): string {
+  if (ch === "‘" || ch === "’") return "'";
+  if (ch === "“" || ch === "”") return '"';
+  if (ch === "–" || ch === "—") return "-";
+  return ch.toLowerCase();
+}
+
+/** Lowercased, whitespace-collapsed text, with a map back to original offsets. */
+function foldWithMap(text: string): { folded: string; map: number[] } {
+  let folded = "";
+  const map: number[] = [];
+  let lastWasSpace = true;
+  for (let i = 0; i < text.length; i++) {
+    const isSpace = /\s/.test(text[i]);
+    if (isSpace && lastWasSpace) continue;
+    folded += isSpace ? " " : foldChar(text[i]);
+    map.push(i);
+    lastWasSpace = isSpace;
+  }
+  return { folded, map };
+}
+
+/**
+ * Locates a quoted passage in the text it was quoted from, forgiving case,
+ * spacing, curly quotes, and a stray wrapping quote or ellipsis. Returns
+ * offsets into the original text, or null when the quote is not really there.
+ */
+export function findAnchor(text: string, anchor: string): { start: number; end: number } | null {
+  const trimmed = anchor.trim().replace(/^["'“‘.…\s]+|["'”’…\s]+$/g, "").replace(/\.{3}$/, "").trim();
+  if (trimmed.length < MIN_ANCHOR_CHARS) return null;
+  const needle = foldWithMap(trimmed).folded.trim();
+  const { folded, map } = foldWithMap(text);
+  const at = folded.indexOf(needle);
+  if (at === -1) return null;
+  return { start: map[at], end: map[at + needle.length - 1] + 1 };
+}
+
+export interface InsightMatch {
+  note: NoteLike;
+  result: RelevanceResult;
+}
+
+/** The strongest matches, in rank order, that an insight may draw on. */
+export function selectInsightMatches(results: RelevanceResult[], notes: NoteLike[]): InsightMatch[] {
+  const byId = new Map(notes.map((note) => [note.id, note]));
+  return results
+    .filter((result) => result.relevance_score >= INSIGHT_MIN_SCORE && byId.has(result.note_id))
+    .slice(0, MAX_INSIGHT_NOTES)
+    .map((result) => ({ note: byId.get(result.note_id)!, result }));
+}
+
+/**
+ * The Domain's most recent notes, newest first. When the person has not stated
+ * a goal, these are the best evidence of what they are working on.
+ */
+export function recentDomainNotes(notes: NoteLike[], domain: string | null, excludeId: string | null): NoteLike[] {
+  if (!domain) return [];
+  const key = domain.trim().toLowerCase();
+  return notes
+    .filter((note) => note.id !== excludeId && (note.category ?? "").trim().toLowerCase() === key)
+    .sort((a, b) => b.created_at.localeCompare(a.created_at))
+    .slice(0, MAX_DOMAIN_CONTEXT_NOTES);
+}
+
+export interface InsightPromptInput {
+  draft: string;
+  context: GoalContext;
+  recentNotes: NoteLike[];
+  matches: InsightMatch[];
+}
+
+export function buildInsightPrompt({ draft, context, recentNotes, matches }: InsightPromptInput): string {
+  const askForGoal = Boolean(context.domain && !context.goal);
+  const recent = recentNotes.length
+    ? recentNotes
+      .map((note) => `- ${note.created_at.slice(0, 10)}: ${truncate((note.summary || note.raw_text).trim().replace(/\s+/g, " "), MAX_CONTEXT_NOTE_CHARS)}`)
+      .join("\n")
+    : "(none)";
+  const related = matches
+    .map(({ note, result }) =>
+      `ID: ${note.id}\nWritten: ${note.created_at.slice(0, 10)}\nHow it relates: ${result.relation_type} - ${result.explanation}\n${truncate(note.raw_text.trim(), MAX_NOTE_CHARS)}`)
+    .join("\n\n---\n\n");
+
+  return `Someone is writing a note. You have the past notes of theirs that relate to it. Decide whether anything in those past notes should change what they do next, and if so, tell them in one short card.
+
+INTENT - first work out what the note is doing. Pick exactly one:
+"stuck" - they describe a problem they have not solved.
+"planning" - they are laying out what they will do.
+"deciding" - they are weighing options, or have just chosen.
+"capturing" - they are logging what happened or what someone said.
+"reflecting" - they are thinking something through, with no action in view.
+
+WHAT COUNTS AS USEFUL - one of these, taken from their past notes:
+- a past attempt at the same thing, and how it went
+- advice they recorded from a book, a person, or another source
+- a decision or conclusion they reached before, especially one this note contradicts or seems to have forgotten
+- a pattern across several notes that this note is another instance of
+- a number or fact that changes the picture
+A past note that says the same thing as the draft is NOT useful. Reminding someone of what they just wrote is worthless, however on-topic it is.
+
+GOAL - if they have said what they are working toward in this area, use it to decide what helps. If not, infer it from the draft and their recent notes in the area. If you still cannot tell, offer only something that helps whatever the goal is: a contradiction, a repeated pattern, or a hard number.
+
+If nothing clears that bar, set "insight" to null. That is a normal, frequent, and correct answer. Do not stretch.
+
+When something does:
+ANCHOR - copy, word for word, the shortest phrase or sentence from the note being written that your insight is about, at most 25 words. Copy it exactly: do not paraphrase, fix typos, or add quotation marks.
+TEXT - one or two plain sentences saying what their past notes add. Name the specifics: people, numbers, what happened. Do not restate the note being written.
+ACTION - one concrete next step, starting with a verb, that they could do this week. Fit it to the intent: for "stuck", a way forward; for "planning", something to add or check; for "deciding", the consideration they are missing; for "capturing", what to do with this (a follow-up, a question for next time); for "reflecting", a question worth answering. Never generic advice like "keep going" or "reflect on this".
+NOTE_IDS - the IDs of the past notes your insight rests on, only from the list given.
+${askForGoal ? `
+GOAL_SUGGESTIONS - they have not said what this area is for. Offer 2 or 3 short guesses at it, 2 to 6 words each and starting with a verb ("Validate pricing", "Find first 10 users"), based on the note and their recent notes in the area. Include these even when insight is null.
+` : ""}
+VOICE - these are their own notes. Speak to them as "you", like a friend who remembers everything they have written. Plain words, no jargon. Never say "the user", "the author", or "this note highlights".
+
+OUTPUT - a JSON object and nothing else, in this shape:
+{"intent": "<stuck|planning|deciding|capturing|reflecting>", "insight": null${askForGoal ? ', "goal_suggestions": ["<guess>"]' : ""}}
+or
+{"intent": "<...>", "insight": {"anchor": "<exact quote>", "text": "<one or two sentences>", "action": "<one step>", "note_ids": ["<id>"]}${askForGoal ? ', "goal_suggestions": ["<guess>"]' : ""}}
+
+========================================
+
+Area: ${context.domain ?? "(none)"}
+What they are working toward in this area: ${context.goal ?? "(not stated)"}
+
+Their most recent notes in this area:
+${recent}
+
+The note they are writing:
+<note>
+${draft}
+</note>
+
+Their related past notes:
+
+${related}
+
+Now respond with ONLY the JSON object described above.`;
+}
+
+/** Pulls a JSON object out of a model response, tolerating a fence or prose around it. */
+function extractJsonObject(raw: string): string | null {
+  const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+  const candidate = fenced ? fenced[1] : raw;
+  const bare = candidate.match(/\{[\s\S]*\}/);
+  return bare ? bare[0] : null;
+}
+
+function cleanLine(value: unknown, limit: number): string {
+  return typeof value === "string" ? truncate(value.trim().replace(/\s+/g, " "), limit) : "";
+}
+
+/**
+ * Turns the insight model's reply into something safe to show. An insight
+ * without text, an action, or a single real citation is dropped rather than
+ * shown half-formed. A quote that is not actually in the draft only loses its
+ * highlight, since the card is still worth showing.
+ */
+export function parseInsightResponse(
+  raw: string,
+  { draft, allowedNoteIds, askForGoal }: { draft: string; allowedNoteIds: Set<string>; askForGoal: boolean },
+): InsightOutcome {
+  const empty: InsightOutcome = { insight: null, goal_suggestions: [] };
+  const jsonText = extractJsonObject(raw);
+  if (!jsonText) return empty;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    return empty;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return empty;
+  const row = parsed as Record<string, unknown>;
+
+  const goalSuggestions = askForGoal && Array.isArray(row.goal_suggestions)
+    ? [...new Set(row.goal_suggestions.map((item) => cleanLine(item, MAX_GOAL_SUGGESTION_CHARS)).filter(Boolean))]
+      .slice(0, MAX_GOAL_SUGGESTIONS)
+    : [];
+
+  const intent = INSIGHT_INTENTS.includes(row.intent as InsightIntent) ? (row.intent as InsightIntent) : "reflecting";
+  const card = row.insight && typeof row.insight === "object" && !Array.isArray(row.insight)
+    ? (row.insight as Record<string, unknown>)
+    : null;
+  if (!card) return { insight: null, goal_suggestions: goalSuggestions };
+
+  const text = cleanLine(card.text, MAX_INSIGHT_TEXT_CHARS);
+  const action = cleanLine(card.action, MAX_ACTION_CHARS);
+  const noteIds = Array.isArray(card.note_ids)
+    ? [...new Set(card.note_ids.filter((id): id is string => typeof id === "string" && allowedNoteIds.has(id)))]
+    : [];
+  if (!text || !action || noteIds.length === 0) return { insight: null, goal_suggestions: goalSuggestions };
+
+  const quoted = typeof card.anchor === "string" ? card.anchor : "";
+  const span = findAnchor(draft, quoted.slice(0, MAX_ANCHOR_CHARS * 2));
+  const anchor = span && span.end - span.start <= MAX_ANCHOR_CHARS ? draft.slice(span.start, span.end) : "";
+
+  return { insight: { anchor, intent, text, action, note_ids: noteIds }, goal_suggestions: goalSuggestions };
+}
+
+export interface FindInsightOptions {
+  draft: string;
+  context: GoalContext;
+  /** Every note that was searched, so matches and the Domain's recent notes can be looked up. */
+  notes: NoteLike[];
+  results: RelevanceResult[];
+  excludeNoteId: string | null;
+  /** Injected so this module stays free of any particular model client. */
+  generate: (prompt: string) => Promise<string>;
+}
+
+/**
+ * The step that replaces the combined summary: one model call over the strong
+ * matches. Skipped entirely, at no cost, when nothing matched strongly enough.
+ */
+export async function findInsight(options: FindInsightOptions): Promise<InsightOutcome> {
+  const { draft, context, notes, results, excludeNoteId, generate } = options;
+  const matches = selectInsightMatches(results, notes);
+  if (!matches.length) return { insight: null, goal_suggestions: [] };
+  const prompt = buildInsightPrompt({
+    draft,
+    context,
+    recentNotes: recentDomainNotes(notes, context.domain, excludeNoteId),
+    matches,
+  });
+  return parseInsightResponse(await generate(prompt), {
+    draft,
+    allowedNoteIds: new Set(matches.map((match) => match.note.id)),
+    askForGoal: Boolean(context.domain && !context.goal),
+  });
+}
+
 /**
  * One line of the newline-delimited JSON stream a caller gets when it asks for
  * progress. "start" and "progress" drive the loading UI; exactly one "done" or
@@ -349,6 +657,9 @@ export type RelevanceStreamEvent =
       results: RelevanceResult[];
       coverage: { notes_searched: number; notes_total: number; complete: boolean };
       summary?: string;
+      /** Present whenever an insight step ran; null means it found nothing worth saying. */
+      insight?: Insight | null;
+      goal_suggestions?: string[];
     }
   | { type: "error"; error: string };
 
@@ -356,6 +667,8 @@ export interface StreamSearchOptions extends Omit<RunAgentsOptions, "onAgentSett
   maxResults: number;
   /** Optional synthesis of the final matches; failure must not hide the matches. */
   summarize?: (results: RelevanceResult[]) => Promise<string>;
+  /** Optional insight from the final matches; like the summary, failure must not hide the matches. */
+  findInsight?: (results: RelevanceResult[]) => Promise<InsightOutcome>;
   /** Shown when every agent failed, which would otherwise read as "nothing related". */
   allFailedMessage: string;
   /** Shown when the search throws outright; the error itself goes to onError. */
@@ -369,7 +682,7 @@ export interface StreamSearchOptions extends Omit<RunAgentsOptions, "onAgentSett
  * so the Deno Edge Function and the Node dev route can both return it as is.
  */
 export function streamRelevanceSearch(options: StreamSearchOptions): ReadableStream<Uint8Array> {
-  const { maxResults, summarize, allFailedMessage, failedMessage, onError, ...agentOptions } = options;
+  const { maxResults, summarize, findInsight, allFailedMessage, failedMessage, onError, ...agentOptions } = options;
   const encoder = new TextEncoder();
 
   return new ReadableStream<Uint8Array>({
@@ -400,14 +713,24 @@ export function streamRelevanceSearch(options: StreamSearchOptions): ReadableStr
         if (notesSearched === 0) {
           send({ type: "error", error: allFailedMessage });
         } else {
-          const summary = results.length && summarize
-            ? await summarize(results).catch((error) => { onError?.(error); return ""; })
-            : "";
+          // Both follow-ups read the same matches, so run them side by side.
+          const [summary, outcome] = await Promise.all([
+            results.length && summarize
+              ? summarize(results).catch((error) => { onError?.(error); return ""; })
+              : Promise.resolve(""),
+            findInsight
+              ? findInsight(results).catch((error): InsightOutcome => {
+                onError?.(error);
+                return { insight: null, goal_suggestions: [] };
+              })
+              : Promise.resolve(null),
+          ]);
           send({
             type: "done",
             results,
             coverage: { notes_searched: notesSearched, notes_total: notesTotal, complete: notesSearched === notesTotal },
             ...(summary ? { summary } : {}),
+            ...(outcome ? { insight: outcome.insight, goal_suggestions: outcome.goal_suggestions } : {}),
           });
         }
       } catch (error) {

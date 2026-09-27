@@ -47,6 +47,52 @@ export interface GeminiGeneration {
    * half sentence check this and fall back.
    */
   truncated: boolean;
+  /** Token counts OpenRouter reported for this call, or null if it sent none. */
+  usage: TokenUsage | null;
+}
+
+/**
+ * For operator cost tracking only. It is written to the function logs and must
+ * never be returned to the client.
+ */
+export interface TokenUsage {
+  calls: number;
+  inputTokens: number;
+  /** Includes reasoning tokens; they are billed as output. */
+  outputTokens: number;
+  reasoningTokens: number;
+  cachedInputTokens: number;
+  /** OpenRouter's own billed figure in USD, when it reports one. */
+  costUsd: number;
+}
+
+export function emptyTokenUsage(): TokenUsage {
+  return { calls: 0, inputTokens: 0, outputTokens: 0, reasoningTokens: 0, cachedInputTokens: 0, costUsd: 0 };
+}
+
+export function addTokenUsage(total: TokenUsage, usage: TokenUsage | null): void {
+  if (!usage) return;
+  total.calls += usage.calls;
+  total.inputTokens += usage.inputTokens;
+  total.outputTokens += usage.outputTokens;
+  total.reasoningTokens += usage.reasoningTokens;
+  total.cachedInputTokens += usage.cachedInputTokens;
+  total.costUsd += usage.costUsd;
+}
+
+function readUsage(raw: unknown): TokenUsage | null {
+  if (!raw || typeof raw !== "object") return null;
+  const usage = raw as Record<string, unknown>;
+  const num = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : 0);
+  const details = (key: string) => (usage[key] ?? {}) as Record<string, unknown>;
+  return {
+    calls: 1,
+    inputTokens: num(usage.prompt_tokens),
+    outputTokens: num(usage.completion_tokens),
+    reasoningTokens: num(details("completion_tokens_details").reasoning_tokens),
+    cachedInputTokens: num(details("prompt_tokens_details").cached_tokens),
+    costUsd: num(usage.cost),
+  };
 }
 
 export async function generateWithGemini(
@@ -83,6 +129,8 @@ export async function generateWithGeminiResult(
       ...(generationConfig?.responseMimeType === "application/json"
         ? { response_format: { type: "json_object" } }
         : {}),
+      // Asks OpenRouter to include the billed cost alongside the token counts.
+      usage: { include: true },
     }),
   });
 
@@ -96,6 +144,7 @@ export async function generateWithGeminiResult(
   return {
     text: choice?.message?.content ?? "",
     truncated: choice?.finish_reason === "length",
+    usage: readUsage(data.usage),
   };
 }
 
