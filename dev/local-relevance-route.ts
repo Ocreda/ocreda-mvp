@@ -2,6 +2,8 @@ import { NextResponse } from 'next/server';
 import {
   condenseDraft,
   findInsight,
+  insightFields,
+  FAILED_INSIGHT,
   mergeAgentResults,
   readGoalContext,
   runRelevanceAgents,
@@ -27,7 +29,7 @@ import { generateWithGemini, isRetryableGeminiError } from '@/supabase/functions
  */
 
 
-const MAX_RESULTS = 50;
+const MAX_RESULTS = 10;
 const MAX_NOTES = 1000;
 
 const INSIGHT_SYSTEM_PROMPT =
@@ -165,12 +167,11 @@ export async function POST(request: Request) {
 
     const outcome = await insightFor(results).catch((error) => {
       console.error('[local] insight failed:', error instanceof Error ? error.message : error);
-      return { insight: null, goal_suggestions: [] };
+      return FAILED_INSIGHT;
     });
     return NextResponse.json({
       results,
-      insight: outcome.insight,
-      goal_suggestions: outcome.goal_suggestions,
+      ...insightFields(outcome),
       coverage: {
         notes_searched: notesSearched,
         notes_total: notes.length,

@@ -1,7 +1,7 @@
 'use client';
 
 import Link from 'next/link';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, ArrowUp, Bold, Check, ChevronDown, ChevronLeft, ChevronRight, Filter, FolderPlus, Grid2X2, Italic, Layers3, Lightbulb, List, ListOrdered, Loader as Loader2, Mic, MoreHorizontal, PanelRightOpen, Pin, Plus, RefreshCw, Rows3, ScanSearch, Search, Trash2, Upload, X } from 'lucide-react';
 import type { RelevanceProgress } from '@/lib/types';
 import NoteImporter, { ImportDomainDraft, ImportNoteDraft } from '@/components/NoteImporter';
@@ -97,7 +97,9 @@ function stableHash(value: string): number {
 // so notes opened before the change are retrieved again instead of showing the
 // old text. v2: summaries and gists speak to the user in the second person.
 // v3: results carry a goal-aware insight, and the goal is part of the signature.
-const SAVED_RETRIEVAL_VERSION = 'v3';
+// v4: up to three insights, and relations gain helps and solves.
+// v5: every match says which way help flows (inbound or outbound).
+const SAVED_RETRIEVAL_VERSION = 'v5';
 
 function savedRetrievalKey(userId: string, noteId: string): string {
   return `ocreda-saved-retrieval:${SAVED_RETRIEVAL_VERSION}:${userId}:${noteId}`;
@@ -1174,11 +1176,8 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
   const [searchRequest, setSearchRequest] = useState<KnowledgeSearchRequest | null>(null);
   const [instantRetrievalOpen, setInstantRetrievalOpen] = useState(false);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
-  const [insightPopover, setInsightPopover] = useState<{ top: number; left: number; width: number } | null>(null);
+  const [selectedInsightIndex, setSelectedInsightIndex] = useState(0);
   const bodyRef = useRef<HTMLTextAreaElement>(null);
-  const articleRef = useRef<HTMLElement>(null);
-  const anchorRef = useRef<HTMLElement>(null);
-  const popoverRef = useRef<HTMLDivElement>(null);
   const latestSaveRef = useRef(onUpdate);
   latestSaveRef.current = onUpdate;
   const muse = cleanCategory(note.category) || 'Instant retrieval';
@@ -1223,7 +1222,12 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
       ? findRelevantNotes(note.raw_text, note.id, onProgress, domainName ? { name: domainName, goal: goalText } : null)
       : findSimilarNotes(note.raw_text, note.id, onProgress, allNotes);
     search
-      .then((response) => { if (active) { setRetrieval(response); persistSavedRetrieval(userId, note, goalText, retrievalMode, response); } })
+      .then((response) => {
+        if (!active) return;
+        setRetrieval(response);
+        // A failed insight step is not saved, so opening the note again retries it.
+        if (!response.insight_failed) persistSavedRetrieval(userId, note, goalText, retrievalMode, response);
+      })
       .catch((err) => { if (active) setRetrievalError(safeErrorMessage(err, 'Could not retrieve related notes.')); })
       .finally(() => { if (active) setRetrievalLoading(false); });
     return () => { active = false; };
@@ -1231,7 +1235,7 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
 
   const surfacedNotes = useMemo(() => {
     const notesById = new Map(allNotes.map((item) => [item.id, item]));
-    return (retrieval?.results ?? []).map((result) => notesById.get(result.note_id)).filter((item): item is Note => item !== undefined && item.id !== note.id).slice(0, 8);
+    return (retrieval?.results ?? []).map((result) => notesById.get(result.note_id)).filter((item): item is Note => item !== undefined && item.id !== note.id).slice(0, 10);
   }, [allNotes, note.id, retrieval]);
 
   useEffect(() => {
@@ -1250,41 +1254,34 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
     .map((result) => result.gist.trim() || noteById.get(result.note_id)?.summary?.trim() || '')
     .filter(Boolean);
 
-  const insight = retrieval?.insight ?? null;
+  const insights = useMemo(() => retrieval?.insights ?? [], [retrieval]);
+  const insight = insights[Math.min(selectedInsightIndex, insights.length - 1)] ?? null;
   const displayedBody = body || note.raw_text;
-  // Only highlight text the reader can see, and never while it is being edited.
-  const anchorSpan = !editing && insight?.anchor ? findAnchor(displayedBody, insight.anchor) : null;
+  // One highlight per insight whose passage is visible, in reading order.
+  // Never while editing, and never two on overlapping text.
+  const highlights = useMemo(() => {
+    if (editing) return [];
+    const found: { start: number; end: number; index: number }[] = [];
+    insights.forEach((item, index) => {
+      const span = item.anchor ? findAnchor(displayedBody, item.anchor) : null;
+      if (span && !found.some((taken) => span.start < taken.end && taken.start < span.end)) found.push({ ...span, index });
+    });
+    return found.sort((x, y) => x.start - y.start);
+  }, [displayedBody, editing, insights]);
 
-  // The popover belongs to one search's insight; a new search or editing closes it.
-  useEffect(() => { setInsightPopover(null); }, [insight, editing]);
+  // A new search starts back on its strongest insight.
+  useEffect(() => { setSelectedInsightIndex(0); }, [retrieval]);
 
-  useEffect(() => {
-    if (!insightPopover) return;
-    const close = (event: MouseEvent | KeyboardEvent) => {
-      if (event instanceof KeyboardEvent) {
-        if (event.key !== 'Escape') return;
-        setInsightPopover(null);
-        anchorRef.current?.focus();
-        return;
-      }
-      const target = event.target as Node;
-      if (!popoverRef.current?.contains(target) && !anchorRef.current?.contains(target)) setInsightPopover(null);
-    };
-    document.addEventListener('mousedown', close);
-    document.addEventListener('keydown', close);
-    return () => { document.removeEventListener('mousedown', close); document.removeEventListener('keydown', close); };
-  }, [insightPopover]);
+  /** The relation of an insight's strongest cited note, so its highlight says what it opens. */
+  const relationOf = (item: NoteInsight) => item.note_ids.map((id) => relevanceByNoteId.get(id)?.relation_type).find(Boolean) ?? null;
+  /** The insight rests only on notes this one helps, so its card points at where the lesson applies. */
+  const isOutbound = (item: NoteInsight) => item.note_ids.every((id) => relevanceByNoteId.get(id)?.direction === 'outbound');
 
-  const toggleInsightPopover = () => {
-    if (insightPopover) { setInsightPopover(null); return; }
-    const anchorEl = anchorRef.current; const article = articleRef.current;
-    if (!anchorEl || !article) return;
-    // Sit under the last line of the highlight, which may wrap across several.
-    const lines = anchorEl.getClientRects();
-    const line = lines[lines.length - 1] ?? anchorEl.getBoundingClientRect();
-    const box = article.getBoundingClientRect();
-    const width = Math.min(380, box.width);
-    setInsightPopover({ top: line.bottom - box.top + 8, left: Math.max(0, Math.min(line.left - box.left, box.width - width)), width });
+  const selectInsight = (index: number) => {
+    setSelectedInsightIndex(index);
+    setSummaryOpen(true);
+    // Below xl the card sits under the note, so bring it into view.
+    requestAnimationFrame(() => document.getElementById('note-summary-panel')?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }));
   };
 
   const showCitedNote = (noteId: string) => { setNotesOpen(true); setSelectedNoteId(noteId); };
@@ -1364,28 +1361,27 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
             {!summaryOpen && <button type="button" onClick={() => setNotesOpen((open) => !open)} aria-controls="related-notes-panel" aria-expanded={notesOpen} className="rounded-md border border-[#dedede] bg-white px-3 py-1.5 text-xs text-[#555] shadow-sm hover:border-[#adc3ff] hover:text-[#477bea] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">{notesOpen ? 'Hide notes' : 'See notes'}</button>}
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto px-7 pb-24 pt-12 sm:px-12 xl:px-[8%]">
-            {editing ? <div className="mx-auto max-w-3xl"><input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} aria-label="Note title" placeholder="Title (optional)" className="w-full bg-transparent text-2xl font-semibold outline-none placeholder:font-normal placeholder:text-[#c4c4c6]" /><textarea ref={bodyRef} value={body} onChange={(event) => setBody(event.target.value)} aria-label="Note text" className="mt-10 min-h-[520px] w-full resize-none bg-transparent text-base leading-[1.7] outline-none" /></div> : <article ref={articleRef} className="relative mx-auto max-w-3xl">{title.trim() && <button type="button" onClick={() => setEditing(true)} className="block w-full rounded-md px-2 py-1 text-left outline-none hover:bg-[#f8f8f8] focus-visible:ring-2 focus-visible:ring-[#477bea]/20"><h1 className="break-words text-2xl font-semibold">{title}</h1></button>}<div className="mt-2 flex flex-wrap gap-x-3 px-2 text-xs text-[#999]"><NoteDomainPicker category={note.category} muses={muses} saving={saving} onChange={onChangeDomain} showPrefix /><button type="button" onClick={openDate} className="hover:text-[#477bea]">{fullNoteDate(note.created_at)}</button></div>{/* A div rather than a <button>, because the highlighted passage inside it is itself clickable. */}
-<div role="button" tabIndex={0} onClick={() => { setEditing(true); requestAnimationFrame(() => bodyRef.current?.focus()); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === 'Enter') { event.preventDefault(); setEditing(true); requestAnimationFrame(() => bodyRef.current?.focus()); } }} aria-label="Edit note text" className="mt-9 block w-full cursor-text rounded-md px-2 py-2 text-left text-base leading-[1.7] outline-none hover:bg-[#f8f8f8] focus-visible:ring-2 focus-visible:ring-[#477bea]/20"><span className="whitespace-pre-wrap break-words">{anchorSpan && insight ? <>
-  {displayedBody.slice(0, anchorSpan.start)}
-  <mark
-    ref={anchorRef}
-    role="button"
-    tabIndex={0}
-    onClick={(event) => { event.stopPropagation(); toggleInsightPopover(); }}
-    onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); toggleInsightPopover(); } }}
-    aria-expanded={Boolean(insightPopover)}
-    aria-haspopup="dialog"
-    title="See what your notes say about this"
-    className="cursor-pointer rounded-sm bg-[#fff1c2] px-0.5 text-inherit underline decoration-[#e3b341] decoration-2 underline-offset-4 [box-decoration-break:clone] hover:bg-[#ffe699] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]"
-  >{displayedBody.slice(anchorSpan.start, anchorSpan.end)}</mark>
-  {displayedBody.slice(anchorSpan.end)}
+            {editing ? <div className="mx-auto max-w-3xl"><input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} aria-label="Note title" placeholder="Title (optional)" className="w-full bg-transparent text-2xl font-semibold outline-none placeholder:font-normal placeholder:text-[#c4c4c6]" /><textarea ref={bodyRef} value={body} onChange={(event) => setBody(event.target.value)} aria-label="Note text" className="mt-10 min-h-[520px] w-full resize-none bg-transparent text-base leading-[1.7] outline-none" /></div> : <article className="relative mx-auto max-w-3xl">{title.trim() && <button type="button" onClick={() => setEditing(true)} className="block w-full rounded-md px-2 py-1 text-left outline-none hover:bg-[#f8f8f8] focus-visible:ring-2 focus-visible:ring-[#477bea]/20"><h1 className="break-words text-2xl font-semibold">{title}</h1></button>}<div className="mt-2 flex flex-wrap gap-x-3 px-2 text-xs text-[#999]"><NoteDomainPicker category={note.category} muses={muses} saving={saving} onChange={onChangeDomain} showPrefix /><button type="button" onClick={openDate} className="hover:text-[#477bea]">{fullNoteDate(note.created_at)}</button></div>{/* A div rather than a <button>, because the highlighted passage inside it is itself clickable. */}
+<div role="button" tabIndex={0} onClick={() => { setEditing(true); requestAnimationFrame(() => bodyRef.current?.focus()); }} onKeyDown={(event) => { if (event.target === event.currentTarget && event.key === 'Enter') { event.preventDefault(); setEditing(true); requestAnimationFrame(() => bodyRef.current?.focus()); } }} aria-label="Edit note text" className="mt-9 block w-full cursor-text rounded-md px-2 py-2 text-left text-base leading-[1.7] outline-none hover:bg-[#f8f8f8] focus-visible:ring-2 focus-visible:ring-[#477bea]/20"><span className="whitespace-pre-wrap break-words">{highlights.length ? <>
+  {highlights.map((span, position) => {
+    const item = insights[span.index];
+    const relation = relationOf(item);
+    const active = item === insight;
+    return <Fragment key={span.index}>
+      {displayedBody.slice(position === 0 ? 0 : highlights[position - 1].end, span.start)}
+      <mark
+        role="button"
+        tabIndex={0}
+        onClick={(event) => { event.stopPropagation(); selectInsight(span.index); }}
+        onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); selectInsight(span.index); } }}
+        aria-pressed={active}
+        title="See what your notes say about this"
+        className={`cursor-pointer rounded-sm px-0.5 text-inherit underline decoration-2 underline-offset-4 [box-decoration-break:clone] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${active ? 'bg-[#ffe699] decoration-[#d49b12]' : 'bg-[#fff6d9] decoration-[#ead089] hover:bg-[#fff0bd]'}`}
+      >{displayedBody.slice(span.start, span.end)}{relation && <span className={`ml-1 inline-block rounded px-1 align-[1px] text-[10px] font-medium leading-4 ${RELATION_BADGES[relation]?.className ?? 'bg-[#eef1f6] text-[#5d6b85]'}`}>{RELATION_LABELS[relation]}</span>}</mark>
+    </Fragment>;
+  })}
+  {displayedBody.slice(highlights[highlights.length - 1].end)}
 </> : displayedBody || 'Tap to start writing.'}</span></div>
-{insightPopover && insight && <div ref={popoverRef} role="dialog" aria-label="What your notes suggest" className="absolute z-30" style={{ top: insightPopover.top, left: insightPopover.left, width: insightPopover.width }}>
-  <div className="relative shadow-xl">
-    <button type="button" onClick={() => { setInsightPopover(null); anchorRef.current?.focus(); }} aria-label="Close" className="absolute right-2 top-2 z-10 rounded p-1 text-[#999] hover:bg-[#f4f4f4] hover:text-[#555]"><X className="h-3.5 w-3.5" /></button>
-    <InsightCard compact showAnchor={false} insight={insight} notesById={noteById} onSelectNote={showCitedNote} />
-  </div>
-</div>}
 </article>}
           </div>
           <ReadingFormatBar onFormat={applyReadingFormat} onDone={finishEditing} editing={editing} />
@@ -1397,13 +1393,24 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
           {retrievalLoading ? <div className="flex h-full items-center justify-center gap-3 text-sm text-[#777]" role="status"><Loader2 className="h-5 w-5 animate-spin text-[#477bea]" /> Finding related notes{retrievalProgress?.agents_total ? ` · ${retrievalProgress.agents_done}/${retrievalProgress.agents_total}` : '…'}</div>
             : retrievalError ? <div className="flex h-full items-center justify-center text-center" role="alert"><div><h2 className="text-lg font-semibold">Could not retrieve notes</h2><p className="mt-3 max-w-sm text-sm leading-relaxed text-[#777]">{retrievalError}</p><button type="button" onClick={() => setRetrievalAttempt((attempt) => attempt + 1)} className="mt-5 rounded-md bg-[#477bea] px-4 py-2 text-sm text-white hover:bg-[#3d6ed7]">Try again</button></div></div>
             : insight ? <div className="mx-auto max-w-xl space-y-10">
-              <InsightCard insight={insight} notesById={noteById} onSelectNote={showCitedNote} />
+              <InsightCard
+                insight={insight}
+                notesById={noteById}
+                relation={relationOf(insight)}
+                outbound={isOutbound(insight)}
+                position={insights.length > 1 ? { index: insights.indexOf(insight), total: insights.length, onSelect: selectInsight } : undefined}
+                onSelectNote={showCitedNote}
+              />
               {goalPrompt}
               {retrieval?.summary && <article><h2 className="text-lg font-semibold leading-snug">Summary of related notes</h2><p className="mt-7 text-sm leading-[1.7] text-[#333]">{retrieval.summary}</p></article>}
             </div>
+            // The insight step broke. Saying "nothing here" would pass a failure off as a verdict.
+            : retrieval?.insight_failed && !insights.length && surfacedNotes.length ? <div className="flex h-full items-center justify-center text-center" role="alert"><div><h2 className="text-lg font-semibold">Couldn’t write an insight this time</h2><p className="mt-3 max-w-sm text-sm leading-relaxed text-[#777]">Your related notes were found and are alongside, but the step that reads them for you didn’t finish.</p><button type="button" onClick={() => setRetrievalAttempt((attempt) => attempt + 1)} className="mt-5 rounded-md bg-[#477bea] px-4 py-2 text-sm text-white hover:bg-[#3d6ed7]">Try again</button></div></div>
             // The insight step ran and found nothing worth acting on. Restating
             // the related notes here instead is exactly the echo it avoids.
-            : retrieval?.insight === null && !retrieval.summary && surfacedNotes.length ? <div className="flex h-full items-center justify-center text-center"><div><h2 className="text-lg font-semibold">Nothing here changes your next step</h2><p className="mt-3 max-w-sm text-sm leading-relaxed text-[#777]">Your related notes are alongside, but none of them adds something this note doesn’t already say.</p>{goalPrompt && <div className="mx-auto mt-8 max-w-sm">{goalPrompt}</div>}</div></div>
+            : retrieval?.insights && !retrieval.insights.length && !retrieval.summary && surfacedNotes.length ? <div className="flex h-full items-center justify-center text-center"><div>{retrieval.note_intent === 'learning'
+              ? <><h2 className="text-lg font-semibold">Nothing to apply this to yet</h2><p className="mt-3 max-w-sm text-sm leading-relaxed text-[#777]">None of your notes describes a problem or plan this lesson would change. Related notes are alongside.</p></>
+              : <><h2 className="text-lg font-semibold">Nothing here changes your next step</h2><p className="mt-3 max-w-sm text-sm leading-relaxed text-[#777]">Your related notes are alongside, but none of them adds something this note doesn’t already say.</p></>}{goalPrompt && <div className="mx-auto mt-8 max-w-sm">{goalPrompt}</div>}</div></div>
             : retrieval?.summary || summaries.length ? <article className="mx-auto max-w-xl"><h2 className="text-lg font-semibold leading-snug">Summary of related notes</h2><div className="mt-7 space-y-4 text-sm leading-[1.7] text-[#333]">{retrieval?.summary ? <p>{retrieval.summary}</p> : summaries.map((summary, index) => <p key={index}>{summary}</p>)}</div></article>
             // Opened just to read it, with nothing saved from an earlier search.
             : !retrieval && !searchRequested && !noteTooShortForRetrieval && hasOtherNotes ? <div className="flex h-full items-center justify-center text-center"><div><h2 className="text-lg font-semibold">See what your notes say about this</h2><p className="mt-3 max-w-sm text-sm leading-relaxed text-[#777]">Search your other notes for anything that connects to this one.</p><button type="button" onClick={() => setSearchRequested(true)} className="mt-5 rounded-md bg-[#477bea] px-4 py-2 text-sm text-white hover:bg-[#3d6ed7]">Find related notes</button></div></div>
@@ -1435,8 +1442,9 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
                 aria-pressed={selectedNote?.id === item.id}
                 className={`block w-full cursor-pointer rounded-lg border bg-[#fafafb] p-3 text-left shadow-sm transition hover:border-[#8fb1ff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${selectedNote?.id === item.id ? 'border-[#7ca2ff] ring-1 ring-[#7ca2ff]/30' : 'border-[#e0e0e0]'}`}
               >
-                <div className="flex items-start justify-between gap-2">
-                  {content.hasTitle ? <strong className="min-w-0 flex-1 truncate text-sm text-[#222]">{content.title}</strong> : <span className="min-w-0 flex-1" />}
+                <div className="flex flex-wrap items-start justify-between gap-x-2 gap-y-1">
+                  {content.hasTitle ? <strong className={`min-w-0 flex-1 truncate text-sm text-[#222] ${retrievalResult?.direction === 'outbound' ? 'basis-full' : ''}`}>{content.title}</strong> : <span className="min-w-0 flex-1" />}
+                  {retrievalResult?.direction === 'outbound' && <span title="This note is a problem your lesson applies to" className="shrink-0 rounded bg-[#fff4d6] px-1.5 py-0.5 text-[10px] font-medium text-[#8a6100]">Lesson applies</span>}
                   {badge ? <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${badge.className}`}>{badge.label}</span> : <span className="shrink-0 text-[11px] text-[#477bea]">note</span>}
                 </div>
                 <p className="mt-2 line-clamp-3 text-[13px] leading-relaxed text-[#333]">{content.body || notePreview(item)}</p>
@@ -1690,7 +1698,7 @@ function InstantRetrievalOverlay({ notes, projects, initialQuery = '', saving, o
   );
 }
 
-type RelevanceSearch = { results: RelevanceResult[]; coverage: RelevanceCoverage; summary?: string; insight?: NoteInsight | null; goal_suggestions?: string[] };
+type RelevanceSearch = { results: RelevanceResult[]; coverage: RelevanceCoverage; summary?: string; insights?: NoteInsight[]; goal_suggestions?: string[]; note_intent?: InsightIntent | null; insight_failed?: boolean };
 
 // Five per page rather than ten, so each card has room to preview the note's
 // own text under the explanation instead of only its title.
@@ -1707,6 +1715,18 @@ const RELATION_BADGES: Partial<Record<NoteRelationType, { label: string; classNa
   contradicts: { label: 'Contradicts', className: 'bg-[#fdecea] text-[#c0392b]' },
   question: { label: 'Open question', className: 'bg-[#f1eafc] text-[#6b3fc0]' },
   parallel: { label: 'Parallel', className: 'bg-[#e3f4f1] text-[#1b7a6e]' },
+  solves: { label: 'Solves', className: 'bg-[#e6f4ea] text-[#1e7b3c]' },
+};
+
+/** Every relation's name, for the label on a highlight, which always says what it opens. */
+const RELATION_LABELS: Record<NoteRelationType, string> = {
+  supports: 'Supports',
+  extends: 'Extends',
+  contradicts: 'Contradicts',
+  question: 'Open question',
+  parallel: 'Parallel',
+  helps: 'Helps',
+  solves: 'Solves',
 };
 
 const INTENT_LABELS: Record<InsightIntent, string> = {
@@ -1715,6 +1735,7 @@ const INTENT_LABELS: Record<InsightIntent, string> = {
   deciding: 'You’re deciding',
   capturing: 'You’re logging what happened',
   reflecting: 'You’re thinking it through',
+  learning: 'You saved a lesson',
 };
 
 /**
@@ -1722,13 +1743,25 @@ const INTENT_LABELS: Record<InsightIntent, string> = {
  * what those notes add, and a step to take. The cited notes are listed so the
  * claim can be checked against the person's own words.
  */
-function InsightCard({ insight, notesById, compact = false, showAnchor = true, onSelectNote }: {
-  insight: NoteInsight; notesById: Map<string, Note>; compact?: boolean; showAnchor?: boolean; onSelectNote: (noteId: string) => void;
+function InsightCard({ insight, notesById, relation = null, outbound = false, position, compact = false, showAnchor = true, onSelectNote }: {
+  insight: NoteInsight; notesById: Map<string, Note>; relation?: NoteRelationType | null; compact?: boolean; showAnchor?: boolean;
+  /** True when this note is the lesson and the cited notes are where it applies. */
+  outbound?: boolean;
+  /** Present when the note has several insights, to step between them from the card. */
+  position?: { index: number; total: number; onSelect: (index: number) => void };
+  onSelectNote: (noteId: string) => void;
 }) {
   const cited = insight.note_ids.map((id) => notesById.get(id)).filter((note): note is Note => note !== undefined);
   return (
     <section aria-label="What your notes suggest" className={`rounded-xl border border-[#dbe5fb] bg-white shadow-sm ${compact ? 'p-4' : 'p-6'}`}>
-      <p className="flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-[0.08em] text-[#477bea]"><Lightbulb className="h-3.5 w-3.5" aria-hidden="true" />{INTENT_LABELS[insight.intent]}</p>
+      <div className="flex items-center justify-between gap-2">
+        <p className="flex min-w-0 items-center gap-1.5 text-[11px] font-medium uppercase tracking-[0.08em] text-[#477bea]"><Lightbulb className="h-3.5 w-3.5 shrink-0" aria-hidden="true" /><span className="truncate">{INTENT_LABELS[insight.intent]}</span>{relation && <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] normal-case tracking-normal ${RELATION_BADGES[relation]?.className ?? 'bg-[#eef1f6] text-[#5d6b85]'}`}>{RELATION_LABELS[relation]}</span>}</p>
+        {position && <div className="flex shrink-0 items-center gap-0.5 text-[11px] text-[#999]">
+          <button type="button" onClick={() => position.onSelect((position.index - 1 + position.total) % position.total)} aria-label="Previous insight" className="rounded p-0.5 hover:bg-[#f4f4f4] hover:text-[#477bea]"><ChevronLeft className="h-3.5 w-3.5" /></button>
+          <span aria-live="polite">{position.index + 1} of {position.total}</span>
+          <button type="button" onClick={() => position.onSelect((position.index + 1) % position.total)} aria-label="Next insight" className="rounded p-0.5 hover:bg-[#f4f4f4] hover:text-[#477bea]"><ChevronRight className="h-3.5 w-3.5" /></button>
+        </div>}
+      </div>
       {showAnchor && insight.anchor && <blockquote className="mt-3 border-l-2 border-[#f0c85a] pl-3 text-xs italic leading-relaxed text-[#777]">“{insight.anchor}”</blockquote>}
       <p className={`mt-3 leading-relaxed text-[#222] ${compact ? 'text-[13px]' : 'text-[15px]'}`}>{insight.text}</p>
       <div className="mt-4 rounded-lg bg-[#eef4ff] px-3 py-2.5">
@@ -1736,7 +1769,7 @@ function InsightCard({ insight, notesById, compact = false, showAnchor = true, o
         <p className="mt-1 text-[13px] leading-relaxed text-[#1f3b73]">{insight.action}</p>
       </div>
       {cited.length > 0 && <div className="mt-4">
-        <p className="text-[11px] text-[#999]">From your notes</p>
+        <p className="text-[11px] text-[#999]">{outbound ? 'Where this applies' : 'From your notes'}</p>
         <ul className="mt-1.5 flex flex-wrap gap-1.5">
           {cited.map((note) => <li key={note.id} className="min-w-0">
             <button type="button" onClick={() => onSelectNote(note.id)} title={noteLabel(note)} className="block max-w-[240px] truncate rounded-md border border-[#e0e0e0] bg-[#fafafb] px-2 py-1 text-[11px] text-[#555] hover:border-[#8fb1ff] hover:text-[#477bea] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">{noteLabel(note)}</button>
@@ -1939,9 +1972,12 @@ function RelevantNotesPanel({ notes, relevance, loading, progress, error, stale,
           <p className="px-2 py-12 text-center text-sm leading-relaxed text-[#999]">Nothing in your notes connects to this draft yet.</p>
         ) : (
           <div className="space-y-3">
-            {currentPage === 0 && relevance.insight && <InsightCard
+            {currentPage === 0 && relevance.insights?.map((item, index) => <InsightCard
+              key={index}
               compact
-              insight={relevance.insight}
+              insight={item}
+              relation={item.note_ids.map((id) => results.find((result) => result.note_id === id)?.relation_type).find(Boolean) ?? null}
+              outbound={item.note_ids.every((id) => results.find((result) => result.note_id === id)?.direction === 'outbound')}
               notesById={noteById}
               onSelectNote={(noteId) => {
                 const index = results.findIndex((result) => result.note_id === noteId);
@@ -1949,7 +1985,7 @@ function RelevantNotesPanel({ notes, relevance, loading, progress, error, stale,
                 onPageChange(Math.floor(index / RELEVANCE_PAGE_SIZE));
                 setExpandedId(noteId);
               }}
-            />}
+            />)}
             {visible.map((result) => {
               const note = noteById.get(result.note_id);
               if (!note) return null;

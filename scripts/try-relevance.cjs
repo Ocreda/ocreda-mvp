@@ -38,7 +38,7 @@ const DEFAULT_CORPUS = path.join(ROOT, 'notes/all-notes.json');
 const DEFAULT_DRAFT = path.join(ROOT, 'notes/test-notes/entry.txt');
 const DEFAULT_TRUTH = path.join(ROOT, 'notes/test-notes/test-notes.json');
 
-const RELATION_SHORT = { supports: 'supports ', extends: 'adds to  ', contradicts: 'contra.  ', question: 'question ', parallel: 'parallel ' };
+const RELATION_SHORT = { supports: 'supports ', extends: 'adds to  ', contradicts: 'contra.  ', question: 'question ', parallel: 'parallel ', helps: 'helps    ', solves: 'solves   ' };
 
 /*
  * The original synthetic corpus, kept available behind --sample. Unlike the
@@ -229,7 +229,7 @@ async function main() {
     const pick = picks.get(result.note_id);
     const tag = picks.size ? (pick ? `[#${String(pick.order).padStart(2)}]` : '[ --]') : '';
     const pct = `${Math.round(result.relevance_score * 100)}%`;
-    console.log(`\n${String(index + 1).padStart(2)}. ${tag} ${pct.padStart(4)}  ${RELATION_SHORT[result.relation_type]} ${result.note_id} ${titleOf(textById.get(result.note_id))}`);
+    console.log(`\n${String(index + 1).padStart(2)}. ${tag} ${pct.padStart(4)}  ${RELATION_SHORT[result.relation_type]} ${result.direction === 'outbound' ? 'OUT' : 'in '} ${result.note_id} ${titleOf(textById.get(result.note_id))}`);
     if (result.gist) console.log(wrap(`Gist: ${result.gist}`, 72, '      '));
     console.log(wrap(`AI:  ${result.explanation}`, 72, '      '));
     if (pick && pick.why) console.log(wrap(`You: ${pick.why}`, 72, '      '));
@@ -252,16 +252,14 @@ async function main() {
   console.log('\n' + '='.repeat(78));
   console.log('INSIGHT');
   console.log('='.repeat(78));
-  if (outcome.insight) {
-    const { insight } = outcome;
-    console.log(`  intent   ${insight.intent}`);
+  outcome.insights.forEach((insight, index) => {
+    console.log(`\n  #${index + 1}  intent ${insight.intent}`);
     console.log(wrap(`anchor:  ${insight.anchor ? `"${insight.anchor}"` : '(quote not found in draft - no highlight)'}`, 72, '  '));
     console.log(wrap(`insight: ${insight.text}`, 72, '  '));
     console.log(wrap(`action:  ${insight.action}`, 72, '  '));
     console.log(`  cites    ${insight.note_ids.map((id) => `${id} ${titleOf(textById.get(id))}`).join('; ')}`);
-  } else {
-    console.log('  (none - nothing in the notes would change the next step)');
-  }
+  });
+  if (!outcome.insights.length) console.log('  (none - nothing in the notes would change the next step)');
   if (outcome.goal_suggestions.length) console.log(`  goal chips: ${outcome.goal_suggestions.join(' | ')}`);
 
   if (!picks.size) return;

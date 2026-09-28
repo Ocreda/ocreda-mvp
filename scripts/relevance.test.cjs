@@ -20,6 +20,8 @@ const {
   readGoalContext,
   recentDomainNotes,
   selectInsightMatches,
+  diversifyByRelation,
+  recencyBoost,
 } = require('../.relevance-build/relevance.js');
 
 let passed = 0;
@@ -92,7 +94,7 @@ test('drops a hallucinated id the agent was never shown', () => {
   assert.deepStrictEqual(parseAgentResponse(row({ note_id: 'not-in-chunk' }), allowed), []);
 });
 
-test('drops scores below the 0.5 floor', () => {
+test('drops a score under the bar for its relation', () => {
   assert.deepStrictEqual(parseAgentResponse(row({ relevance_score: 0.3 }), allowed), []);
 });
 
@@ -268,11 +270,6 @@ test('all agents succeeding counts every note', () => {
   assert.strictEqual(mergeAgentResults(outcomes, new Map(), 50).notesSearched, 500);
 });
 
-test('ties break toward the newer note', () => {
-  const createdAt = new Map([['older', '2026-01-01'], ['newer', '2026-06-01']]);
-  const { results } = mergeAgentResults([{ chunkSize: 2, results: [res('older', 0.8), res('newer', 0.8)] }], createdAt, 50);
-  assert.deepStrictEqual(results.map((r) => r.note_id), ['newer', 'older']);
-});
 
 test('caps the returned list at maxResults', () => {
   const many = Array.from({ length: 80 }, (_, i) => res(`n-${i}`, 0.5 + i / 1000));
@@ -449,57 +446,95 @@ test('an anchor that is not in the text, or is too short, is rejected', () => {
 
 // ------------------------------------------------------------------ insight
 
-const DRAFT = 'Tester said she would pay $20/month for this if it synced with Notion.';
+const DRAFT = 'Tester said she would pay $20/month for this if it synced with Notion. She got lost on the empty home screen.';
 const insightIds = new Set(['n1', 'n2']);
 const parseOpts = (askForGoal = false) => ({ draft: DRAFT, allowedNoteIds: insightIds, askForGoal });
-const insightJson = (over = {}) => JSON.stringify({
-  intent: 'capturing',
-  insight: { anchor: 'she would pay $20/month', text: 'Two testers said $10.', action: 'Ask the next tester to pick $10 or $20.', note_ids: ['n1'], ...over },
-});
+const card = (over = {}) => ({ anchor: 'she would pay $20/month', text: 'Two testers said $10.', action: 'Ask the next tester to pick $10 or $20.', note_ids: ['n1'], ...over });
+const insightJson = (over = {}) => JSON.stringify({ intent: 'capturing', insights: [card(over)] });
+const first = (raw, opts = parseOpts()) => parseInsightResponse(raw, opts).insights[0];
 
 test('a well-formed insight is kept, with its anchor taken from the draft itself', () => {
-  const { insight } = parseInsightResponse(insightJson(), parseOpts());
+  const insight = first(insightJson());
   assert.strictEqual(insight.anchor, 'she would pay $20/month');
   assert.strictEqual(insight.intent, 'capturing');
   assert.deepStrictEqual(insight.note_ids, ['n1']);
 });
 
-test('an explicit null insight is a valid answer', () => {
-  const raw = JSON.stringify({ intent: 'reflecting', insight: null });
-  assert.deepStrictEqual(parseInsightResponse(raw, parseOpts()), { insight: null, goal_suggestions: [] });
+test('an empty insights list is a valid answer, not a failure, and still says what the note is doing', () => {
+  const raw = JSON.stringify({ intent: 'learning', insights: [] });
+  assert.deepStrictEqual(parseInsightResponse(raw, parseOpts()), { insights: [], goal_suggestions: [], intent: 'learning', failed: false });
+});
+
+test('a missing or unknown note intent is reported as null, not guessed', () => {
+  assert.strictEqual(parseInsightResponse(JSON.stringify({ insights: [] }), parseOpts()).intent, null);
+  assert.strictEqual(parseInsightResponse(JSON.stringify({ intent: 'daydreaming', insights: [] }), parseOpts()).intent, null);
+});
+
+test('a reply cut off mid-JSON is a failure, not "nothing useful"', () => {
+  const cut = '{"intent": "capturing", "insights": [{"anchor": "she would pay';
+  assert.strictEqual(parseInsightResponse(cut, parseOpts()).failed, true);
+});
+
+test('an older single "insight" reply is still read', () => {
+  const raw = JSON.stringify({ intent: 'capturing', insight: card() });
+  assert.strictEqual(parseInsightResponse(raw, parseOpts()).insights.length, 1);
+});
+
+test('up to three insights are kept, each on its own passage', () => {
+  const raw = JSON.stringify({ intent: 'capturing', insights: [
+    card(),
+    card({ anchor: 'got lost on the empty home screen', text: 'Sam got lost there too.', action: 'Add a sample note.' }),
+    card({ anchor: 'synced with Notion', text: 'Three testers asked for Notion.', action: 'Scope a Notion import.' }),
+    card({ anchor: 'Tester said', text: 'A fourth point.', action: 'Do a fourth thing.' }),
+  ] });
+  const { insights } = parseInsightResponse(raw, parseOpts());
+  assert.deepStrictEqual(insights.map((i) => i.anchor), ['she would pay $20/month', 'got lost on the empty home screen', 'synced with Notion']);
+});
+
+test('an insight whose passage overlaps an earlier one is dropped as the same issue', () => {
+  const raw = JSON.stringify({ intent: 'capturing', insights: [
+    card(),
+    card({ anchor: 'would pay $20/month for this', text: 'Another take on price.', action: 'Something else.' }),
+  ] });
+  assert.strictEqual(parseInsightResponse(raw, parseOpts()).insights.length, 1);
+});
+
+test('a repeated insight is dropped', () => {
+  const raw = JSON.stringify({ intent: 'capturing', insights: [card(), card({ anchor: '' })] });
+  assert.strictEqual(parseInsightResponse(raw, parseOpts()).insights.length, 1);
 });
 
 test('invented citations are dropped, and an insight with none left is dropped', () => {
-  assert.deepStrictEqual(parseInsightResponse(insightJson({ note_ids: ['n1', 'made-up'] }), parseOpts()).insight.note_ids, ['n1']);
-  assert.strictEqual(parseInsightResponse(insightJson({ note_ids: ['made-up'] }), parseOpts()).insight, null);
+  assert.deepStrictEqual(first(insightJson({ note_ids: ['n1', 'made-up'] })).note_ids, ['n1']);
+  assert.strictEqual(first(insightJson({ note_ids: ['made-up'] })), undefined);
 });
 
 test('an insight without an action is dropped rather than shown half-formed', () => {
-  assert.strictEqual(parseInsightResponse(insightJson({ action: '  ' }), parseOpts()).insight, null);
+  assert.strictEqual(first(insightJson({ action: '  ' })), undefined);
 });
 
 test('a paraphrased anchor keeps the card but loses the highlight', () => {
-  const { insight } = parseInsightResponse(insightJson({ anchor: 'she is willing to spend twenty dollars' }), parseOpts());
+  const insight = first(insightJson({ anchor: 'she is willing to spend twenty dollars' }));
   assert.ok(insight);
   assert.strictEqual(insight.anchor, '');
 });
 
 test('an unknown intent falls back to "reflecting"', () => {
   const raw = JSON.stringify({ ...JSON.parse(insightJson()), intent: 'daydreaming' });
-  assert.strictEqual(parseInsightResponse(raw, parseOpts()).insight.intent, 'reflecting');
+  assert.strictEqual(first(raw).intent, 'reflecting');
 });
 
 test('goal suggestions are kept only when asked for, deduplicated and capped at three', () => {
-  const raw = JSON.stringify({ intent: 'capturing', insight: null, goal_suggestions: ['Validate pricing', 'Validate pricing', 'Find users', 'Raise money', 'Hire'] });
+  const raw = JSON.stringify({ intent: 'capturing', insights: [], goal_suggestions: ['Validate pricing', 'Validate pricing', 'Find users', 'Raise money', 'Hire'] });
   assert.deepStrictEqual(parseInsightResponse(raw, parseOpts(true)).goal_suggestions, ['Validate pricing', 'Find users', 'Raise money']);
   assert.deepStrictEqual(parseInsightResponse(raw, parseOpts(false)).goal_suggestions, []);
 });
 
-test('unparseable insight output yields nothing rather than throwing', () => {
-  assert.deepStrictEqual(parseInsightResponse('no json here', parseOpts(true)), { insight: null, goal_suggestions: [] });
+test('unparseable insight output is reported as a failure rather than throwing', () => {
+  assert.deepStrictEqual(parseInsightResponse('no json here', parseOpts(true)), { insights: [], goal_suggestions: [], intent: null, failed: true });
 });
 
-const hit = (id, score) => ({ note_id: id, relevance_score: score, relation_type: 'supports', gist: '', explanation: 'why' });
+const hit = (id, score, relation = 'supports') => ({ note_id: id, relevance_score: score, relation_type: relation, gist: '', explanation: 'why' });
 
 test('only strong matches feed the insight', () => {
   const matches = selectInsightMatches([hit('a', 0.9), hit('b', 0.69), hit('c', 0.7)], [note('a'), note('b'), note('c')]);
@@ -531,17 +566,21 @@ test('no strong matches means no insight call at all', async () => {
     generate: async () => { calls++; return '{}'; },
   });
   assert.strictEqual(calls, 0);
-  assert.deepStrictEqual(out, { insight: null, goal_suggestions: [] });
+  assert.deepStrictEqual(out, { insights: [], goal_suggestions: [], intent: null, failed: false }, 'skipped is not failed');
 });
 
-test('stream carries the insight and goal suggestions on "done"', async () => {
+test('stream carries the insights, the first one alone for older clients, and goal suggestions', async () => {
+  const insight = { anchor: 'a', intent: 'capturing', text: 't', action: 'x', note_ids: ['id-0'] };
   const events = await readEvents(streamRelevanceSearch(streamOptions({
-    findInsight: async () => ({ insight: null, goal_suggestions: ['Find users'] }),
+    findInsight: async () => ({ insights: [insight], goal_suggestions: ['Find users'], intent: 'capturing', failed: false }),
   })));
   const done = events.at(-1);
   assert.strictEqual(done.type, 'done');
-  assert.strictEqual(done.insight, null);
+  assert.deepStrictEqual(done.insights, [insight]);
+  assert.deepStrictEqual(done.insight, insight);
   assert.deepStrictEqual(done.goal_suggestions, ['Find users']);
+  assert.strictEqual(done.note_intent, 'capturing');
+  assert.strictEqual(done.insight_failed, false);
   assert.strictEqual(done.summary, undefined);
 });
 
@@ -552,12 +591,98 @@ test('a failing insight step still delivers the matches', async () => {
   const done = events.at(-1);
   assert.strictEqual(done.type, 'done');
   assert.ok(done.results.length > 0);
+  assert.deepStrictEqual(done.insights, []);
   assert.strictEqual(done.insight, null);
+  assert.strictEqual(done.insight_failed, true, 'the app must be able to tell a failure from "nothing useful"');
 });
 
-test('without an insight step, "done" has no insight field at all', async () => {
+test('without an insight step, "done" has no insight fields at all', async () => {
   const events = await readEvents(streamRelevanceSearch(streamOptions()));
   assert.ok(!('insight' in events.at(-1)));
+  assert.ok(!('insights' in events.at(-1)));
+});
+
+// ------------------------------------------------------------ direction
+
+const NOW = Date.parse('2026-06-15');
+const aged = new Map([['older', '2025-01-01'], ['newer', '2026-06-01']]);
+const dir = (id, score, direction, relation = 'extends') => ({ ...res(id, score), direction, relation_type: relation });
+
+test('outbound: between equally strong problems, the recent one wins', () => {
+  const { results } = mergeAgentResults([{ chunkSize: 2, results: [dir('older', 0.8, 'outbound'), dir('newer', 0.8, 'outbound')] }], aged, 50, NOW);
+  assert.deepStrictEqual(results.map((r) => r.note_id), ['newer', 'older']);
+});
+
+test('inbound: solutions are not aged, so a tie keeps its order', () => {
+  const { results } = mergeAgentResults([{ chunkSize: 2, results: [dir('older', 0.8, 'inbound'), dir('newer', 0.8, 'inbound')] }], aged, 50, NOW);
+  assert.deepStrictEqual(results.map((r) => r.note_id), ['older', 'newer']);
+});
+
+test('contradictions ignore recency even when outbound', () => {
+  const { results } = mergeAgentResults([{ chunkSize: 2, results: [
+    dir('older', 0.9, 'outbound', 'contradicts'), dir('newer', 0.9, 'outbound', 'contradicts'),
+  ] }], aged, 50, NOW);
+  assert.deepStrictEqual(results.map((r) => r.note_id), ['older', 'newer']);
+});
+
+test('recency is a boost, never enough to beat a clearly stronger match', () => {
+  const { results } = mergeAgentResults([{ chunkSize: 2, results: [dir('older', 0.9, 'outbound'), dir('newer', 0.8, 'outbound')] }], aged, 50, NOW);
+  assert.deepStrictEqual(results.map((r) => r.note_id), ['older', 'newer']);
+});
+
+test('the recency boost fades with age and needs a date', () => {
+  const r = dir('x', 0.8, 'outbound');
+  assert.strictEqual(recencyBoost(r, '2026-06-01', NOW), 0.03);
+  assert.strictEqual(recencyBoost(r, '2026-04-01', NOW), 0.015);
+  assert.strictEqual(recencyBoost(r, '2025-01-01', NOW), 0);
+  assert.strictEqual(recencyBoost(r, undefined, NOW), 0);
+  assert.strictEqual(recencyBoost(dir('x', 0.8, 'inbound'), '2026-06-01', NOW), 0);
+});
+
+test('direction is read from the agent, defaulting to inbound', () => {
+  assert.strictEqual(parseAgentResponse(row({ direction: 'outbound' }), allowed)[0].direction, 'outbound');
+  assert.strictEqual(parseAgentResponse(row(), allowed)[0].direction, 'inbound');
+  assert.strictEqual(parseAgentResponse(row({ direction: 'sideways' }), allowed)[0].direction, 'inbound');
+});
+
+test('the insight prompt tells the model which way each note points', () => {
+  const prompt = buildInsightPrompt({
+    draft: 'd', context: { domain: null, goal: 'g' }, recentNotes: [],
+    matches: [{ note: note('a'), result: { ...hit('a', 0.9), direction: 'outbound' } }],
+  });
+  assert.ok(prompt.includes('Direction: outbound'));
+  assert.ok(prompt.includes('"learning"'));
+});
+
+// ------------------------------------------------------ relation bars, variety
+
+test('each relation is held to its own bar', () => {
+  const at = (relation, score) => parseAgentResponse(row({ relation_type: relation, relevance_score: score }), allowed).length;
+  assert.strictEqual(at('contradicts', 0.84), 0, 'a contradiction needs near-certainty');
+  assert.strictEqual(at('contradicts', 0.85), 1);
+  assert.strictEqual(at('extends', 0.6), 1, 'extends has the lowest bar');
+  assert.strictEqual(at('supports', 0.6), 0);
+  assert.strictEqual(at('solves', 0.7), 1);
+  assert.strictEqual(at('helps', 0.69), 0);
+});
+
+test('helps and solves are recognised relations', () => {
+  assert.strictEqual(parseAgentResponse(row({ relation_type: 'solves' }), allowed)[0].relation_type, 'solves');
+  assert.strictEqual(parseAgentResponse(row({ relation_type: 'helps' }), allowed)[0].relation_type, 'helps');
+});
+
+test('variety lets a near-tie of another relation past a run of the same one', () => {
+  const ranked = [hit('s1', 0.9), hit('s2', 0.89), hit('s3', 0.88), hit('c1', 0.86, 'contradicts')];
+  assert.deepStrictEqual(diversifyByRelation(ranked).map((r) => r.note_id), ['s1', 'c1', 's2', 's3']);
+});
+
+test('variety never lets a much weaker match jump a strong one', () => {
+  const ranked = [hit('s1', 0.95), hit('s2', 0.94), hit('e1', 0.61, 'extends')];
+  assert.deepStrictEqual(diversifyByRelation(ranked).map((r) => r.note_id), ['s1', 's2', 'e1']);
+});
+
+test('variety stops at the limit', () => {
+  assert.strictEqual(diversifyByRelation([hit('a', 0.9), hit('b', 0.8), hit('c', 0.7)], 2).length, 2);
 });
 
 run();
