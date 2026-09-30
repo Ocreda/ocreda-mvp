@@ -4,8 +4,26 @@ export const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
-const DEFAULT_MODEL = "google/gemini-3.7-flash"; //Prod mode
-// const DEFAULT_MODEL = "google/gemini-2.5-flash-lite"; //Dev Mode
+/** "Best" mode, and the default everywhere: the production model. */
+export const BEST_MODEL = "google/gemini-3.7-flash";
+/** "Basic" mode: far cheaper, for testing. Weaker on subtle relations. */
+export const BASIC_MODEL = "google/gemini-2.5-flash-lite";
+const DEFAULT_MODEL = BEST_MODEL;
+
+/** The AI mode a person picks in the app. */
+export type ModelTier = "basic" | "best";
+
+/**
+ * Callers send a tier, never a model id, so a request can only ever choose
+ * between these two models. Anything unrecognised gets the default.
+ */
+export function readModelTier(value: unknown): ModelTier {
+  return value === "basic" ? "basic" : "best";
+}
+
+export function modelForTier(tier: ModelTier): string {
+  return tier === "basic" ? BASIC_MODEL : BEST_MODEL;
+}
 
 export interface GeminiMessage {
   role: "user" | "model";

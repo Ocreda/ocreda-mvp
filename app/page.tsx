@@ -14,6 +14,7 @@ import { prepareImportedNoteText } from '@/lib/import-note-content';
 import { IS_LOCAL_MODE } from '@/dev/local-mode';  // DEV-LOCAL-MODE
 import { DomainGoal, InsightIntent, Note, NoteInsight, NoteRelationType, RelevanceCoverage, RelevanceResult } from '@/lib/types';
 import { findAnchor } from '@/supabase/functions/_shared/relevance';
+import { getAiMode, useAiMode } from '@/lib/ai-mode';
 
 type MuseMeta = { title: string; description: string; createdAt: string };
 type ProjectPage = { id: string; title: string; content: string; sourceNoteIds: string[]; createdAt: string; updatedAt: string };
@@ -99,15 +100,18 @@ function stableHash(value: string): number {
 // v3: results carry a goal-aware insight, and the goal is part of the signature.
 // v4: up to three insights, and relations gain helps and solves.
 // v5: every match says which way help flows (inbound or outbound).
+// The AI mode is part of the signature, so switching Basic/Best searches again.
 const SAVED_RETRIEVAL_VERSION = 'v5';
 
 function savedRetrievalKey(userId: string, noteId: string): string {
   return `ocreda-saved-retrieval:${SAVED_RETRIEVAL_VERSION}:${userId}:${noteId}`;
 }
 
-/** Changing either the note or its Domain's goal changes what a search would return. */
+/** Changing the note, its Domain's goal, or the AI mode changes what a search would return. */
 function noteSignature(note: Note, goal: string): string {
-  return `${note.raw_text.length}:${stableHash(note.raw_text)}:${stableHash(goal)}`;
+  // "best" keeps the signature it had before modes existed, so saved results stay valid.
+  const mode = getAiMode() === 'basic' ? ':basic' : '';
+  return `${note.raw_text.length}:${stableHash(note.raw_text)}:${stableHash(goal)}${mode}`;
 }
 
 function readSavedRetrieval(userId: string, note: Note, goal: string): { mode: 'similar' | 'relevant'; search: RelevanceSearch } | null {
@@ -1177,6 +1181,7 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
   const [instantRetrievalOpen, setInstantRetrievalOpen] = useState(false);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [selectedInsightIndex, setSelectedInsightIndex] = useState(0);
+  const aiMode = useAiMode();
   const bodyRef = useRef<HTMLTextAreaElement>(null);
   const latestSaveRef = useRef(onUpdate);
   latestSaveRef.current = onUpdate;
@@ -1231,7 +1236,7 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
       .catch((err) => { if (active) setRetrievalError(safeErrorMessage(err, 'Could not retrieve related notes.')); })
       .finally(() => { if (active) setRetrievalLoading(false); });
     return () => { active = false; };
-  }, [allNotes, domainName, editing, goalText, hasOtherNotes, note, noteTooShortForRetrieval, retrievalAttempt, retrievalMode, searchRequested, userId]);
+  }, [aiMode, allNotes, domainName, editing, goalText, hasOtherNotes, note, noteTooShortForRetrieval, retrievalAttempt, retrievalMode, searchRequested, userId]);
 
   const surfacedNotes = useMemo(() => {
     const notesById = new Map(allNotes.map((item) => [item.id, item]));
@@ -1389,6 +1394,8 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
         </section>
 
         {summaryOpen && <section id="note-summary-panel" className="relative min-h-[420px] overflow-y-auto border-t border-[#dedede] bg-[#f7f7f9] px-7 pb-12 pt-12 sm:px-12 xl:min-h-0 xl:border-l xl:border-t-0">
+          {/* So results from the cheap model are never mistaken for the real thing. */}
+          {aiMode === 'basic' && <Link href="/profile" title="Searching with the cheaper Basic model. Change it in your profile." className="absolute left-4 top-3 rounded-md border border-[#f0d9a8] bg-[#fff8e8] px-2.5 py-1.5 text-xs text-[#8a6100] hover:border-[#e3b341]">Basic AI</Link>}
           <button type="button" onClick={() => setNotesOpen((open) => !open)} aria-controls="related-notes-panel" aria-expanded={notesOpen} className="absolute right-4 top-3 rounded-md border border-[#dedede] bg-white px-3 py-1.5 text-xs text-[#477bea] shadow-sm hover:border-[#adc3ff] hover:bg-[#edf3ff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">{notesOpen ? 'Hide notes' : 'See notes'}</button>
           {retrievalLoading ? <div className="flex h-full items-center justify-center gap-3 text-sm text-[#777]" role="status"><Loader2 className="h-5 w-5 animate-spin text-[#477bea]" /> Finding related notes{retrievalProgress?.agents_total ? ` · ${retrievalProgress.agents_done}/${retrievalProgress.agents_total}` : '…'}</div>
             : retrievalError ? <div className="flex h-full items-center justify-center text-center" role="alert"><div><h2 className="text-lg font-semibold">Could not retrieve notes</h2><p className="mt-3 max-w-sm text-sm leading-relaxed text-[#777]">{retrievalError}</p><button type="button" onClick={() => setRetrievalAttempt((attempt) => attempt + 1)} className="mt-5 rounded-md bg-[#477bea] px-4 py-2 text-sm text-white hover:bg-[#3d6ed7]">Try again</button></div></div>
@@ -2103,9 +2110,7 @@ function NoteEditor({ state, muses, notes, saving, error, onChange, onCreateMuse
     setPanelOpen(true); setRelevanceError(''); setRelevancePage(0);
 
     const domain = domainGoalFor(state.muse, muses);
-    const cacheKey = `${domain?.name ?? ''}
-${domain?.goal ?? ''}
-${draftText}`;
+    const cacheKey = `${getAiMode()}\n${domain?.name ?? ''}\n${domain?.goal ?? ''}\n${draftText}`;
     const cached = relevanceCache.current.get(cacheKey);
     if (cached) { setRelevance(cached); setSearchedDraft(draftText); return; }
 

@@ -16,6 +16,7 @@
  *   --expected <file>  ground truth: {notes:[{id,title,explanation}]}
  *   --goal <text>      what the person is working toward, as a Domain description
  *                      would supply it; compare runs with and without it
+ *   --basic            use the cheaper "Basic" model instead of "Best"
  */
 
 const fs = require('fs');
@@ -25,7 +26,7 @@ const {
   DEFAULT_AGENT_COUNT: AGENT_COUNT,
   DEFAULT_AGENT_CONCURRENCY: AGENT_CONCURRENCY,
 } = require('../.relevance-build/relevance.js');
-const { generateWithGemini, isRetryableGeminiError } = require('../.relevance-build/gemini.js');
+const { generateWithGemini, isRetryableGeminiError, modelForTier } = require('../.relevance-build/gemini.js');
 
 const MAX_RESULTS = 50;
 const INSIGHT_SYSTEM_PROMPT =
@@ -87,6 +88,7 @@ function parseArgs(argv) {
     else if (argv[i] === '--expected') args.expected = argv[++i];
     else if (argv[i] === '--sample') args.sample = true;
     else if (argv[i] === '--goal') args.goal = argv[++i];
+    else if (argv[i] === '--basic') args.basic = true;
   }
   return args;
 }
@@ -189,6 +191,8 @@ async function main() {
   console.log(`\nDraft:\n${wrap(draftText.trim(), 74, '  ')}`);
   console.log(`\nCorpus: ${corpusLabel} (${notes.length} notes)`);
   console.log(`Goal: ${args.goal || '(not stated)'}`);
+  const model = modelForTier(args.basic ? 'basic' : 'best');
+  console.log(`Model: ${model}`);
   if (picks.size) console.log(`Your picks: ${truthLabel} (${picks.size} notes)`);
   console.log(`\nSearching across ${AGENT_COUNT} agents, ${AGENT_CONCURRENCY} at a time...\n`);
 
@@ -202,7 +206,7 @@ async function main() {
     concurrency: AGENT_CONCURRENCY,
     isRetryable: isRetryableGeminiError,
     generate: (prompt) =>
-      generateWithGemini(AGENT_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], apiKey, undefined, {
+      generateWithGemini(AGENT_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], apiKey, model, {
         responseMimeType: 'application/json',
         temperature: 0.2,
       }),
@@ -242,7 +246,7 @@ async function main() {
     results,
     excludeNoteId: null,
     generate: (prompt) =>
-      generateWithGemini(INSIGHT_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], apiKey, undefined, {
+      generateWithGemini(INSIGHT_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], apiKey, model, {
         responseMimeType: 'application/json',
         temperature: 0.2,
         maxOutputTokens: 3000,

@@ -6,6 +6,9 @@ import {
   emptyTokenUsage,
   generateWithGeminiResult,
   isRetryableGeminiError,
+  modelForTier,
+  readModelTier,
+  type ModelTier,
   type TokenUsage,
 } from "../_shared/gemini.ts";
 import {
@@ -78,11 +81,12 @@ const AGENT_SYSTEM_PROMPT =
  * on real traffic. Operator-only: never add this to a response body. It holds
  * counts only, no note text and no user id.
  */
-function logUsage(usage: TokenUsage, notesTotal: number, startedAt: number, context: GoalContext): void {
+function logUsage(usage: TokenUsage, notesTotal: number, startedAt: number, context: GoalContext, tier: ModelTier): void {
   console.log(JSON.stringify({
     event: "find_relevant_notes_usage",
     notes_total: notesTotal,
     has_goal: Boolean(context.goal),
+    model_tier: tier,
     llm_calls: usage.calls,
     input_tokens: usage.inputTokens,
     cached_input_tokens: usage.cachedInputTokens,
@@ -101,6 +105,7 @@ async function findMatchInsight(
   excludeNoteId: string | null,
   apiKey: string,
   usage: TokenUsage,
+  model: string,
 ): Promise<InsightOutcome> {
   try {
     return await findInsight({
@@ -114,7 +119,7 @@ async function findMatchInsight(
           INSIGHT_SYSTEM_PROMPT,
           [{ role: "user", content: prompt }],
           apiKey,
-          undefined,
+          model,
           { responseMimeType: "application/json", temperature: 0.2, maxOutputTokens: INSIGHT_TOKEN_BUDGET },
         );
         addTokenUsage(usage, callUsage);
@@ -130,7 +135,7 @@ async function findMatchInsight(
   }
 }
 
-async function summarizeMatches(results: RelevanceResult[], apiKey: string, usage: TokenUsage): Promise<string> {
+async function summarizeMatches(results: RelevanceResult[], apiKey: string, usage: TokenUsage, model: string): Promise<string> {
   // The reading workspace displays eight related notes, so summarize that same
   // set rather than describing results the user cannot see.
   const gists = results.slice(0, 8).map((result) => result.gist.trim()).filter(Boolean);
@@ -141,7 +146,7 @@ async function summarizeMatches(results: RelevanceResult[], apiKey: string, usag
       "These are the person's own notes. Talk to them about what the notes add up to, the way a thoughtful friend would, in 2-4 plain sentences. Speak directly to them in the second person: \"you wrote\", \"you keep coming back to\", \"you seem torn between\". Never call them \"the author\", \"the writer\", or \"the user\", and never describe the notes from the outside (\"these notes discuss\"). Anyone else mentioned keeps their name. Cover the distinct ideas across all of them, including any tension between them. Use only the supplied facts. Do not mention the search, relevance scores, or the act of summarizing. Return only the summary text.",
       [{ role: "user", content: gists.map((gist, index) => `Note ${index + 1}: ${gist}`).join("\n") }],
       apiKey,
-      undefined,
+      model,
       // The budget covers the model's reasoning as well as the sentences the
       // reader sees. A thinking model spent most of 320 on reasoning and left
       // the summary cut off after one line, so keep the ceiling well clear of
@@ -195,6 +200,8 @@ Deno.serve(async (req: Request) => {
     const draftText = typeof body?.draft_text === "string" ? body.draft_text.trim() : "";
     const excludeNoteId = typeof body?.exclude_note_id === "string" ? body.exclude_note_id : null;
     const goalContext = readGoalContext(body?.domain);
+    const tier = readModelTier(body?.model_tier);
+    const model = modelForTier(tier);
 
     if (draftText.length < MIN_DRAFT_CHARS) {
       return json({ error: "Write a little more before searching for related notes." }, 400);
@@ -233,10 +240,10 @@ Deno.serve(async (req: Request) => {
     const usage = emptyTokenUsage();
     const draft = condenseDraft(draftText);
     const summarize = COMBINED_SUMMARY_ENABLED
-      ? (results: RelevanceResult[]) => summarizeMatches(results, apiKey, usage)
+      ? (results: RelevanceResult[]) => summarizeMatches(results, apiKey, usage, model)
       : undefined;
     const insightFor = (results: RelevanceResult[]) =>
-      findMatchInsight(draft, goalContext, notes, results, excludeNoteId, apiKey, usage);
+      findMatchInsight(draft, goalContext, notes, results, excludeNoteId, apiKey, usage, model);
     const agentOptions = {
       draft,
       notes,
@@ -250,7 +257,7 @@ Deno.serve(async (req: Request) => {
             AGENT_SYSTEM_PROMPT,
             [{ role: "user", content: prompt }],
             apiKey,
-            undefined,
+            model,
             { responseMimeType: "application/json", temperature: 0.2 },
           );
           addTokenUsage(usage, callUsage);
@@ -279,7 +286,7 @@ Deno.serve(async (req: Request) => {
       });
       // Log once the stream has ended, when every call has been counted.
       const logged = stream.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
-        flush: () => logUsage(usage, notes.length, startedAt, goalContext),
+        flush: () => logUsage(usage, notes.length, startedAt, goalContext, tier),
       }));
       return new Response(logged, {
         headers: { ...corsHeaders, "Content-Type": "application/x-ndjson", "Cache-Control": "no-cache" },
@@ -294,7 +301,7 @@ Deno.serve(async (req: Request) => {
     // Every agent failed: report an outage rather than an empty result set,
     // which would read as "nothing in your notes is related".
     if (notesSearched === 0) {
-      logUsage(usage, notes.length, startedAt, goalContext);
+      logUsage(usage, notes.length, startedAt, goalContext, tier);
       return json({ error: "Relevance search is unavailable right now. Please try again." }, 502);
     }
 
@@ -302,7 +309,7 @@ Deno.serve(async (req: Request) => {
       summarize && results.length ? summarize(results) : Promise.resolve(""),
       insightFor(results),
     ]);
-    logUsage(usage, notes.length, startedAt, goalContext);
+    logUsage(usage, notes.length, startedAt, goalContext, tier);
     return json({
       results,
       ...(summary ? { summary } : {}),

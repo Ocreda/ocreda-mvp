@@ -10,6 +10,7 @@
 
 import { DomainGoal, Note, NoteImportInput, RelevanceProgress, RelevantNotesResponse } from '@/lib/types';
 import { readRelevanceResponse } from '@/lib/relevance-stream';
+import { getAiMode } from '@/lib/ai-mode';
 
 export const IS_LOCAL_MODE = process.env.NEXT_PUBLIC_LOCAL_MODE === '1';
 
@@ -133,7 +134,7 @@ export async function localFindRelevantNotes(
   const response = await fetch('/api/find-relevant-notes', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ draft_text: draftText, notes, domain: domain ?? null, stream: true }),
+    body: JSON.stringify({ draft_text: draftText, notes, domain: domain ?? null, model_tier: getAiMode(), stream: true }),
   });
 
   if (!response.ok) {

@@ -14,7 +14,7 @@ import {
   type NoteLike,
   type RelevanceResult,
 } from '@/supabase/functions/_shared/relevance';
-import { generateWithGemini, isRetryableGeminiError } from '@/supabase/functions/_shared/gemini';
+import { generateWithGemini, isRetryableGeminiError, modelForTier, readModelTier } from '@/supabase/functions/_shared/gemini';
 
 /**
  * Development-only stand-in for the find-relevant-notes Edge Function, so the
@@ -95,6 +95,8 @@ export async function POST(request: Request) {
       category: typeof note.category === 'string' ? note.category : null,
     }));
   const goalContext = readGoalContext(body?.domain);
+  const tier = readModelTier(body?.model_tier);
+  const model = modelForTier(tier);
   const excludeNoteId = typeof body?.exclude_note_id === 'string' ? body.exclude_note_id : null;
 
   if (notes.length === 0) {
@@ -106,7 +108,7 @@ export async function POST(request: Request) {
 
   // Next.js prefers a variable already set in the shell over .env.local, so a
   // stale key can hide here. Printing its ends shows which one is in use.
-  console.log(`[local] find-relevant-notes: ${notes.length} notes, OpenRouter key ${maskKey(apiKey)}`);
+  console.log(`[local] find-relevant-notes: ${notes.length} notes, ${tier} mode (${model}), OpenRouter key ${maskKey(apiKey)}`);
 
   const draft = condenseDraft(draftText);
   const insightFor = (results: RelevanceResult[]) =>
@@ -117,7 +119,7 @@ export async function POST(request: Request) {
       results,
       excludeNoteId,
       generate: withFailureLog('insight call', (prompt) =>
-        generateWithGemini(INSIGHT_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], apiKey, undefined, {
+        generateWithGemini(INSIGHT_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], apiKey, model, {
           responseMimeType: 'application/json',
           temperature: 0.2,
           maxOutputTokens: 3000,
@@ -131,7 +133,7 @@ export async function POST(request: Request) {
     concurrency: DEFAULT_AGENT_CONCURRENCY,
     isRetryable: isRetryableGeminiError,
     generate: withFailureLog('agent call', (prompt: string) =>
-      generateWithGemini(AGENT_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], apiKey, undefined, {
+      generateWithGemini(AGENT_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], apiKey, model, {
         responseMimeType: 'application/json',
         temperature: 0.2,
       })),

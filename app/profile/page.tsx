@@ -7,6 +7,7 @@ import SidebarMain from '@/components/SidebarMain';
 import { useAuth } from '@/lib/auth-context';
 import { supabase } from '@/lib/supabase';
 import { useTheme, ThemePreference } from '@/lib/theme-context';
+import { AiMode, setAiMode, useAiMode } from '@/lib/ai-mode';
 import { getNotes } from '@/lib/notes-api';
 import {
   Camera,
@@ -40,6 +41,7 @@ export default function ProfilePage() {
   const router = useRouter();
   const { user, signOut } = useAuth();
   const { preference: themePref, setPreference: setThemePref } = useTheme();
+  const aiMode = useAiMode();
 
   const [profile, setProfile] = useState<ProfileData>({ full_name: '', avatar_url: null });
   const [editName, setEditName] = useState('');
@@ -239,6 +241,36 @@ export default function ProfilePage() {
             </div>
             <p className="text-[11px] text-muted-foreground/50 mt-3">
               {themePref === 'auto' ? 'Follows your device system preference.' : themePref === 'dark' ? 'Always dark, regardless of device setting.' : 'Always light, regardless of device setting.'}
+            </p>
+          </div>
+
+          <div className="bg-card border border-border rounded-2xl p-6 mb-4 shadow-sm">
+            <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-4">AI mode</h2>
+            <div className="flex items-center gap-2" role="radiogroup" aria-label="AI mode">
+              {(['basic', 'best'] as AiMode[]).map((option) => {
+                const active = aiMode === option;
+                return (
+                  <button
+                    key={option}
+                    role="radio"
+                    aria-checked={active}
+                    onClick={() => setAiMode(option)}
+                    className={`px-4 py-1.5 rounded-lg text-sm font-medium border transition-all ${
+                      active
+                        ? 'text-white border-transparent'
+                        : 'text-muted-foreground border-border hover:text-foreground hover:border-border/80'
+                    }`}
+                    style={active ? { backgroundColor: '#487BE9', borderColor: '#487BE9' } : undefined}
+                  >
+                    {option === 'basic' ? 'Basic' : 'Best'}
+                  </button>
+                );
+              })}
+            </div>
+            <p className="text-[11px] text-muted-foreground/50 mt-3">
+              {aiMode === 'basic'
+                ? 'A much cheaper model, for testing. Related notes and insights will be rougher. Saved on this device.'
+                : 'The full model, used by default. Gives the most careful related notes and insights.'}
             </p>
           </div>
 

@@ -20,6 +20,7 @@ import {
   RelevantNotesResponse,
 } from './types';
 import { readRelevanceResponse } from './relevance-stream';
+import { getAiMode } from './ai-mode';
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
@@ -585,7 +586,7 @@ export async function findRelevantNotes(
         'Content-Type': 'application/json',
       },
       // The Domain's goal lives in this browser, so it travels with the search.
-      body: JSON.stringify({ draft_text: draftText, exclude_note_id: excludeNoteId ?? null, domain: domain ?? null, stream: true }),
+      body: JSON.stringify({ draft_text: draftText, exclude_note_id: excludeNoteId ?? null, domain: domain ?? null, model_tier: getAiMode(), stream: true }),
     });
   } catch (error) {
     // A missing Edge Function or failed CORS preflight surfaces as an opaque
