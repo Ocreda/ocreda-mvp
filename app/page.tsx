@@ -1251,6 +1251,7 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
   const [summaryOpen, setSummaryOpen] = useState(true);
   const [selectedNoteId, setSelectedNoteId] = useState<string | null>(null);
   const [panelNoteId, setPanelNoteId] = useState<string | null>(null);
+  const [insightActionStates, setInsightActionStates] = useState<InsightActionStates>(() => readInsightActionStates(userId, note.id));
   const [flippedReasonById, setFlippedReasonById] = useState<Record<string, boolean>>({});
   const [retrieval, setRetrieval] = useState<RelevanceSearch | null>(null);
   const [retrievalLoading, setRetrievalLoading] = useState(false);
@@ -1351,6 +1352,10 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
   const panelNote = panelNoteId ? allNotes.find((item) => item.id === panelNoteId) ?? null : null;
   const insights = useMemo(() => retrieval?.insights ?? [], [retrieval]);
   const insight = insights[Math.min(selectedInsightIndex, insights.length - 1)] ?? null;
+  /** The relation of an insight's strongest cited note, so its highlight says what it opens. */
+  const relationOf = useCallback((item: NoteInsight) => item.note_ids.map((id) => relevanceByNoteId.get(id)?.relation_type).find(Boolean) ?? null, [relevanceByNoteId]);
+  /** The insight rests only on notes this one helps, so its card points at where the lesson applies. */
+  const isOutbound = (item: NoteInsight) => item.note_ids.every((id) => relevanceByNoteId.get(id)?.direction === 'outbound');
   const displayedBody = body || note.raw_text;
   const formattedBody = hasNoteFormatting(displayedBody);
   // One highlight per insight whose passage is visible, in reading order.
@@ -1359,19 +1364,33 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
     if (editing || formattedBody) return [];
     const found: { start: number; end: number; index: number }[] = [];
     insights.forEach((item, index) => {
+      const actionId = insightActionId(item, relationOf(item));
+      if (insightActionStates[actionId]?.status === 'dismissed') return;
       const span = item.anchor ? findAnchor(displayedBody, item.anchor) : null;
       if (span && !found.some((taken) => span.start < taken.end && taken.start < span.end)) found.push({ ...span, index });
     });
     return found.sort((x, y) => x.start - y.start);
-  }, [displayedBody, editing, formattedBody, insights]);
+  }, [displayedBody, editing, formattedBody, insightActionStates, insights, relationOf]);
 
   // A new search starts back on its strongest insight.
   useEffect(() => { setSelectedInsightIndex(0); }, [retrieval]);
 
-  /** The relation of an insight's strongest cited note, so its highlight says what it opens. */
-  const relationOf = (item: NoteInsight) => item.note_ids.map((id) => relevanceByNoteId.get(id)?.relation_type).find(Boolean) ?? null;
-  /** The insight rests only on notes this one helps, so its card points at where the lesson applies. */
-  const isOutbound = (item: NoteInsight) => item.note_ids.every((id) => relevanceByNoteId.get(id)?.direction === 'outbound');
+  const updateInsightAction = (actionId: string, next: InsightActionState) => {
+    setInsightActionStates((current) => {
+      const updated = { ...current, [actionId]: next };
+      persistInsightActionStates(userId, note.id, updated);
+      return updated;
+    });
+  };
+
+  const visibleInsightEntries = insights
+    .map((item, index) => {
+      const relation = relationOf(item);
+      const actionId = insightActionId(item, relation);
+      return { item, index, relation, actionId, actionState: insightActionStates[actionId] ?? IDLE_INSIGHT_ACTION };
+    })
+    .filter((entry) => entry.actionState.status !== 'dismissed')
+    .slice(0, 3);
 
   const selectInsight = (index: number) => {
     setSelectedInsightIndex(index);
@@ -1464,18 +1483,34 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
   {highlights.map((span, position) => {
     const item = insights[span.index];
     const relation = relationOf(item);
+    const actionState = insightActionStates[insightActionId(item, relation)] ?? IDLE_INSIGHT_ACTION;
+    const effectiveRelation = actionState.status === 'helps' ? 'helps' : relation;
+    const relationLabel = actionState.status === 'solved' ? 'Solved' : effectiveRelation ? RELATION_LABELS[effectiveRelation] : '';
+    const relationClass = actionState.status === 'solved'
+      ? 'bg-[#e0f4e6] text-[#287141]'
+      : actionState.status === 'helps'
+        ? 'bg-[#e0f4e6] text-[#2c7b45]'
+        : effectiveRelation ? RELATION_BADGES[effectiveRelation]?.className ?? 'bg-[#eef1f6] text-[#5d6b85]' : '';
     const active = item === insight;
+    const openInsight = () => {
+      if (relation === 'extends' && actionState.status === 'merged' && item.note_ids[0]) {
+        setSummaryOpen(true);
+        setPanelNoteId(item.note_ids[0]);
+        return;
+      }
+      selectInsight(span.index);
+    };
     return <Fragment key={span.index}>
       {displayedBody.slice(position === 0 ? 0 : highlights[position - 1].end, span.start)}
       <mark
         role="button"
         tabIndex={0}
-        onClick={(event) => { event.stopPropagation(); selectInsight(span.index); }}
-        onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); selectInsight(span.index); } }}
+        onClick={(event) => { event.stopPropagation(); openInsight(); }}
+        onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); openInsight(); } }}
         aria-pressed={active}
-        title="See what your notes say about this"
+        title={relation === 'extends' && actionState.status === 'merged' ? 'Open the note that extends this' : 'See what your notes say about this'}
         className={`cursor-pointer rounded-sm px-0.5 text-inherit underline decoration-2 underline-offset-4 [box-decoration-break:clone] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${active ? 'bg-[#ffe699] decoration-[#d49b12]' : 'bg-[#fff6d9] decoration-[#ead089] hover:bg-[#fff0bd]'}`}
-      >{displayedBody.slice(span.start, span.end)}{relation && <span className={`ml-1 inline-block rounded px-1 align-[1px] text-[10px] font-medium leading-4 ${RELATION_BADGES[relation]?.className ?? 'bg-[#eef1f6] text-[#5d6b85]'}`}>{RELATION_LABELS[relation]}</span>}</mark>
+      >{displayedBody.slice(span.start, span.end)}{relationLabel && <span className={`ml-1 inline-block rounded px-1 align-[1px] text-[10px] font-medium leading-4 ${relationClass}`}>{relationLabel}</span>}</mark>
     </Fragment>;
   })}
   {displayedBody.slice(highlights[highlights.length - 1].end)}
@@ -1508,8 +1543,8 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
                 <section aria-labelledby="suggestions-heading">
                   <div className="mb-4 flex items-center justify-between gap-3"><h2 id="suggestions-heading" className="text-sm font-medium text-[#555]">Suggestions</h2><span className="text-[11px] text-[#999]">Up to 3</span></div>
                   <div className="space-y-4">
-                    {insights.slice(0, 3).map((item, index) => <div key={`${item.intent}-${index}`} id={`suggestion-card-${index}`} onClick={() => setSelectedInsightIndex(index)} className={selectedInsightIndex === index ? 'rounded-xl ring-2 ring-[#477bea]/20' : ''}>
-                      <InsightCard insight={item} notesById={noteById} relation={relationOf(item)} outbound={isOutbound(item)} onSelectNote={showCitedNote} />
+                    {visibleInsightEntries.map(({ item, index, relation, actionId, actionState }) => <div key={actionId} id={`suggestion-card-${index}`} onClick={() => setSelectedInsightIndex(index)} className={selectedInsightIndex === index ? 'rounded-xl ring-2 ring-[#477bea]/20' : ''}>
+                      <InsightCard insight={item} notesById={noteById} relation={relation} outbound={isOutbound(item)} actionState={actionState} onActionChange={(next) => updateInsightAction(actionId, next)} onSelectNote={showCitedNote} />
                     </div>)}
                     {!insights.length && retrieval?.summary && <section className="rounded-xl border border-[#eadb99] bg-[#fffdf4] p-5 shadow-sm"><span className="rounded-md bg-[#fff2b8] px-2 py-1 text-xs font-medium text-[#8a6a00]">Insight</span><p className="mt-4 text-sm leading-relaxed text-[#3d3828]">{retrieval.summary}</p></section>}
                     {!retrieval && !searchRequested && !noteTooShortForRetrieval && hasOtherNotes && <div className="rounded-xl border border-dashed border-[#d5d9e3] bg-white p-7 text-center"><h3 className="font-medium">See what your notes suggest</h3><p className="mt-2 text-sm leading-relaxed text-[#777]">Search your other notes for contradictions, solutions, help, extensions, and insights.</p><button type="button" onClick={() => { setSearchRequested(true); setRetrievalAttempt((attempt) => attempt + 1); }} className="mt-4 rounded-md bg-[#477bea] px-4 py-2 text-sm text-white hover:bg-[#3d6ed7]">Find related notes</button></div>}
@@ -1845,6 +1880,44 @@ const INTENT_LABELS: Record<InsightIntent, string> = {
 
 type SuggestionKind = 'contradiction' | 'solution' | 'helps' | 'extension' | 'insight';
 
+type InsightActionStatus = 'idle' | 'writing' | 'saved' | 'declined' | 'solved' | 'helps' | 'merging' | 'merged' | 'dismissed';
+type InsightActionState = { status: InsightActionStatus; response?: string };
+type InsightActionStates = Record<string, InsightActionState>;
+
+const IDLE_INSIGHT_ACTION: InsightActionState = { status: 'idle' };
+
+function insightActionId(insight: NoteInsight, relation: NoteRelationType | null): string {
+  const source = `${suggestionKindFor(relation)}|${insight.anchor}|${insight.text}|${insight.action}|${insight.note_ids.join(',')}`;
+  return `${suggestionKindFor(relation)}:${Math.abs(stableHash(source))}`;
+}
+
+function insightActionsStorageKey(userId: string, noteId: string): string {
+  return `ocreda-insight-actions:v1:${userId}:${noteId}`;
+}
+
+function readInsightActionStates(userId: string, noteId: string): InsightActionStates {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(insightActionsStorageKey(userId, noteId)) ?? '{}') as Record<string, unknown>;
+    const statuses: InsightActionStatus[] = ['idle', 'writing', 'saved', 'declined', 'solved', 'helps', 'merging', 'merged', 'dismissed'];
+    return Object.fromEntries(Object.entries(parsed).flatMap(([key, value]) => {
+      if (!value || typeof value !== 'object') return [];
+      const candidate = value as { status?: unknown; response?: unknown };
+      if (typeof candidate.status !== 'string' || !statuses.includes(candidate.status as InsightActionStatus)) return [];
+      return [[key, { status: candidate.status as InsightActionStatus, ...(typeof candidate.response === 'string' ? { response: candidate.response } : {}) }]];
+    }));
+  } catch {
+    return {};
+  }
+}
+
+function persistInsightActionStates(userId: string, noteId: string, states: InsightActionStates): void {
+  try {
+    localStorage.setItem(insightActionsStorageKey(userId, noteId), JSON.stringify(states));
+  } catch {
+    // A disabled or full browser store should not block the note workspace.
+  }
+}
+
 const SUGGESTION_STYLES: Record<SuggestionKind, { label: string; border: string; badge: string; action: string; actionText: string }> = {
   contradiction: { label: 'Contradiction', border: 'border-[#f3c2c2]', badge: 'bg-[#ffe1e1] text-[#c64747]', action: 'bg-[#fff0f0]', actionText: 'text-[#8f3c3c]' },
   solution: { label: 'Solution', border: 'border-[#bfd2ff]', badge: 'bg-[#dfe9ff] text-[#3f6ed3]', action: 'bg-[#edf3ff]', actionText: 'text-[#315fc5]' },
@@ -1861,21 +1934,121 @@ function suggestionKindFor(relation: NoteRelationType | null): SuggestionKind {
   return 'insight';
 }
 
+function InsightActionBox({ kind, insight, state, onChange, onSelectNote }: {
+  kind: SuggestionKind;
+  insight: NoteInsight;
+  state: InsightActionState;
+  onChange: (state: InsightActionState) => void;
+  onSelectNote: (noteId: string) => void;
+}) {
+  const [draft, setDraft] = useState(state.response ?? (kind === 'extension' ? insight.action : ''));
+
+  useEffect(() => {
+    if (state.status !== 'writing' && state.status !== 'merging') setDraft(state.response ?? (kind === 'extension' ? insight.action : ''));
+  }, [insight.action, kind, state.response, state.status]);
+
+  if (kind === 'helps') return <div className="mt-4 rounded-lg bg-[#eef8f1] px-3 py-3">
+    <p className="text-[11px] font-medium text-[#2c7b45]">This might help</p>
+    <p className="mt-1 text-[13px] leading-relaxed text-[#28623b]">{insight.action}</p>
+  </div>;
+
+  if (kind === 'insight') return <div className="mt-4 rounded-lg bg-[#fff9df] px-3 py-3">
+    <p className="text-[11px] font-medium text-[#8a6a00]">A pattern across your notes</p>
+    <p className="mt-1 text-[13px] leading-relaxed text-[#735d12]">{insight.action}</p>
+  </div>;
+
+  if (kind === 'solution') {
+    if (state.status === 'solved') return <div className="mt-4 rounded-lg border border-[#c7e7d0] bg-[#eef8f1] px-3 py-3">
+      <p className="flex items-center gap-1.5 text-[11px] font-medium text-[#287141]"><Check className="h-3.5 w-3.5" /> Solved</p>
+      <p className="mt-1 text-[13px] leading-relaxed text-[#28623b]">{insight.action}</p>
+    </div>;
+    return <div className="mt-4 rounded-lg bg-[#edf3ff] px-3 py-3">
+      <p className="text-[11px] font-medium text-[#315fc5]">Is this solved?</p>
+      <p className="mt-1 text-[13px] leading-relaxed text-[#315078]">{insight.action}</p>
+      <div className="mt-3 flex gap-2">
+        <button type="button" onClick={(event) => { event.stopPropagation(); onChange({ status: 'solved' }); }} aria-label="Mark this as solved" title="Solved" className="flex h-8 w-8 items-center justify-center rounded-md bg-[#477bea] text-white hover:bg-[#3d6ed7] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] focus-visible:ring-offset-2"><Check className="h-4 w-4" /></button>
+        <button type="button" onClick={(event) => { event.stopPropagation(); onChange({ status: 'helps' }); }} aria-label="This helps but does not solve it" title="Not solved — keep as helpful" className="flex h-8 w-8 items-center justify-center rounded-md bg-white text-[#999] hover:bg-[#f5f5f5] hover:text-[#555] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]"><X className="h-4 w-4" /></button>
+      </div>
+    </div>;
+  }
+
+  if (kind === 'extension') {
+    if (state.status === 'merging') return <div className="mt-4 rounded-lg bg-[#f6f0fc] px-3 py-3">
+      <label className="text-[11px] font-medium text-[#7348a7]" htmlFor={`extension-${Math.abs(stableHash(insight.text))}`}>Edit the extension</label>
+      <textarea id={`extension-${Math.abs(stableHash(insight.text))}`} autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onClick={(event) => event.stopPropagation()} rows={3} className="mt-2 w-full resize-y rounded-md border border-[#d8c4ef] bg-white px-3 py-2 text-[13px] leading-relaxed text-[#4d3569] outline-none focus:border-[#9a72c5] focus:ring-2 focus:ring-[#d8c4ef]" />
+      <div className="mt-2 flex gap-2">
+        <button type="button" disabled={!draft.trim()} onClick={(event) => { event.stopPropagation(); onChange({ status: 'merged', response: draft.trim() }); }} className="rounded-md bg-[#8254b5] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#70449f] disabled:opacity-40">Save extension</button>
+        <button type="button" onClick={(event) => { event.stopPropagation(); onChange({ status: 'dismissed' }); }} aria-label="Dismiss extension" className="flex h-7 w-7 items-center justify-center rounded-md bg-white text-[#999] hover:text-[#555]"><X className="h-3.5 w-3.5" /></button>
+      </div>
+    </div>;
+    if (state.status === 'merged') return <div className="mt-4 rounded-lg bg-[#f6f0fc] px-3 py-3">
+      <p className="text-[11px] font-medium text-[#7348a7]">Extends this</p>
+      <button type="button" onClick={(event) => { event.stopPropagation(); if (insight.note_ids[0]) onSelectNote(insight.note_ids[0]); }} className="mt-1 block w-full rounded text-left text-[13px] leading-relaxed text-[#62408a] hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#8254b5]">{state.response || insight.action}</button>
+      <button type="button" onClick={(event) => { event.stopPropagation(); setDraft(state.response || insight.action); onChange({ status: 'merging', response: state.response || insight.action }); }} className="mt-2 text-xs font-medium text-[#7348a7] hover:underline">Edit</button>
+    </div>;
+    return <div className="mt-4 rounded-lg bg-[#f6f0fc] px-3 py-3">
+      <p className="text-[11px] font-medium text-[#7348a7]">Extends this</p>
+      <p className="mt-1 text-[13px] leading-relaxed text-[#62408a]">{insight.action}</p>
+      <div className="mt-3 flex gap-2">
+        <button type="button" onClick={(event) => { event.stopPropagation(); setDraft(insight.action); onChange({ status: 'merging', response: insight.action }); }} className="rounded-md bg-white px-3 py-1.5 text-xs font-medium text-[#7348a7] shadow-sm hover:bg-[#eee2fb]">Merge</button>
+        <button type="button" onClick={(event) => { event.stopPropagation(); onChange({ status: 'dismissed' }); }} aria-label="Dismiss extension" title="Dismiss" className="flex h-8 w-8 items-center justify-center rounded-md bg-white text-[#999] hover:text-[#555]"><X className="h-4 w-4" /></button>
+      </div>
+    </div>;
+  }
+
+  if (state.status === 'writing') return <div className="mt-4 rounded-lg bg-[#fff0f0] px-3 py-3">
+    <label className="text-[11px] font-medium text-[#c64747]" htmlFor={`contradiction-${Math.abs(stableHash(insight.text))}`}>Reconcile these beliefs</label>
+    <textarea id={`contradiction-${Math.abs(stableHash(insight.text))}`} autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onClick={(event) => event.stopPropagation()} rows={3} placeholder="Write what you believe now…" className="mt-2 w-full resize-y rounded-md border border-[#f3c2c2] bg-white px-3 py-2 text-[13px] leading-relaxed text-[#6f3333] outline-none focus:border-[#d47a7a] focus:ring-2 focus:ring-[#f3c2c2]" />
+    <div className="mt-2 flex gap-2">
+      <button type="button" disabled={!draft.trim()} onClick={(event) => { event.stopPropagation(); onChange({ status: 'saved', response: draft.trim() }); }} className="rounded-md bg-[#d65d5d] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#c34f4f] disabled:opacity-40">Save</button>
+      <button type="button" onClick={(event) => { event.stopPropagation(); onChange({ status: 'declined' }); }} aria-label="Decline writing" className="flex h-7 w-7 items-center justify-center rounded-md bg-white text-[#999] hover:text-[#555]"><X className="h-3.5 w-3.5" /></button>
+    </div>
+  </div>;
+
+  if (state.status === 'saved') return <div className="mt-4 rounded-lg border border-[#f3c2c2] bg-[#fff0f0] px-3 py-3">
+    <p className="text-[11px] font-medium text-[#c64747]">How you reconcile it</p>
+    <p className="mt-1 whitespace-pre-wrap text-[13px] leading-relaxed text-[#6f3333]">{state.response}</p>
+    <button type="button" onClick={(event) => { event.stopPropagation(); setDraft(state.response ?? ''); onChange({ status: 'writing', response: state.response }); }} className="mt-2 text-xs font-medium text-[#a84444] hover:underline">Edit</button>
+  </div>;
+
+  if (state.status === 'declined') return <div className="mt-4 rounded-lg bg-[#fff0f0] px-3 py-3">
+    <p className="text-[11px] font-medium text-[#c64747]">Write about the contradiction</p>
+    <p className="mt-1 text-[12px] text-[#a97878]">You chose not to write about this right now.</p>
+  </div>;
+
+  return <div className="mt-4 rounded-lg bg-[#fff0f0] px-3 py-3">
+    <p className="text-[11px] font-medium text-[#c64747]">Write about the contradiction</p>
+    <p className="mt-1 text-[13px] leading-relaxed text-[#8f3c3c]">{insight.action}</p>
+    <div className="mt-3 flex gap-2">
+      <button type="button" onClick={(event) => { event.stopPropagation(); setDraft(''); onChange({ status: 'writing' }); }} className="rounded-md bg-white px-3 py-1.5 text-xs font-medium text-[#a84444] shadow-sm hover:bg-[#ffe1e1]">Write here</button>
+      <button type="button" onClick={(event) => { event.stopPropagation(); onChange({ status: 'declined' }); }} aria-label="Decline writing" title="Not now" className="flex h-8 w-8 items-center justify-center rounded-md bg-white text-[#999] hover:text-[#555]"><X className="h-4 w-4" /></button>
+    </div>
+  </div>;
+}
+
 /**
  * The one thing from past notes that should change what the person does next:
  * what those notes add, and a step to take. The cited notes are listed so the
  * claim can be checked against the person's own words.
  */
-function InsightCard({ insight, notesById, relation = null, outbound = false, position, compact = false, showAnchor = true, onSelectNote }: {
+function InsightCard({ insight, notesById, relation = null, outbound = false, position, compact = false, showAnchor = true, actionState, onActionChange, onSelectNote }: {
   insight: NoteInsight; notesById: Map<string, Note>; relation?: NoteRelationType | null; compact?: boolean; showAnchor?: boolean;
   /** True when this note is the lesson and the cited notes are where it applies. */
   outbound?: boolean;
   /** Present when the note has several insights, to step between them from the card. */
   position?: { index: number; total: number; onSelect: (index: number) => void };
+  actionState?: InsightActionState;
+  onActionChange?: (state: InsightActionState) => void;
   onSelectNote: (noteId: string) => void;
 }) {
+  const [localActionState, setLocalActionState] = useState<InsightActionState>(IDLE_INSIGHT_ACTION);
+  const currentActionState = actionState ?? localActionState;
+  const updateActionState = onActionChange ?? setLocalActionState;
+  if (currentActionState.status === 'dismissed') return null;
   const cited = insight.note_ids.map((id) => notesById.get(id)).filter((note): note is Note => note !== undefined);
-  const style = SUGGESTION_STYLES[suggestionKindFor(relation)];
+  const originalKind = suggestionKindFor(relation);
+  const kind = originalKind === 'solution' && currentActionState.status === 'helps' ? 'helps' : originalKind;
+  const style = SUGGESTION_STYLES[kind];
   return (
     <section aria-label={`${style.label} suggestion`} className={`rounded-xl border bg-white shadow-sm ${style.border} ${compact ? 'p-4' : 'p-6'}`}>
       <div className="flex items-center justify-between gap-2">
@@ -1888,18 +2061,15 @@ function InsightCard({ insight, notesById, relation = null, outbound = false, po
       </div>
       {showAnchor && insight.anchor && <blockquote className="mt-3 border-l-2 border-[#f0c85a] pl-3 text-xs italic leading-relaxed text-[#777]">“{insight.anchor}”</blockquote>}
       <p className={`mt-3 leading-relaxed text-[#222] ${compact ? 'text-[13px]' : 'text-[15px]'}`}>{insight.text}</p>
-      <div className={`mt-4 rounded-lg px-3 py-2.5 ${style.action}`}>
-        <p className={`text-[11px] font-medium ${style.actionText}`}>What you can do</p>
-        <p className={`mt-1 text-[13px] leading-relaxed ${style.actionText}`}>{insight.action}</p>
-      </div>
-      {cited.length > 0 && <div className="mt-4">
-        <p className="text-[11px] text-[#999]">{outbound ? 'Where this applies' : 'From your notes'}</p>
-        <ul className="mt-1.5 flex flex-wrap gap-1.5">
+      <InsightActionBox kind={kind} insight={insight} state={currentActionState} onChange={updateActionState} onSelectNote={onSelectNote} />
+      {cited.length > 0 && <details className="group mt-4 border-t border-[#ececef] pt-3">
+        <summary className="flex cursor-pointer list-none items-center justify-center gap-1 text-[11px] text-[#aaa] hover:text-[#666] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]"><span>{outbound ? 'Where this applies' : 'Notes used'}</span><ChevronDown className="h-3.5 w-3.5 transition-transform group-open:rotate-180" /></summary>
+        <ul className="mt-2 flex flex-wrap justify-center gap-1.5">
           {cited.map((note) => <li key={note.id} className="min-w-0">
             <button type="button" onClick={() => onSelectNote(note.id)} title={noteLabel(note)} className="block max-w-[240px] truncate rounded-md border border-[#e0e0e0] bg-[#fafafb] px-2 py-1 text-[11px] text-[#555] hover:border-[#8fb1ff] hover:text-[#477bea] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">{noteLabel(note)}</button>
           </li>)}
         </ul>
-      </div>}
+      </details>}
     </section>
   );
 }
