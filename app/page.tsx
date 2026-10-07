@@ -226,8 +226,8 @@ export default function OcredaHome() {
   const [noteEditor, setNoteEditor] = useState<NoteEditorState | null>(null);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
   const [activeNoteRetrievalMode, setActiveNoteRetrievalMode] = useState<'similar' | 'relevant'>('relevant');
-  // False when a note is only being looked at, e.g. opened from another note's
-  // related notes, so reading it does not spend an AI search.
+  // Note-to-note navigation enables this so the destination restores or finds
+  // its own connections without requiring another click.
   const [activeNoteAutoSearch, setActiveNoteAutoSearch] = useState(true);
   const [museEditor, setMuseEditor] = useState<MuseEditorState | null>(null);
   const [projectEditor, setProjectEditor] = useState<ProjectEditorState | null>(null);
@@ -1254,7 +1254,8 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
   const [insightActionStates, setInsightActionStates] = useState<InsightActionStates>(() => readInsightActionStates(userId, note.id));
   const [flippedReasonById, setFlippedReasonById] = useState<Record<string, boolean>>({});
   const [retrieval, setRetrieval] = useState<RelevanceSearch | null>(null);
-  const [retrievalLoading, setRetrievalLoading] = useState(false);
+  // Avoid briefly showing "Not searched yet" before an automatic search starts.
+  const [retrievalLoading, setRetrievalLoading] = useState(autoSearch);
   const [retrievalProgress, setRetrievalProgress] = useState<RelevanceProgress | null>(null);
   const [retrievalError, setRetrievalError] = useState('');
   const [retrievalAttempt, setRetrievalAttempt] = useState(0);
@@ -1298,16 +1299,22 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
   useEffect(() => {
     if (!searchRequested) return;
     let active = true;
-    setRetrieval(null); setRetrievalError(''); setRetrievalProgress(null); setSelectedNoteId(null);
+    setRetrievalError(''); setRetrievalProgress(null); setSelectedNoteId(null);
     const inputs = retrievalInputsRef.current;
     const requestNote = { ...inputs.note, raw_text: inputs.rawText || inputs.note.raw_text };
     const requestSignature = retrievalInputSignature(requestNote.raw_text, inputs.goalText, inputs.aiMode);
     const saved = retrievalAttempt === 0 ? readSavedRetrieval(userId, requestNote) : null;
-    if (saved && (retrievalMode === 'similar' || saved.mode === 'relevant')) {
+    const availableNoteIds = new Set(inputs.allNotes.filter((item) => item.id !== requestNote.id).map((item) => item.id));
+    const savedHasVisibleNotes = Boolean(saved?.search.results.some((result) => availableNoteIds.has(result.note_id)));
+    const savedMatchesMode = Boolean(saved && (retrievalMode === 'similar' || saved.mode === 'relevant'));
+    if (saved && savedHasVisibleNotes && savedMatchesMode) {
       setRetrieval(saved.search);
       setRetrievalLoading(false);
       return;
     }
+    // Empty retrievals and caches whose notes no longer exist are not useful
+    // completed searches. Retry instead of leaving the panel blank forever.
+    setRetrieval(null);
     const requestTooShort = requestNote.raw_text.trim().length < MIN_RELEVANCE_DRAFT_CHARS;
     const requestHasOtherNotes = inputs.allNotes.some((item) => item.id !== requestNote.id);
     if (requestTooShort || !requestHasOtherNotes) { setRetrievalLoading(false); return; }
@@ -1526,7 +1533,7 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
             note={panelNote}
             relevance={relevanceByNoteId.get(panelNote.id)}
             onClose={() => setPanelNoteId(null)}
-            onOpenFull={() => void leaveWorkspace(panelNote, false)}
+            onOpenFull={() => void leaveWorkspace(panelNote)}
           /> : <>
           <header className="sticky top-0 z-10 flex min-h-14 shrink-0 items-center justify-between gap-3 border-b border-[#e2e2e2] bg-[#f7f7f9]/95 px-4 py-2 backdrop-blur">
             <div>{aiMode === 'basic' && <Link href="/profile" title="Searching with the cheaper Basic model. Change it in your profile." className="rounded-md border border-[#f0d9a8] bg-[#fff8e8] px-2.5 py-1.5 text-xs text-[#8a6100] hover:border-[#e3b341]">Basic AI</Link>}</div>
