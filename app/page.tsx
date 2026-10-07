@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, ArrowUp, Bold, Check, ChevronDown, ChevronLeft, ChevronRight, Filter, FolderPlus, Grid2X2, Italic, Layers3, List, ListOrdered, Loader as Loader2, Mic, MoreHorizontal, PanelRightOpen, Pin, Plus, RefreshCw, Rows3, ScanSearch, Search, Trash2, Upload, X } from 'lucide-react';
+import { ArrowLeft, ArrowUp, Bold, Check, ChevronDown, ChevronLeft, ChevronRight, Filter, FolderPlus, Grid2X2, Italic, Layers3, List, ListOrdered, Loader as Loader2, Mic, MoreHorizontal, PanelRightOpen, Pin, Plus, Rows3, ScanSearch, Search, Trash2, Upload, X } from 'lucide-react';
 import type { RelevanceProgress } from '@/lib/types';
 import NoteImporter, { ImportNoteDraft } from '@/components/NoteImporter';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
@@ -204,6 +204,7 @@ export default function OcredaHome() {
   const [noteEditor, setNoteEditor] = useState<NoteEditorState | null>(null);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
   const [activeNoteRetrievalMode, setActiveNoteRetrievalMode] = useState<'similar' | 'relevant'>('relevant');
+  const [refreshActiveNoteRetrieval, setRefreshActiveNoteRetrieval] = useState(false);
   const [museEditor, setMuseEditor] = useState<MuseEditorState | null>(null);
   const [projectEditor, setProjectEditor] = useState<ProjectEditorState | null>(null);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
@@ -334,7 +335,12 @@ export default function OcredaHome() {
     setView('muses');
   }, []);
   const openNewNote = (muse = AUTOMATIC_MUSE) => { setError(''); setNoteEditor({ note: null, title: '', body: '', muse, context: 'domain' }); };
-  const openExistingNote = (note: Note) => { setError(''); setActiveNoteRetrievalMode('relevant'); setActiveNoteId(note.id); };
+  const openExistingNote = (note: Note, refreshRetrieval = false) => {
+    setError('');
+    setActiveNoteRetrievalMode('relevant');
+    setRefreshActiveNoteRetrieval(refreshRetrieval);
+    setActiveNoteId(note.id);
+  };
   const createMuseFromEditor = (value: string) => {
     const requested = cleanCategory(value);
     if (!requested) return;
@@ -557,7 +563,7 @@ export default function OcredaHome() {
   return (
     <main className="light h-[100dvh] w-full overflow-hidden bg-white text-[#141414]">
       <section className="relative flex h-full w-full flex-col overflow-hidden bg-white">
-        {activeNoteId && notes.find((note) => note.id === activeNoteId) ? <NoteReadingWorkspace key={activeNoteId} note={notes.find((note) => note.id === activeNoteId)!} allNotes={notes} muses={muses} projects={projects} saving={saving} userId={user?.id ?? 'local'} initialRetrievalMode={activeNoteRetrievalMode} onBack={() => setActiveNoteId(null)} onAddNote={() => openNewNote(cleanCategory(notes.find((note) => note.id === activeNoteId)?.category) ?? AUTOMATIC_MUSE)} onOpenNote={(note) => openExistingNote(note)} onOpenPage={(project, page) => { setActiveNoteId(null); setActiveProjectId(project.id); setActivePageId(page.id); }} onUpdate={updateReadingNote} onChangeDomain={(category) => void changeReadingNoteDomain(activeNoteId, category)} onDelete={removeReadingNote} onSaveRetrieval={saveInstantRetrieval} />
+        {activeNoteId && notes.find((note) => note.id === activeNoteId) ? <NoteReadingWorkspace key={activeNoteId} note={notes.find((note) => note.id === activeNoteId)!} allNotes={notes} muses={muses} projects={projects} saving={saving} userId={user?.id ?? 'local'} initialRetrievalMode={activeNoteRetrievalMode} refreshRetrievalOnOpen={refreshActiveNoteRetrieval} onBack={() => setActiveNoteId(null)} onAddNote={() => openNewNote(cleanCategory(notes.find((note) => note.id === activeNoteId)?.category) ?? AUTOMATIC_MUSE)} onOpenNote={(note) => openExistingNote(note, true)} onOpenPage={(project, page) => { setActiveNoteId(null); setActiveProjectId(project.id); setActivePageId(page.id); }} onUpdate={updateReadingNote} onChangeDomain={(category) => void changeReadingNoteDomain(activeNoteId, category)} onDelete={removeReadingNote} onSaveRetrieval={saveInstantRetrieval} />
           : activeProject && activePage ? <ProjectPageWorkspace key={activePage.id} project={activeProject} page={activePage} notes={notes} muses={muses} projects={projects} saving={saving} onBack={() => setActivePageId(null)} onChange={(page) => updateProjectPage(activeProject.id, page)} onAddNote={() => openNewNote()} onOpenNote={openExistingNote} onOpenPage={(project, page) => { setActiveProjectId(project.id); setActivePageId(page.id); }} onDelete={() => removeProjectPage(activeProject.id, activePage.id)} onSaveRetrieval={saveInstantRetrieval} />
           : activeProject ? <ProjectPagesGrid project={activeProject} onBack={() => { setActiveProjectId(null); setActivePageId(null); }} onAddPage={() => createProjectPage(activeProject.id)} onOpenPage={(page) => setActivePageId(page.id)} onEdit={() => setProjectEditor({ project: activeProject, title: activeProject.title, description: activeProject.description })} onDelete={() => removeProject(activeProject.id)} />
           : isEmpty ? <EmptyWorkspace displayName={displayName} userEmail={user?.email ?? ''} onAddNote={() => openNewNote()} onImport={handleImport} onOpenImport={() => setImportOpen(true)} importError={importError} progress={importProgress} />
@@ -566,7 +572,7 @@ export default function OcredaHome() {
           : <CortexHome projects={projects} muses={muses} pinnedMuseTitles={pinnedMuseTitles} notes={notes} notesByMuse={notesByMuse} userEmail={user?.email ?? ''} busy={saving} onOpenMuses={() => setView('muses')} onOpenMuse={openMuse} onTogglePin={togglePinnedMuse} onAddMuse={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onAddNote={() => openNewNote()} onOpenImport={() => setImportOpen(true)} onOpenPage={(project, page) => { setActiveProjectId(project.id); setActivePageId(page.id); }} onOpenNote={openExistingNote} onSaveRetrieval={saveInstantRetrieval} />}
         {error && !noteEditor && !museEditor && !projectEditor && <div role="alert" className="fixed bottom-5 left-1/2 z-40 max-w-[90vw] -translate-x-1/2 rounded-lg bg-[#202020] px-4 py-3 text-sm text-white shadow-xl">{error}<button type="button" onClick={() => setError('')} aria-label="Dismiss error" className="ml-4"><X className="inline h-4 w-4" /></button></div>}
       </section>
-      {noteEditor && <NoteEditor state={noteEditor} muses={muses} notes={notes} saving={saving} error={error} onChange={setNoteEditor} onCreateMuse={createMuseFromEditor} onClose={() => { setNoteEditor(null); setError(''); }} onSave={() => void saveNote()} onFindRelevantNotes={() => void saveNote(true)} onImport={() => { setImportError(''); setImportOpen(true); }} onDelete={noteEditor.note ? () => void removeNote() : undefined} />}
+      {noteEditor && <NoteEditor state={noteEditor} muses={muses} notes={notes} saving={saving} error={error} onChange={setNoteEditor} onCreateMuse={createMuseFromEditor} onClose={() => { setNoteEditor(null); setError(''); }} onSave={() => void saveNote()} onFindRelevantNotes={() => void saveNote(true)} onImport={() => { setImportError(''); setImportOpen(true); }} onOpenNote={(note) => { setNoteEditor(null); openExistingNote(note, true); }} onDelete={noteEditor.note ? () => void removeNote() : undefined} />}
       {museEditor && <MuseEditor state={museEditor} saving={saving} error={error} onChange={setMuseEditor} onClose={() => { setMuseEditor(null); setError(''); }} onSave={() => void saveMuse()} />}
       {projectEditor && <ProjectEditor state={projectEditor} error={error} onChange={setProjectEditor} onClose={() => { setProjectEditor(null); setError(''); }} onSave={saveProject} />}
       <Dialog open={importOpen} onOpenChange={setImportOpen}>
@@ -1048,8 +1054,8 @@ function NoteDomainPicker({ category, muses, saving, onChange, showPrefix = fals
   );
 }
 
-function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId, initialRetrievalMode, onBack, onAddNote, onOpenNote, onOpenPage, onUpdate, onChangeDomain, onDelete, onSaveRetrieval }: {
-  note: Note; allNotes: Note[]; muses: MuseMeta[]; projects: CortexProject[]; saving: boolean; userId: string; initialRetrievalMode: 'similar' | 'relevant';
+function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId, initialRetrievalMode, refreshRetrievalOnOpen, onBack, onAddNote, onOpenNote, onOpenPage, onUpdate, onChangeDomain, onDelete, onSaveRetrieval }: {
+  note: Note; allNotes: Note[]; muses: MuseMeta[]; projects: CortexProject[]; saving: boolean; userId: string; initialRetrievalMode: 'similar' | 'relevant'; refreshRetrievalOnOpen: boolean;
   onBack: () => void; onAddNote: () => void; onOpenNote: (note: Note) => void; onOpenPage: (project: CortexProject, page: ProjectPage) => void;
   onUpdate: (noteId: string, rawText: string) => Promise<void>; onChangeDomain: (category: string | null) => void; onDelete: (note: Note) => Promise<void>;
   onSaveRetrieval: (queryText: string, resultNotes: Note[], projectId: string, newProjectTitle?: string) => Promise<void>;
@@ -1062,9 +1068,11 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
   const [summaryOpen, setSummaryOpen] = useState(true);
   const [notesOpen, setNotesOpen] = useState(true);
   const [selectedNoteId, setSelectedNoteId] = useState<string | null>(null);
-  const [flippedReasonById, setFlippedReasonById] = useState<Record<string, boolean>>({});
+  const [dismissedConnectionIds, setDismissedConnectionIds] = useState<string[]>([]);
   const [retrieval, setRetrieval] = useState<RelevanceSearch | null>(null);
-  const [retrievalLoading, setRetrievalLoading] = useState(false);
+  // A note with enough text opens in a searching state, never in the misleading
+  // "not searched" state while the automatic retrieval effect starts.
+  const [retrievalLoading, setRetrievalLoading] = useState(true);
   const [retrievalProgress, setRetrievalProgress] = useState<RelevanceProgress | null>(null);
   const [retrievalError, setRetrievalError] = useState('');
   const [retrievalAttempt, setRetrievalAttempt] = useState(0);
@@ -1099,12 +1107,23 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
     // running the more expensive related-note search again.
     if (editing) return;
     let active = true;
-    setRetrieval(null); setRetrievalError(''); setRetrievalProgress(null); setSelectedNoteId(null);
+    setRetrievalError(''); setRetrievalProgress(null); setSelectedNoteId(null);
     const saved = retrievalAttempt === 0 ? readSavedRetrieval(userId, note) : null;
-    if (saved && (retrievalMode === 'similar' || saved.mode === 'relevant')) {
+    const availableNoteIds = new Set(allNotes.filter((item) => item.id !== note.id).map((item) => item.id));
+    const savedHasVisibleNotes = Boolean(saved?.search.results.some((result) => availableNoteIds.has(result.note_id)));
+    const savedMatchesMode = Boolean(saved && (retrievalMode === 'similar' || saved.mode === 'relevant'));
+    if (saved && savedHasVisibleNotes && savedMatchesMode) {
       setRetrieval(saved.search);
-      setRetrievalLoading(false);
-      return;
+      // Normal opens use the saved search immediately. Note-to-note navigation
+      // also paints it immediately, then refreshes it automatically below.
+      if (!refreshRetrievalOnOpen) {
+        setRetrievalLoading(false);
+        return;
+      }
+    } else {
+      // Empty results and results whose notes were deleted are not a completed
+      // retrieval. Search again instead of leaving a blank panel forever.
+      setRetrieval(null);
     }
     if (noteTooShortForRetrieval || !hasOtherNotes) { setRetrievalLoading(false); return; }
     setRetrievalLoading(true);
@@ -1114,12 +1133,16 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
       .catch((err) => { if (active) setRetrievalError(safeErrorMessage(err, 'Could not retrieve related notes.')); })
       .finally(() => { if (active) setRetrievalLoading(false); });
     return () => { active = false; };
-  }, [allNotes, editing, hasOtherNotes, note, noteTooShortForRetrieval, retrievalAttempt, retrievalMode, userId]);
+  }, [allNotes, editing, hasOtherNotes, note, noteTooShortForRetrieval, refreshRetrievalOnOpen, retrievalAttempt, retrievalMode, userId]);
 
   const surfacedNotes = useMemo(() => {
     const notesById = new Map(allNotes.map((item) => [item.id, item]));
-    return (retrieval?.results ?? []).map((result) => notesById.get(result.note_id)).filter((item): item is Note => item !== undefined && item.id !== note.id).slice(0, 8);
-  }, [allNotes, note.id, retrieval]);
+    return (retrieval?.results ?? [])
+      .map((result) => notesById.get(result.note_id))
+      .filter((item): item is Note => item !== undefined && item.id !== note.id)
+      .filter((item) => !dismissedConnectionIds.includes(item.id))
+      .slice(0, 8);
+  }, [allNotes, dismissedConnectionIds, note.id, retrieval]);
 
   useEffect(() => {
     setSelectedNoteId((current) => surfacedNotes.some((item) => item.id === current) ? current : surfacedNotes[0]?.id ?? null);
@@ -1221,9 +1244,6 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
               const content = splitNote(item);
               const retrievalResult = relevanceByNoteId.get(item.id);
               const retrievalReason = retrievalResult?.explanation.trim() ?? '';
-              const retrievalSummary = retrievalResult?.gist.trim() || item.summary?.trim() || notePreview(item);
-              const badge = retrievalResult?.relation_type ? RELATION_BADGES[retrievalResult.relation_type] : null;
-              const flipped = Boolean(flippedReasonById[item.id]);
               return <div
                 key={item.id}
                 role="button"
@@ -1240,18 +1260,19 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
               >
                 <div className="flex items-start justify-between gap-2">
                   {content.hasTitle ? <strong className="min-w-0 flex-1 truncate text-sm text-[#222]">{content.title}</strong> : <span className="min-w-0 flex-1" />}
-                  {badge ? <span className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${badge.className}`}>{badge.label}</span> : <span className="shrink-0 text-[11px] text-[#477bea]">note</span>}
+                  {!retrievalResult?.relation_type && <span className="shrink-0 text-[11px] text-[#477bea]">note</span>}
                 </div>
                 <p className="mt-2 line-clamp-3 text-[13px] leading-relaxed text-[#333]">{content.body || notePreview(item)}</p>
-                {retrievalReason && (retrievalSummary ? <AnnotationFlip
-                  summary={retrievalSummary}
-                  relevance={retrievalReason}
-                  flipped={flipped}
-                  onFlip={() => setFlippedReasonById((current) => ({ ...current, [item.id]: !flipped }))}
-                /> : <div className="mt-2.5 rounded-md bg-[#f4f7ff] px-2.5 py-2">
+                {retrievalResult?.relation_type ? <ConnectionAnnotation
+                  result={retrievalResult}
+                  note={item}
+                  contextKey={note.id}
+                  onDismiss={() => setDismissedConnectionIds((current) => [...current, item.id])}
+                  onOpenSource={() => void leaveWorkspace(item)}
+                /> : retrievalReason ? <div className="mt-2.5 rounded-md bg-[#f4f7ff] px-2.5 py-2">
                   <p className="text-[9px] font-semibold uppercase tracking-[0.09em] text-[#8ba0d8]">Why it’s relevant</p>
                   <p className="mt-1 text-[11px] leading-relaxed text-[#5d6b85]">{retrievalReason}</p>
-                </div>)}
+                </div> : null}
                 <div className="mt-2.5 flex items-center justify-between text-[11px] text-[#aaa]"><span className="truncate">Domain: {cleanCategory(item.category) || 'Instant retrieval'}</span><span className="shrink-0">{formatDate(item.created_at)}</span></div>
               </div>;
             })}
@@ -1499,57 +1520,146 @@ type RelevanceSearch = { results: RelevanceResult[]; coverage: RelevanceCoverage
 // own text under the explanation instead of only its title.
 const RELEVANCE_PAGE_SIZE = 5;
 
-/**
- * Only relationships worth interrupting the reader for get a badge. A relevant
- * note that supports or extends the draft is the default expectation, so saying
- * so adds noise — whereas a note that contradicts the draft, or raises a
- * question it leaves open, is exactly what someone would miss on their own. The
- * full taxonomy still comes back from the API for filtering later.
- */
-const RELATION_BADGES: Partial<Record<NoteRelationType, { label: string; className: string }>> = {
-  contradicts: { label: 'Contradicts', className: 'bg-[#fdecea] text-[#c0392b]' },
-  question: { label: 'Open question', className: 'bg-[#f1eafc] text-[#6b3fc0]' },
-  parallel: { label: 'Parallel', className: 'bg-[#e3f4f1] text-[#1b7a6e]' },
+/** Product language for the five founder-defined connection types. */
+const RELATION_BADGES: Record<NoteRelationType, { label: string; className: string }> = {
+  contradicts: { label: 'Contradiction', className: 'bg-[#ffe9e9] text-[#df6666]' },
+  question: { label: 'Solution', className: 'bg-[#e8f0ff] text-[#5d8ee8]' },
+  supports: { label: 'Helps', className: 'bg-[#e9f8ed] text-[#55a96c]' },
+  extends: { label: 'Extension', className: 'bg-[#f0e5fb] text-[#8550b8]' },
+  parallel: { label: 'Insight', className: 'bg-[#fff3c9] text-[#b28316]' },
 };
 
-/**
- * The tinted annotation under a relevant note, with why-it's-relevant on its
- * front and the note summary on its back. Both faces share one grid cell, so the
- * panel is as tall as the longer of the two and nothing below it jumps when it
- * turns over.
- */
-function AnnotationFlip({ summary, relevance, flipped, onFlip }: {
-  summary: string; relevance: string; flipped: boolean; onFlip: () => void;
+type ConnectionActionState = {
+  contradictionText?: string;
+  contradictionWriting?: boolean;
+  contradictionDeclined?: boolean;
+  solutionDecision?: 'solved' | 'helps';
+  extensionMode?: 'offered' | 'editing' | 'saved';
+  extensionText?: string;
+  dismissed?: boolean;
+};
+
+function connectionActionKey(contextKey: string, noteId: string): string {
+  return `ocreda-connection-action:v1:${contextKey}:${noteId}`;
+}
+
+function readConnectionAction(contextKey: string, noteId: string): ConnectionActionState {
+  try {
+    const value = JSON.parse(localStorage.getItem(connectionActionKey(contextKey, noteId)) ?? '{}') as ConnectionActionState;
+    return value && typeof value === 'object' ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+function ConnectionAnnotation({ result, note, contextKey, onDismiss, onOpenSource }: {
+  result: RelevanceResult; note: Note; contextKey: string; onDismiss: () => void; onOpenSource?: () => void;
 }) {
-  // Each face carries its own tint: green explains how the note bears on the
-  // draft first; blue restates the note after the reader deliberately flips it.
-  const faces = [
-    { key: 'relevance', label: 'Why it’s relevant', text: relevance, action: 'Summary', hidden: flipped, back: false, panel: 'bg-[#e4f2e8]', labelColor: 'text-[#6aa37c]', textColor: 'text-[#4a6b55]' },
-    { key: 'summary', label: 'Summary', text: summary, action: 'Why it’s relevant', hidden: !flipped, back: true, panel: 'bg-[#f4f7ff]', labelColor: 'text-[#8ba0d8]', textColor: 'text-[#5d6b85]' },
-  ];
+  const [state, setState] = useState<ConnectionActionState>({});
+  const onDismissRef = useRef(onDismiss);
+  onDismissRef.current = onDismiss;
+  const relation = state.solutionDecision === 'helps' ? 'supports' : (result.relation_type ?? 'supports');
+  const presentation = RELATION_BADGES[relation];
+  const sourceText = result.gist.trim() || notePreview(note);
+
+  const update = (next: ConnectionActionState) => {
+    setState(next);
+    try { localStorage.setItem(connectionActionKey(contextKey, note.id), JSON.stringify(next)); } catch { /* UI state may remain session-only. */ }
+  };
+
+  const dismissExtension = () => {
+    update({ ...state, dismissed: true });
+    onDismiss();
+  };
+
+  useEffect(() => {
+    const saved = readConnectionAction(contextKey, note.id);
+    setState(saved);
+    if (saved.dismissed) onDismissRef.current();
+  }, [contextKey, note.id]);
+
   return (
-    <div className="mt-2.5 [perspective:900px]">
-      <div className={`grid transition-transform duration-500 ease-out [transform-style:preserve-3d] motion-reduce:transition-none ${flipped ? '[transform:rotateY(180deg)]' : ''}`}>
-        {faces.map((face) => (
-          <div
-            key={face.key}
-            aria-hidden={face.hidden}
-            className={`flex flex-col rounded-md px-2.5 py-2 [backface-visibility:hidden] [grid-area:1/1] ${face.panel} ${face.back ? '[transform:rotateY(180deg)]' : ''}`}
-          >
-            <p className={`text-[9px] font-semibold uppercase tracking-[0.09em] ${face.labelColor}`}>{face.label}</p>
-            <p className={`mt-1 flex-1 text-[11px] leading-relaxed ${face.textColor}`}>{face.text}</p>
-            <button
-              type="button"
-              tabIndex={face.hidden ? -1 : 0}
-              onClick={(event) => { event.stopPropagation(); onFlip(); }}
-              className="mt-1.5 flex items-center gap-1 self-end rounded text-[10px] font-medium text-[#477bea] hover:text-[#2f5fcc] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#8fb1ff]"
-            >
-              {face.action} <RefreshCw className="h-2.5 w-2.5" />
-            </button>
-          </div>
-        ))}
+    <>
+      <div className="mt-2.5 flex items-center gap-2">
+        <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${presentation.className}`}>{presentation.label}</span>
+        <span className="text-[10px] text-[#aaa]">
+          {relation === 'contradicts' ? 'Two beliefs to reconcile' : relation === 'question' ? 'A clear answer' : relation === 'supports' ? 'This might help' : relation === 'extends' ? 'Adds what is missing' : 'A shared structure'}
+        </span>
+        {state.solutionDecision === 'solved' && <span className="ml-auto rounded-full bg-[#e8f0ff] px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-[#477bea]">Solved</span>}
       </div>
-    </div>
+
+      {result.explanation && relation !== 'parallel' && <p className="mt-2 text-[12px] leading-relaxed text-[#333]">{result.explanation}</p>}
+
+      {relation === 'contradicts' && (
+        <div className="mt-2.5 rounded-md bg-[#fff2f2] p-2.5">
+          <p className="text-[10px] font-medium text-[#cf6565]">Write about the contradiction</p>
+          {state.contradictionWriting || state.contradictionText ? (
+            <textarea
+              autoFocus={!state.contradictionText}
+              value={state.contradictionText ?? ''}
+              onClick={(event) => event.stopPropagation()}
+              onChange={(event) => update({ ...state, contradictionWriting: true, contradictionText: event.target.value })}
+              placeholder="What do you believe now?"
+              rows={3}
+              className="mt-2 w-full resize-y rounded-md border border-[#efc5c5] bg-white p-2 text-[11px] leading-relaxed outline-none focus:border-[#df7777]"
+            />
+          ) : (
+            <div className="mt-2 flex items-center gap-2">
+              <button type="button" onClick={(event) => { event.stopPropagation(); update({ ...state, contradictionWriting: true, contradictionDeclined: false }); }} className="rounded bg-white px-2.5 py-1.5 text-[10px] text-[#b85b5b] shadow-sm">Write here</button>
+              {!state.contradictionDeclined && <button type="button" aria-label="Decline writing for now" onClick={(event) => { event.stopPropagation(); update({ ...state, contradictionWriting: false, contradictionDeclined: true }); }} className="rounded bg-white p-1.5 text-[#aaa]"><X className="h-3 w-3" /></button>}
+            </div>
+          )}
+        </div>
+      )}
+
+      {relation === 'question' && (
+        <div className="mt-2.5 rounded-md bg-[#edf3ff] p-2.5">
+          <p className="text-[10px] font-medium text-[#5d8ee8]">{state.solutionDecision === 'solved' ? 'Resolved with this answer' : 'Is this the solution?'}</p>
+          <p className="mt-1 text-[11px] leading-relaxed text-[#536b93]">{sourceText}</p>
+          {!state.solutionDecision && <div className="mt-2 flex items-center gap-2">
+            <button type="button" aria-label="Mark solved" onClick={(event) => { event.stopPropagation(); update({ ...state, solutionDecision: 'solved' }); }} className="rounded bg-[#477bea] p-1.5 text-white"><Check className="h-3.5 w-3.5" /></button>
+            <button type="button" aria-label="Keep as helpful, unresolved" onClick={(event) => { event.stopPropagation(); update({ ...state, solutionDecision: 'helps' }); }} className="rounded bg-white p-1.5 text-[#aaa]"><X className="h-3.5 w-3.5" /></button>
+          </div>}
+        </div>
+      )}
+
+      {relation === 'supports' && (
+        <div className="mt-2.5 rounded-md bg-[#edf9f0] p-2.5">
+          <p className="text-[10px] font-medium text-[#55a96c]">This might help</p>
+          <p className="mt-1 text-[11px] leading-relaxed text-[#4f7359]">{sourceText}</p>
+        </div>
+      )}
+
+      {relation === 'extends' && (
+        <div className="mt-2.5 rounded-md bg-[#f5edfc] p-2.5">
+          <p className="text-[10px] font-medium text-[#8550b8]">{state.extensionMode === 'editing' ? 'Edit the extension' : state.extensionMode === 'saved' ? 'Saved extension' : 'Extends this'}</p>
+          {state.extensionMode === 'editing' ? (
+            <textarea
+              autoFocus
+              value={state.extensionText ?? sourceText}
+              onClick={(event) => event.stopPropagation()}
+              onChange={(event) => update({ ...state, extensionMode: 'editing', extensionText: event.target.value })}
+              rows={4}
+              className="mt-2 w-full resize-y rounded-md border border-[#a86bd1] bg-white p-2 text-[11px] leading-relaxed text-[#604077] outline-none focus:ring-2 focus:ring-[#a86bd1]/20"
+            />
+          ) : (
+            <button type="button" onClick={(event) => { event.stopPropagation(); if (state.extensionMode === 'saved') onOpenSource?.(); }} className={`mt-1 block w-full text-left text-[11px] leading-relaxed text-[#604077] ${state.extensionMode === 'saved' && onOpenSource ? 'hover:underline' : 'cursor-default'}`}>{state.extensionText || sourceText}</button>
+          )}
+          <div className="mt-2 flex items-center gap-2">
+            {state.extensionMode === 'editing' ? <button type="button" onClick={(event) => { event.stopPropagation(); update({ ...state, extensionMode: 'saved', extensionText: (state.extensionText ?? sourceText).trim() }); }} className="rounded bg-[#8550b8] px-2.5 py-1.5 text-[10px] font-medium text-white">Save extension</button>
+              : state.extensionMode !== 'saved' && <button type="button" onClick={(event) => { event.stopPropagation(); update({ ...state, extensionMode: 'editing', extensionText: sourceText }); }} className="rounded bg-white px-2.5 py-1.5 text-[10px] font-medium text-[#8550b8] shadow-sm">Merge</button>}
+            {state.extensionMode !== 'saved' && <button type="button" aria-label="Dismiss extension" onClick={(event) => { event.stopPropagation(); dismissExtension(); }} className="rounded bg-white p-1.5 text-[#aaa]"><X className="h-3 w-3" /></button>}
+          </div>
+        </div>
+      )}
+
+      {relation === 'parallel' && (
+        <div className="mt-2.5 rounded-md bg-[#fff8df] p-2.5">
+          <p className="text-[10px] font-medium text-[#b28316]">A pattern across your notes</p>
+          <p className="mt-1 text-[11px] leading-relaxed text-[#7a682d]">{result.explanation}</p>
+        </div>
+      )}
+    </>
   );
 }
 
@@ -1600,16 +1710,15 @@ function SearchProgress({ notes, progress }: { notes: Note[]; progress: Relevanc
   );
 }
 
-function RelevantNotesPanel({ notes, relevance, loading, progress, error, stale, page, onPageChange, onRetry, onClose }: {
+function RelevantNotesPanel({ notes, relevance, loading, progress, error, stale, page, contextKey, onPageChange, onRetry, onClose, onOpenNote }: {
   notes: Note[]; relevance: RelevanceSearch | null; loading: boolean; progress: RelevanceProgress | null; error: string; stale: boolean;
-  page: number; onPageChange: (page: number) => void; onRetry: () => void; onClose: () => void;
+  page: number; contextKey: string; onPageChange: (page: number) => void; onRetry: () => void; onClose: () => void; onOpenNote: (note: Note) => void;
 }) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
-  // Cards whose annotation has been flipped from the summary to "why it's relevant".
-  const [flippedById, setFlippedById] = useState<Record<string, boolean>>({});
+  const [dismissedIds, setDismissedIds] = useState<string[]>(() => []);
   const noteById = useMemo(() => new Map(notes.map((note) => [note.id, note])), [notes]);
 
-  const results = relevance?.results ?? [];
+  const results = (relevance?.results ?? []).filter((result) => !dismissedIds.includes(result.note_id));
   const pageCount = Math.max(1, Math.ceil(results.length / RELEVANCE_PAGE_SIZE));
   const currentPage = Math.min(page, pageCount - 1);
   const visible = results.slice(currentPage * RELEVANCE_PAGE_SIZE, (currentPage + 1) * RELEVANCE_PAGE_SIZE);
@@ -1667,9 +1776,7 @@ function RelevantNotesPanel({ notes, relevance, loading, progress, error, stale,
               const note = noteById.get(result.note_id);
               if (!note) return null;
               const content = splitNote(note);
-              const badge = result.relation_type ? RELATION_BADGES[result.relation_type] : null;
               const expanded = expandedId === result.note_id;
-              const flipped = Boolean(flippedById[result.note_id]);
               // splitNote treats the first line as a title. For a note written
               // as one block that "title" is just its opening words, which the
               // preview underneath already shows — so only head the card when
@@ -1679,9 +1786,8 @@ function RelevantNotesPanel({ notes, relevance, loading, progress, error, stale,
                 // A div rather than a <button>, because the flip link inside
                 // it is itself a button.
                 <div key={result.note_id} role="button" tabIndex={0} onClick={() => setExpandedId(expanded ? null : result.note_id)} onKeyDown={(event) => { if (event.target === event.currentTarget && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); setExpandedId(expanded ? null : result.note_id); } }} aria-expanded={expanded} className="block w-full cursor-pointer rounded-lg border border-[#e4e4e4] bg-[#fafafb] p-3 text-left transition hover:border-[#8fb1ff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#8fb1ff]">
-                  {(hasHeading || badge) && <div className="mb-2 flex items-start justify-between gap-2">
+                  {hasHeading && <div className="mb-2 flex items-start justify-between gap-2">
                     {hasHeading && <strong className="min-w-0 flex-1 truncate text-sm text-[#222]">{content.title}</strong>}
-                    {badge && <span className={`ml-auto shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${badge.className}`}>{badge.label}</span>}
                   </div>}
                   {/* The note's own words lead, and are the largest, darkest
                       text on the card. line-clamp trails them with an ellipsis
@@ -1692,19 +1798,7 @@ function RelevantNotesPanel({ notes, relevance, loading, progress, error, stale,
                   {/* Set on its own tinted panel, smaller and cooler in tone, so
                       it reads as annotation about the note rather than more of
                       the note. */}
-                  {result.gist ? (
-                    <AnnotationFlip
-                      summary={result.gist}
-                      relevance={result.explanation}
-                      flipped={flipped}
-                      onFlip={() => setFlippedById((current) => ({ ...current, [result.note_id]: !flipped }))}
-                    />
-                  ) : result.explanation ? (
-                    <div className="mt-2.5 rounded-md bg-[#f4f7ff] px-2.5 py-2">
-                      <p className="text-[9px] font-semibold uppercase tracking-[0.09em] text-[#8ba0d8]">Why it’s relevant</p>
-                      <p className="mt-1 text-[11px] leading-relaxed text-[#5d6b85]">{result.explanation}</p>
-                    </div>
-                  ) : null}
+                  <ConnectionAnnotation result={result} note={note} contextKey={contextKey} onDismiss={() => setDismissedIds((current) => [...current, result.note_id])} onOpenSource={() => onOpenNote(note)} />
                   <div className="mt-2.5 flex items-center justify-between text-[11px] text-[#aaa]">
                     <span>{Math.round(result.relevance_score * 100)}% {result.explanation ? 'match' : 'similarity'}</span>
                     <span>{formatDate(note.created_at)}</span>
@@ -1731,10 +1825,10 @@ function RelevantNotesPanel({ notes, relevance, loading, progress, error, stale,
   );
 }
 
-function NoteEditor({ state, muses, notes, saving, error, onChange, onCreateMuse, onClose, onSave, onFindRelevantNotes, onImport, onDelete }: {
+function NoteEditor({ state, muses, notes, saving, error, onChange, onCreateMuse, onClose, onSave, onFindRelevantNotes, onImport, onOpenNote, onDelete }: {
   state: NoteEditorState; muses: MuseMeta[]; notes: Note[]; saving: boolean; error: string;
   onChange: (state: NoteEditorState) => void; onCreateMuse: (title: string) => void;
-  onClose: () => void; onSave: () => void; onFindRelevantNotes: () => void; onImport: () => void; onDelete?: () => void;
+  onClose: () => void; onSave: () => void; onFindRelevantNotes: () => void; onImport: () => void; onOpenNote: (note: Note) => void; onDelete?: () => void;
 }) {
   const bodyRef = useRef<HTMLTextAreaElement>(null);
   const speechRef = useRef<SpeechRecognitionLike | null>(null);
@@ -1861,7 +1955,7 @@ function NoteEditor({ state, muses, notes, saving, error, onChange, onCreateMuse
             <input value={state.title} onFocus={() => setEditingStarted(true)} onChange={(event) => onChange({ ...state, title: event.target.value })} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); setEditingStarted(true); bodyRef.current?.focus(); } }} placeholder={domainCapture ? 'Title' : 'What’s on your mind?'} aria-label="Note title" className={`w-full shrink-0 bg-transparent outline-none placeholder:text-[#555] ${domainCapture ? 'max-w-2xl text-xl font-semibold sm:text-2xl' : 'text-xl font-medium italic sm:text-2xl'}`} />
             <textarea ref={bodyRef} value={state.body} onFocus={() => setEditingStarted(true)} onChange={(event) => onChange({ ...state, body: event.target.value })} placeholder={editingStarted ? '' : domainCapture ? 'Knowledge is what makes people special, and special people do special things, so make this one count.' : "For example: Someone made the point that we mostly don't choose our beliefs, we absorb them and backfill reasons after. Uncomfortable but I can't argue with it. Makes me wonder how much of what I think is actually mine."} aria-label="Note body" className={`mt-5 min-h-0 w-full flex-1 resize-none bg-transparent text-base leading-relaxed outline-none placeholder:text-[#aaa] ${domainCapture ? 'max-w-2xl sm:text-lg sm:leading-[1.65]' : ''}`} />
           </div>
-          {panelOpen && <RelevantNotesPanel notes={notes} relevance={relevance} loading={relevanceLoading} progress={relevanceProgress} error={relevanceError} stale={draftChangedSinceSearch} page={relevancePage} onPageChange={setRelevancePage} onRetry={() => void runRelevanceSearch()} onClose={() => setPanelOpen(false)} />}
+          {panelOpen && <RelevantNotesPanel notes={notes} relevance={relevance} loading={relevanceLoading} progress={relevanceProgress} error={relevanceError} stale={draftChangedSinceSearch} page={relevancePage} contextKey={state.note?.id ?? `draft-${stableHash(searchedDraft || draftText)}`} onPageChange={setRelevancePage} onRetry={() => void runRelevanceSearch()} onClose={() => setPanelOpen(false)} onOpenNote={onOpenNote} />}
         </div>
         <div className={`relative border-t border-[#eee] bg-[#f8f8fa] px-3 py-2 text-sm text-[#555] sm:px-5 ${domainCapture ? 'flex min-h-[62px] flex-col items-stretch gap-2 lg:flex-row lg:items-center lg:gap-1' : 'flex min-h-[58px] flex-wrap items-center gap-1'}`}>
           <div className={`${domainCapture ? 'flex w-full min-w-0 items-center gap-1 overflow-x-auto pb-1 lg:flex-1 lg:overflow-visible lg:pb-0' : 'contents'}`}>

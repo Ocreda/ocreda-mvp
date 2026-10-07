@@ -107,22 +107,25 @@ Score the strength of the connection, NOT how similar the subject matter is. A n
 Below 0.50 - Leave it out of your response entirely.
 
 RELATION TYPE - pick exactly one:
-"supports" - the note gives grounds for what the draft says or feels: evidence, an example, a lived experience, or reasoning that makes it sturdier.
-"extends" - the note stands on the same ground and carries it further: more detail, a consequence, a next step, or a fuller version of the same thought.
+"supports" (shown as "Helps") - the note does not give a definitive answer, but contains a concrete observation or possibility that might help the person decide what to try. Suggest the useful possibility; never order the person to do it.
+"extends" (shown as "Extension") - the note is on the same subject and supplies information the draft lacks. Use the smallest, safest addition that can continue the thought. State the missing information itself; never turn it into an instruction or tell the person what to do.
 "contradicts" - the note pulls against the draft: it states something incompatible, names a cost the draft ignores, or records a position the draft is reversing.
-"question" - the note raises something the draft leaves open: an obstacle, a tension, or a question it brushes past without settling.
-"parallel" - the note is about something else entirely, but the same shape shows up in it: the same pattern, tension, or way of seeing, appearing in a different part of the person's life. The link is structural, not topical.
+"question" (shown as "Solution") - the draft contains an open question or unresolved problem and the note supplies a clear answer to it. Do not use this type merely because a note raises another question.
+"parallel" (shown as "Insight") - the note belongs to an unrelated domain, but the same specific structure appears in both notes. Explain the shared structure without prescribing an action.
 
 GIST - exactly one short sentence: what the note actually says, in your own words. These are the person's own notes, so say it back to them in the second person, the way a friend recapping it would: "You noticed...", "You decided...", "You're worried that...". Never call them "the author", "the writer", "the user", or "this person". Anyone else in the note keeps their name ("Maya told you..."). Keep its specifics (names, numbers, decisions). Do not mention the draft here; this must make sense on its own as a summary of the note.
 
 EXPLANATION - one or two short sentences, in plain language, written to the person who wrote the draft: how the note bears on the draft, naming the specific thing in the draft it touches. Do not restate the gist; the reader sees them separately.
 Write both the way you would explain it to a friend. Address them as "you" and call the draft "your draft". No jargon, no academic register, and never open with "This note highlights/underscores/demonstrates".
 Do the thinking for them: spell the connection out rather than gesturing at it. Never say two things are "both about X" without saying what about X ties them together.
+For Helps, Extensions, and Insights, describe the possibility, missing information, or shared structure without imperatives such as "do", "try", "practice", "use", or "incorporate". Ocreda surfaces the connection; the person decides what to do.
 
 CRITICAL RULES:
 - Many candidate notes will be irrelevant. Returning [] is correct when nothing connects. Do not pad your response.
 - Never include a note merely because it shares words, names, or a broad category with the draft. The connection must be about substance.
 - A "parallel" must name the specific shared structure. An abstraction that both notes merely belong to - "both are about time", "both express awe" - is not a parallel. If the same explanation could be written about a dozen other pairs of notes, leave the note out.
+- An "extends" result must be about the same subject and add information the draft is missing. A merely adjacent idea is not an extension.
+- A "question" result must actually answer an unresolved question in the draft. If it only offers something potentially useful, classify it as "supports" instead.
 - Use the exact ID string as given. Never invent an ID, and never return one that is not listed above.
 
 Worked examples:
