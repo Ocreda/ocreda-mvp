@@ -1,11 +1,47 @@
-import { RelevanceCoverage, RelevanceProgress, RelevanceResult, RelevantNotesResponse } from '@/lib/types';
+import { InsightIntent, NoteInsight, RelevanceCoverage, RelevanceProgress, RelevanceResult, RelevantNotesResponse } from '@/lib/types';
+
+const INTENTS: InsightIntent[] = ['stuck', 'planning', 'deciding', 'capturing', 'reflecting', 'learning'];
+
+/** Undefined when the server sent no insight field at all, null when it sent an explicit "nothing". */
+function readInsight(value: unknown, resultIds: Set<string>): NoteInsight | null | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object') return null;
+  const row = value as Record<string, unknown>;
+  const text = typeof row.text === 'string' ? row.text.trim() : '';
+  const action = typeof row.action === 'string' ? row.action.trim() : '';
+  const noteIds = Array.isArray(row.note_ids) ? row.note_ids.filter((id): id is string => typeof id === 'string' && resultIds.has(id)) : [];
+  if (!text || !action || !noteIds.length) return null;
+  return {
+    anchor: typeof row.anchor === 'string' ? row.anchor : '',
+    intent: INTENTS.includes(row.intent as InsightIntent) ? (row.intent as InsightIntent) : 'reflecting',
+    text,
+    action,
+    note_ids: noteIds,
+  };
+}
 
 function toRelevantNotesResponse(payload: Record<string, unknown> | null): RelevantNotesResponse {
   const results = payload && Array.isArray(payload.results) ? (payload.results as RelevanceResult[]) : [];
   const rawCoverage = payload?.coverage as Partial<RelevanceCoverage> | undefined;
+  const resultIds = new Set(results.map((result) => result.note_id));
+  // Servers from before there could be several send one "insight" instead.
+  const rawInsights = !payload ? undefined
+    : Array.isArray(payload.insights) ? payload.insights
+      : 'insight' in payload ? [payload.insight] : undefined;
+  const insights = rawInsights
+    ?.map((item) => readInsight(item, resultIds))
+    .filter((item): item is NoteInsight => Boolean(item));
+  const rawSuggestions = payload?.goal_suggestions;
+  const goalSuggestions = Array.isArray(rawSuggestions)
+    ? rawSuggestions.filter((item): item is string => typeof item === 'string' && Boolean(item.trim())).map((item) => item.trim())
+    : [];
   return {
     results,
     summary: typeof payload?.summary === 'string' ? payload.summary.trim() : undefined,
+    ...(insights ? { insights } : {}),
+    ...(goalSuggestions.length ? { goal_suggestions: goalSuggestions } : {}),
+    ...(INTENTS.includes(payload?.note_intent as InsightIntent) ? { note_intent: payload?.note_intent as InsightIntent } : {}),
+    ...(payload?.insight_failed === true ? { insight_failed: true } : {}),
     coverage: {
       notes_searched: Number(rawCoverage?.notes_searched ?? 0),
       notes_total: Number(rawCoverage?.notes_total ?? 0),

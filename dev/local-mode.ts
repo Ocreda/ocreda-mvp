@@ -8,8 +8,9 @@
  * file runs unless the flag is set.
  */
 
-import { Note, RelevanceProgress, RelevantNotesResponse } from '@/lib/types';
+import { DomainGoal, Note, NoteImportInput, RelevanceProgress, RelevantNotesResponse } from '@/lib/types';
 import { readRelevanceResponse } from '@/lib/relevance-stream';
+import { getAiMode } from '@/lib/ai-mode';
 
 export const IS_LOCAL_MODE = process.env.NEXT_PUBLIC_LOCAL_MODE === '1';
 
@@ -72,12 +73,12 @@ export function localCreateNote(rawText: string, category: string | null): Note 
 }
 
 export function localImportNotes(
-  rawTexts: string[],
+  inputs: NoteImportInput[],
   onProgress?: (completed: number, total: number) => void
 ): Note[] {
-  const created = rawTexts.map((text) => newNote(text, null));
+  const created = inputs.map((input) => newNote(input.rawText, input.category));
   writeAll([...created, ...readAll()]);
-  onProgress?.(rawTexts.length, rawTexts.length);
+  onProgress?.(inputs.length, inputs.length);
   return created;
 }
 
@@ -117,7 +118,8 @@ export function localMoveNotesToCategory(noteIds: string[], category: string | n
 export async function localFindRelevantNotes(
   draftText: string,
   excludeNoteId?: string | null,
-  onProgress?: (progress: RelevanceProgress) => void
+  onProgress?: (progress: RelevanceProgress) => void,
+  domain?: DomainGoal | null
 ): Promise<RelevantNotesResponse> {
   const notes = localGetNotes()
     .filter((note) => note.id !== excludeNoteId)
@@ -126,12 +128,13 @@ export async function localFindRelevantNotes(
       raw_text: note.raw_text,
       summary: note.summary,
       created_at: note.created_at,
+      category: note.category,
     }));
 
   const response = await fetch('/api/find-relevant-notes', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ draft_text: draftText, notes, stream: true }),
+    body: JSON.stringify({ draft_text: draftText, notes, domain: domain ?? null, model_tier: getAiMode(), stream: true }),
   });
 
   if (!response.ok) {

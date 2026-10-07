@@ -1,15 +1,20 @@
 import { NextResponse } from 'next/server';
 import {
   condenseDraft,
+  findInsight,
+  insightFields,
+  FAILED_INSIGHT,
   mergeAgentResults,
+  readGoalContext,
   runRelevanceAgents,
   streamRelevanceSearch,
   DEFAULT_AGENT_CONCURRENCY,
   DEFAULT_AGENT_COUNT,
   MIN_DRAFT_CHARS,
   type NoteLike,
+  type RelevanceResult,
 } from '@/supabase/functions/_shared/relevance';
-import { generateWithGemini, isRetryableGeminiError } from '@/supabase/functions/_shared/gemini';
+import { generateWithGemini, isRetryableGeminiError, modelForTier, readModelTier } from '@/supabase/functions/_shared/gemini';
 
 /**
  * Development-only stand-in for the find-relevant-notes Edge Function, so the
@@ -24,11 +29,35 @@ import { generateWithGemini, isRetryableGeminiError } from '@/supabase/functions
  */
 
 
-const MAX_RESULTS = 50;
+const MAX_RESULTS = 10;
 const MAX_NOTES = 1000;
+
+const INSIGHT_SYSTEM_PROMPT =
+  'You help a person act on their own past notes. You respond with a JSON object and nothing else.';
 
 const AGENT_SYSTEM_PROMPT =
   "You identify meaningful relationships between a person's notes. You respond with a JSON array and nothing else.";
+
+/** Enough of the key to tell which one the server loaded, without printing it. */
+function maskKey(key: string): string {
+  return key.length > 16 ? `${key.slice(0, 12)}...${key.slice(-4)}` : '(too short to be a real key)';
+}
+
+/**
+ * Wraps a model call so a failure prints its real reason (a 401 for a dead
+ * key, a 402 for no credits, a 429 for rate limiting) before the shared code
+ * turns it into a generic "every agent failed".
+ */
+function withFailureLog(label: string, call: (prompt: string) => Promise<string>) {
+  return async (prompt: string) => {
+    try {
+      return await call(prompt);
+    } catch (error) {
+      console.error(`[local] ${label} failed:`, error instanceof Error ? error.message : error);
+      throw error;
+    }
+  };
+}
 
 function isNoteLike(value: unknown): value is NoteLike {
   if (!value || typeof value !== 'object') return false;
@@ -63,7 +92,12 @@ export async function POST(request: Request) {
       raw_text: note.raw_text,
       summary: note.summary ?? null,
       created_at: note.created_at ?? new Date().toISOString(),
+      category: typeof note.category === 'string' ? note.category : null,
     }));
+  const goalContext = readGoalContext(body?.domain);
+  const tier = readModelTier(body?.model_tier);
+  const model = modelForTier(tier);
+  const excludeNoteId = typeof body?.exclude_note_id === 'string' ? body.exclude_note_id : null;
 
   if (notes.length === 0) {
     return NextResponse.json({
@@ -72,23 +106,44 @@ export async function POST(request: Request) {
     });
   }
 
+  // Next.js prefers a variable already set in the shell over .env.local, so a
+  // stale key can hide here. Printing its ends shows which one is in use.
+  console.log(`[local] find-relevant-notes: ${notes.length} notes, ${tier} mode (${model}), OpenRouter key ${maskKey(apiKey)}`);
+
+  const draft = condenseDraft(draftText);
+  const insightFor = (results: RelevanceResult[]) =>
+    findInsight({
+      draft,
+      context: goalContext,
+      notes,
+      results,
+      excludeNoteId,
+      generate: withFailureLog('insight call', (prompt) =>
+        generateWithGemini(INSIGHT_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], apiKey, model, {
+          responseMimeType: 'application/json',
+          temperature: 0.2,
+          maxOutputTokens: 3000,
+        })),
+    });
   const agentOptions = {
-    draft: condenseDraft(draftText),
+    draft,
     notes,
+    goal: goalContext.goal,
     agentCount: DEFAULT_AGENT_COUNT,
     concurrency: DEFAULT_AGENT_CONCURRENCY,
     isRetryable: isRetryableGeminiError,
-    generate: (prompt: string) =>
-      generateWithGemini(AGENT_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], apiKey, undefined, {
+    generate: withFailureLog('agent call', (prompt: string) =>
+      generateWithGemini(AGENT_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], apiKey, model, {
         responseMimeType: 'application/json',
         temperature: 0.2,
-      }),
+      })),
   };
 
   if (body?.stream === true) {
     const stream = streamRelevanceSearch({
       ...agentOptions,
       maxResults: MAX_RESULTS,
+      findInsight: insightFor,
       allFailedMessage: 'Every agent failed — check your OPENROUTER_API_KEY and the terminal output.',
       failedMessage: 'Relevance search failed. Check the terminal output.',
       onError: (error) =>
@@ -112,8 +167,13 @@ export async function POST(request: Request) {
       );
     }
 
+    const outcome = await insightFor(results).catch((error) => {
+      console.error('[local] insight failed:', error instanceof Error ? error.message : error);
+      return FAILED_INSIGHT;
+    });
     return NextResponse.json({
       results,
+      ...insightFields(outcome),
       coverage: {
         notes_searched: notesSearched,
         notes_total: notes.length,

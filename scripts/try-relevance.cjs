@@ -14,18 +14,23 @@
  *   --notes <file>     JSON array of strings, or text with "---" between notes
  *   --draft <file|text>
  *   --expected <file>  ground truth: {notes:[{id,title,explanation}]}
+ *   --goal <text>      what the person is working toward, as a Domain description
+ *                      would supply it; compare runs with and without it
+ *   --basic            use the cheaper "Basic" model instead of "Best"
  */
 
 const fs = require('fs');
 const path = require('path');
 const {
-  condenseDraft, mergeAgentResults, runRelevanceAgents,
+  condenseDraft, findInsight, mergeAgentResults, runRelevanceAgents,
   DEFAULT_AGENT_COUNT: AGENT_COUNT,
   DEFAULT_AGENT_CONCURRENCY: AGENT_CONCURRENCY,
 } = require('../.relevance-build/relevance.js');
-const { generateWithGemini, isRetryableGeminiError } = require('../.relevance-build/gemini.js');
+const { generateWithGemini, isRetryableGeminiError, modelForTier } = require('../.relevance-build/gemini.js');
 
 const MAX_RESULTS = 50;
+const INSIGHT_SYSTEM_PROMPT =
+  'You help a person act on their own past notes. You respond with a JSON object and nothing else.';
 const AGENT_SYSTEM_PROMPT =
   "You identify meaningful relationships between a person's notes. You respond with a JSON array and nothing else.";
 
@@ -34,7 +39,7 @@ const DEFAULT_CORPUS = path.join(ROOT, 'notes/all-notes.json');
 const DEFAULT_DRAFT = path.join(ROOT, 'notes/test-notes/entry.txt');
 const DEFAULT_TRUTH = path.join(ROOT, 'notes/test-notes/test-notes.json');
 
-const RELATION_SHORT = { supports: 'supports ', extends: 'adds to  ', contradicts: 'contra.  ', question: 'question ', parallel: 'parallel ' };
+const RELATION_SHORT = { supports: 'supports ', extends: 'adds to  ', contradicts: 'contra.  ', question: 'question ', parallel: 'parallel ', helps: 'helps    ', solves: 'solves   ' };
 
 /*
  * The original synthetic corpus, kept available behind --sample. Unlike the
@@ -82,6 +87,8 @@ function parseArgs(argv) {
     else if (argv[i] === '--draft') args.draft = argv[++i];
     else if (argv[i] === '--expected') args.expected = argv[++i];
     else if (argv[i] === '--sample') args.sample = true;
+    else if (argv[i] === '--goal') args.goal = argv[++i];
+    else if (argv[i] === '--basic') args.basic = true;
   }
   return args;
 }
@@ -183,18 +190,23 @@ async function main() {
 
   console.log(`\nDraft:\n${wrap(draftText.trim(), 74, '  ')}`);
   console.log(`\nCorpus: ${corpusLabel} (${notes.length} notes)`);
+  console.log(`Goal: ${args.goal || '(not stated)'}`);
+  const model = modelForTier(args.basic ? 'basic' : 'best');
+  console.log(`Model: ${model}`);
   if (picks.size) console.log(`Your picks: ${truthLabel} (${picks.size} notes)`);
   console.log(`\nSearching across ${AGENT_COUNT} agents, ${AGENT_CONCURRENCY} at a time...\n`);
 
   const started = Date.now();
+  const draft = condenseDraft(draftText.trim());
   const { outcomes } = await runRelevanceAgents({
-    draft: condenseDraft(draftText.trim()),
+    draft,
     notes,
+    goal: args.goal || null,
     agentCount: AGENT_COUNT,
     concurrency: AGENT_CONCURRENCY,
     isRetryable: isRetryableGeminiError,
     generate: (prompt) =>
-      generateWithGemini(AGENT_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], apiKey, undefined, {
+      generateWithGemini(AGENT_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], apiKey, model, {
         responseMimeType: 'application/json',
         temperature: 0.2,
       }),
@@ -221,11 +233,38 @@ async function main() {
     const pick = picks.get(result.note_id);
     const tag = picks.size ? (pick ? `[#${String(pick.order).padStart(2)}]` : '[ --]') : '';
     const pct = `${Math.round(result.relevance_score * 100)}%`;
-    console.log(`\n${String(index + 1).padStart(2)}. ${tag} ${pct.padStart(4)}  ${RELATION_SHORT[result.relation_type]} ${result.note_id} ${titleOf(textById.get(result.note_id))}`);
+    console.log(`\n${String(index + 1).padStart(2)}. ${tag} ${pct.padStart(4)}  ${RELATION_SHORT[result.relation_type]} ${result.direction === 'outbound' ? 'OUT' : 'in '} ${result.note_id} ${titleOf(textById.get(result.note_id))}`);
     if (result.gist) console.log(wrap(`Gist: ${result.gist}`, 72, '      '));
     console.log(wrap(`AI:  ${result.explanation}`, 72, '      '));
     if (pick && pick.why) console.log(wrap(`You: ${pick.why}`, 72, '      '));
   });
+
+  const outcome = await findInsight({
+    draft,
+    context: { domain: 'Eval', goal: args.goal || null },
+    notes,
+    results,
+    excludeNoteId: null,
+    generate: (prompt) =>
+      generateWithGemini(INSIGHT_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], apiKey, model, {
+        responseMimeType: 'application/json',
+        temperature: 0.2,
+        maxOutputTokens: 3000,
+      }),
+  });
+
+  console.log('\n' + '='.repeat(78));
+  console.log('INSIGHT');
+  console.log('='.repeat(78));
+  outcome.insights.forEach((insight, index) => {
+    console.log(`\n  #${index + 1}  intent ${insight.intent}`);
+    console.log(wrap(`anchor:  ${insight.anchor ? `"${insight.anchor}"` : '(quote not found in draft - no highlight)'}`, 72, '  '));
+    console.log(wrap(`insight: ${insight.text}`, 72, '  '));
+    console.log(wrap(`action:  ${insight.action}`, 72, '  '));
+    console.log(`  cites    ${insight.note_ids.map((id) => `${id} ${titleOf(textById.get(id))}`).join('; ')}`);
+  });
+  if (!outcome.insights.length) console.log('  (none - nothing in the notes would change the next step)');
+  if (outcome.goal_suggestions.length) console.log(`  goal chips: ${outcome.goal_suggestions.join(' | ')}`);
 
   if (!picks.size) return;
 
