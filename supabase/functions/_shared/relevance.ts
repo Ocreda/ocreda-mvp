@@ -54,8 +54,9 @@ export const DEFAULT_AGENT_COUNT = 10;
 export const DEFAULT_AGENT_CONCURRENCY = 10;
 
 export const MAX_NOTE_CHARS = 800;
-export const MAX_DRAFT_CHARS = 6000;
 export const MIN_DRAFT_CHARS = 20;
+/** From the retrieval workflow: each idea keeps its best few. The note as a whole has no cap. */
+export const MAX_RESULTS_PER_SECTION = 3;
 /** Up to two plain sentences rather than one clipped clause, so this is roomier. */
 export const MAX_EXPLANATION_CHARS = 320;
 /** One sentence restating the note, shown when the card is flipped to its summary. */
@@ -110,20 +111,185 @@ export interface RelevanceResult {
   gist: string;
   /** How the note bears on the draft. */
   explanation: string;
+  /** The draft section (one of its ideas) the note bears on, or WHOLE_DRAFT. */
+  section_id: string;
 }
 
 export function truncate(text: string, limit: number): string {
   return text.length <= limit ? text : `${text.slice(0, limit)}...`;
 }
 
+// ---------------------------------------------------------------- sections
+
 /**
- * Long drafts get repeated into every agent prompt, so cap them — but keep the
- * tail as well as the head, since the thought a writer is currently developing
- * tends to live at the end of what they have written so far.
+ * One idea in the draft. Sections are in reading order and do not overlap, and
+ * together they hold every non-blank character of the draft, so any passage
+ * belongs to exactly one of them. Offsets index into the draft as searched.
  */
-export function condenseDraft(text: string): string {
-  if (text.length <= MAX_DRAFT_CHARS) return text;
-  return `${text.slice(0, 4000)}\n\n[...]\n\n${text.slice(-2000)}`;
+export interface DraftSection {
+  /** "1", "2", ... in reading order. */
+  id: string;
+  /** A few words naming the idea. Empty when the draft was split by paragraphs instead. */
+  label: string;
+  start: number;
+  end: number;
+  text: string;
+}
+
+/** A match that bears on the draft as a whole rather than on any one idea in it. */
+export const WHOLE_DRAFT = "whole";
+
+/**
+ * A single paragraph this short is one idea, so the call that splits a draft
+ * into ideas is skipped for it. It only saves a call; it never cuts text. Kept
+ * low because a paragraph of a few sentences can already change subject.
+ */
+export const SINGLE_IDEA_CHARS = 300;
+
+/** Trims a span to its non-blank text, or returns null when nothing is left. */
+function trimmedSpan(text: string, start: number, end: number): { start: number; end: number } | null {
+  while (start < end && /\s/.test(text[start])) start++;
+  while (end > start && /\s/.test(text[end - 1])) end--;
+  return end > start ? { start, end } : null;
+}
+
+function toSections(text: string, spans: { start: number; end: number; label: string }[]): DraftSection[] {
+  const sections: DraftSection[] = [];
+  for (const span of spans) {
+    const trimmed = trimmedSpan(text, span.start, span.end);
+    if (!trimmed) continue;
+    sections.push({ id: String(sections.length + 1), label: span.label, ...trimmed, text: text.slice(trimmed.start, trimmed.end) });
+  }
+  return sections;
+}
+
+/** The draft as one section, for a draft with a single idea. */
+export function wholeDraftSection(draft: string): DraftSection[] {
+  return toSections(draft, [{ start: 0, end: draft.length, label: "" }]);
+}
+
+/**
+ * Splits at blank lines. The fallback when the model's split cannot be used,
+ * and what the app shows before any search has run.
+ */
+export function splitIntoParagraphs(draft: string): DraftSection[] {
+  const spans: { start: number; end: number; label: string }[] = [];
+  for (const match of draft.matchAll(/\S(?:[\s\S]*?\S)?(?=\n\s*\n|\s*$)/g)) {
+    const start = match.index ?? 0;
+    spans.push({ start, end: start + match[0].length, label: "" });
+  }
+  return toSections(draft, spans);
+}
+
+export function buildSectionPrompt(draft: string): string {
+  return `Split a note into its separate ideas, so that each idea can be matched against the person's other notes on its own.
+
+An idea is one thing the note works on: a problem, a decision, a plan, a question, an observation, a lesson. A new idea starts where the note moves on to something different. That is usually at a paragraph break, but not always.
+- Keep consecutive paragraphs together when they develop the same idea. A problem and the reasons behind it, or a plan and its steps, are one idea.
+- Split inside a paragraph only when it clearly changes subject partway through.
+- A note about one thing is one idea. That is a normal answer; never split just to have more.
+
+For each idea, in the order they appear:
+STARTS_WITH - copy, word for word, the first 6 to 12 words of the idea exactly as they appear in the note. Do not paraphrase, fix typos, or add quotation marks.
+LABEL - 2 to 6 plain words naming the idea, such as "Tester pricing feedback".
+
+OUTPUT - a JSON object and nothing else, in this shape:
+{"ideas": [{"starts_with": "<exact opening words>", "label": "<a few words>"}]}
+
+========================================
+
+<note>
+${draft}
+</note>
+
+Now respond with ONLY the JSON object described above.`;
+}
+
+const MAX_SECTION_LABEL_CHARS = 60;
+
+/**
+ * Turns the model's list of ideas into sections of the draft. Each idea runs
+ * from where its opening words are found to where the next idea starts, and
+ * the first one also takes anything before it, so no text is ever lost. An
+ * idea whose opening words are not in the draft, or are out of order, is
+ * folded into the one before it. Null when nothing usable came back.
+ */
+export function parseSectionResponse(raw: string, draft: string): DraftSection[] | null {
+  const jsonText = extractJsonObject(raw);
+  if (!jsonText) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(jsonText);
+  } catch {
+    return null;
+  }
+  const ideas = parsed && typeof parsed === "object" && Array.isArray((parsed as Record<string, unknown>).ideas)
+    ? (parsed as { ideas: unknown[] }).ideas
+    : null;
+  if (!ideas) return null;
+
+  const starts: { start: number; label: string }[] = [];
+  let cursor = 0;
+  for (const entry of ideas) {
+    if (!entry || typeof entry !== "object") continue;
+    const row = entry as Record<string, unknown>;
+    const opening = typeof row.starts_with === "string" ? row.starts_with : "";
+    // Searching on from the previous idea keeps them in order, even when the
+    // same opening words also appear earlier in the note.
+    const found = findAnchor(draft.slice(cursor), opening);
+    if (!found) continue;
+    const start = cursor + found.start;
+    if (starts.length && start <= starts[starts.length - 1].start) continue;
+    starts.push({ start, label: cleanLine(row.label, MAX_SECTION_LABEL_CHARS) });
+    cursor = start + 1;
+  }
+  if (!starts.length) return null;
+
+  const sections = toSections(draft, starts.map((item, index) => ({
+    start: index === 0 ? 0 : item.start,
+    end: index + 1 < starts.length ? starts[index + 1].start : draft.length,
+    label: item.label,
+  })));
+  return sections.length ? sections : null;
+}
+
+export interface FindSectionsOptions {
+  draft: string;
+  /** Injected so this module stays free of any particular model client. */
+  generate: (prompt: string) => Promise<string>;
+  onError?: (error: unknown) => void;
+}
+
+/**
+ * Splits the draft into its ideas with one model call, before any notes are
+ * read. A short single paragraph skips the call. When the call fails or its
+ * reply is unusable, paragraphs stand in for ideas: worse boundaries, but
+ * every part of the draft still gets searched.
+ */
+export async function findDraftSections({ draft, generate, onError }: FindSectionsOptions): Promise<DraftSection[]> {
+  const paragraphs = splitIntoParagraphs(draft);
+  if (paragraphs.length <= 1 && draft.length < SINGLE_IDEA_CHARS) return wholeDraftSection(draft);
+  try {
+    const sections = parseSectionResponse(await generate(buildSectionPrompt(draft)), draft);
+    if (sections) return sections;
+    onError?.(new Error("the idea split came back unusable; using paragraphs"));
+  } catch (error) {
+    onError?.(error);
+  }
+  return paragraphs.length ? paragraphs : wholeDraftSection(draft);
+}
+
+/** The draft as the agents see it: whole, with each idea marked and numbered when there are several. */
+function renderDraft(draft: string, sections: DraftSection[]): string {
+  if (sections.length <= 1) return draft;
+  return sections
+    .map((section) => `<idea id="${section.id}"${section.label ? ` label="${section.label.replace(/"/g, "'")}"` : ""}>\n${section.text}\n</idea>`)
+    .join("\n\n");
+}
+
+/** Which section a draft offset falls in, or null when it is outside all of them. */
+export function sectionAt(sections: DraftSection[], offset: number): DraftSection | null {
+  return sections.find((section) => offset >= section.start && offset < section.end) ?? null;
 }
 
 /**
@@ -143,9 +309,10 @@ export function dealIntoChunks<T>(items: T[], chunkCount: number): T[][] {
  * in a fan-out sends an identical multi-thousand-character prefix. That is what
  * makes the provider's implicit prefix caching usable; putting the variable
  * content first would give the calls nothing in common to cache. The goal is
- * variable too, so it sits beside the draft; only its instructions are fixed.
+ * variable too, so it sits beside the draft; only its instructions are fixed,
+ * and so are the instructions about ideas, whether or not the draft has several.
  */
-export function buildPrompt(draft: string, notes: NoteLike[], goal: string | null = null): string {
+export function buildPrompt(draft: string, notes: NoteLike[], goal: string | null = null, sections: DraftSection[] = []): string {
   const candidates = notes
     .map((note) => `ID: ${note.id}\n${truncate((note.summary || note.raw_text).trim(), MAX_NOTE_CHARS)}`)
     .join("\n\n---\n\n");
@@ -165,6 +332,9 @@ Score the strength of the connection, NOT how similar the subject matter is. A n
 0.70-0.89 - A clear, specific connection that adds something real: evidence, a concrete example, a counterweight, an unresolved snag, or a pattern the draft turns out to be an instance of.
 0.50-0.69 - A real but looser connection: it shares the draft's underlying concern or stance and is worth having nearby, without changing anything.
 Below 0.50 - Leave it out of your response entirely.
+
+IDEAS - a long draft can work on several separate ideas at once, and each one deserves its own matches. When the draft is marked into numbered <idea> blocks, judge every note against each idea, not only against the draft's main point: a note that speaks to a small idea is as worth returning as one that speaks to the big one. A note must serve what that idea is trying to do, not merely share its topic. Still read the whole draft, because what the person is getting at overall decides what would help each idea.
+Give each note the number of the one idea it bears on most, as "idea". Use "whole" when it bears on the draft as a whole and on no single idea more than the others, and whenever the draft is not marked into ideas.
 
 GOAL - you may also be told what the person is working toward in this area. When you are, a note that would help them toward it - a past attempt and how it went, advice they recorded, a decision they made, a fact that changes the picture - deserves a higher score than one that is merely on the same subject. Never include a note only because it matches the goal; it must still bear on the draft.
 
@@ -203,13 +373,13 @@ Worked examples:
 - Draft: the pricing one again. Candidate note: "Pricing page redesign - make the CTA green and move testimonials above the fold." Omitted entirely: it shares the word "pricing" but has nothing to do with the draft's argument.
 
 OUTPUT - a JSON array and nothing else, in this shape:
-[{"note_id": "<exact id>", "relevance_score": <number>, "relation_type": "<solves|helps|supports|extends|contradicts|question|parallel>", "direction": "<inbound|outbound>", "gist": "<one sentence>", "explanation": "<one or two short sentences>"}]
+[{"note_id": "<exact id>", "idea": "<idea number, or whole>", "relevance_score": <number>, "relation_type": "<solves|helps|supports|extends|contradicts|question|parallel>", "direction": "<inbound|outbound>", "gist": "<one sentence>", "explanation": "<one or two short sentences>"}]
 
 ========================================
 
 Here is the draft:
 <draft>
-${draft}
+${renderDraft(draft, sections)}
 </draft>${goalBlock}
 
 Here are the candidate notes:
@@ -233,9 +403,16 @@ export function extractJsonArray(raw: string): string | null {
 /**
  * Turns one agent's raw text into trustworthy results. Anything malformed is
  * dropped rather than repaired, and ids are checked against what this agent was
- * actually shown so hallucinated UUIDs cannot reach the user.
+ * actually shown so hallucinated UUIDs cannot reach the user. With a single
+ * section every match is about it; otherwise an idea the draft does not have
+ * means the note is taken as bearing on the draft as a whole.
  */
-export function parseAgentResponse(raw: string, allowedIds: Set<string>): RelevanceResult[] {
+export function parseAgentResponse(raw: string, allowedIds: Set<string>, sectionIds: string[] = []): RelevanceResult[] {
+  const sectionOf = (value: unknown): string => {
+    if (sectionIds.length <= 1) return sectionIds[0] ?? WHOLE_DRAFT;
+    const id = typeof value === "number" || typeof value === "string" ? String(value).trim() : "";
+    return sectionIds.includes(id) ? id : WHOLE_DRAFT;
+  };
   const jsonText = extractJsonArray(raw);
   if (!jsonText) return [];
 
@@ -279,6 +456,7 @@ export function parseAgentResponse(raw: string, allowedIds: Set<string>): Releva
       direction: DIRECTIONS.includes(row.direction as Direction) ? (row.direction as Direction) : "inbound",
       gist: truncate(gist, MAX_GIST_CHARS),
       explanation: truncate(explanation, MAX_EXPLANATION_CHARS),
+      section_id: sectionOf(row.idea),
     });
   }
 
@@ -320,6 +498,8 @@ export interface RunAgentsOptions {
   notes: NoteLike[];
   /** The Domain's stated goal, if the person gave one. */
   goal?: string | null;
+  /** The draft's ideas. Every agent sees the same ones, so their matches can be grouped. */
+  sections?: DraftSection[];
   agentCount: number;
   concurrency: number;
   /** Injected so this module stays free of any particular model client. */
@@ -337,11 +517,12 @@ export interface RunAgentsOptions {
 export async function runRelevanceAgents(
   options: RunAgentsOptions
 ): Promise<{ chunks: NoteLike[][]; outcomes: AgentOutcome[] }> {
-  const { draft, notes, goal, agentCount, concurrency, generate, isRetryable, onAgentSettled } = options;
+  const { draft, notes, goal, sections = [], agentCount, concurrency, generate, isRetryable, onAgentSettled } = options;
   const chunks = dealIntoChunks(notes, agentCount);
+  const sectionIds = sections.map((section) => section.id);
 
   const settled = await runWithConcurrency(chunks, concurrency, async (chunk, index) => {
-    const prompt = buildPrompt(draft, chunk, goal ?? null);
+    const prompt = buildPrompt(draft, chunk, goal ?? null, sections);
     const allowedIds = new Set(chunk.map((n) => n.id));
     // Reported the moment this agent finishes rather than after all of them, so
     // a caller can show progress while the rest are still running. Called
@@ -353,7 +534,7 @@ export async function runRelevanceAgents(
     for (let attempt = 0; ; attempt++) {
       let results: RelevanceResult[];
       try {
-        results = parseAgentResponse(await generate(prompt), allowedIds);
+        results = parseAgentResponse(await generate(prompt), allowedIds, sectionIds);
       } catch (error) {
         if (attempt === 1 || !isRetryable(error)) {
           settle(null);
@@ -381,11 +562,14 @@ export async function runRelevanceAgents(
  * notes were actually read. A failed agent contributes nothing to the count,
  * which is what lets the UI tell the user coverage was incomplete instead of
  * quietly presenting a partial search as a complete one.
+ *
+ * Each section keeps its own best `maxPerSection`, so a draft's main idea
+ * cannot crowd out the smaller ones; the whole list has no cap of its own.
  */
 export function mergeAgentResults(
   outcomes: AgentOutcome[],
   createdAtById: Map<string, string>,
-  maxResults: number,
+  maxPerSection: number,
   now: number = Date.now(),
 ): { results: RelevanceResult[]; notesSearched: number } {
   let notesSearched = 0;
@@ -410,8 +594,20 @@ export function mergeAgentResults(
   );
   const scoreOf = (result: RelevanceResult) => rankScore.get(result.note_id) ?? result.relevance_score;
   const ranked = Array.from(merged.values()).sort((a, b) => scoreOf(b) - scoreOf(a));
+  const bySection = new Map<string, RelevanceResult[]>();
+  for (const result of ranked) bySection.set(result.section_id, [...(bySection.get(result.section_id) ?? []), result]);
+  const picked = Array.from(bySection.values())
+    .flatMap((group) => diversifyByRelation(group, maxPerSection, VARIETY_PENALTY, scoreOf));
+  // Within a section the variety order is kept; across sections, strongest first.
+  const order = new Map(picked.map((result, index) => [result.note_id, index]));
+  const best = new Map<string, number>();
+  for (const result of picked) best.set(result.section_id, Math.max(best.get(result.section_id) ?? -Infinity, scoreOf(result)));
 
-  return { results: diversifyByRelation(ranked, maxResults, VARIETY_PENALTY, scoreOf), notesSearched };
+  return {
+    results: picked.sort((a, b) =>
+      a.section_id === b.section_id ? order.get(a.note_id)! - order.get(b.note_id)! : best.get(b.section_id)! - best.get(a.section_id)!),
+    notesSearched,
+  };
 }
 
 const DAY_MS = 86_400_000;
@@ -486,11 +682,14 @@ export interface Insight {
   action: string;
   /** The notes the insight rests on; always a subset of the search results. */
   note_ids: string[];
+  /** The draft section the insight is about: where its passage is, else where its notes point. */
+  section_id: string;
 }
 
 export interface InsightOutcome {
   /**
-   * Up to MAX_INSIGHTS, each about a different passage of the draft. Empty
+   * Each about a different passage of the draft: up to MAX_INSIGHTS for a
+   * draft with one idea, one per idea (and one for the whole) otherwise. Empty
    * means nothing in the notes would change their next step.
    */
   insights: Insight[];
@@ -515,9 +714,11 @@ export const FAILED_INSIGHT: InsightOutcome = { insights: [], goal_suggestions: 
 
 /** Only strong matches are worth building an insight on. */
 export const INSIGHT_MIN_SCORE = 0.7;
-/** One trigger per issue the draft raises, but never a margin full of them. */
+/**
+ * For a draft with a single idea: one trigger per issue it raises, but never a
+ * margin full of them. A draft with several ideas gets one per idea instead.
+ */
 export const MAX_INSIGHTS = 3;
-export const MAX_INSIGHT_NOTES = 6;
 export const MAX_DOMAIN_CONTEXT_NOTES = 10;
 const MAX_CONTEXT_NOTE_CHARS = 200;
 const MAX_ANCHOR_CHARS = 240;
@@ -570,13 +771,20 @@ export interface InsightMatch {
   result: RelevanceResult;
 }
 
-/** The strongest matches, in rank order, that an insight may draw on. */
+/**
+ * The strong matches, in rank order, that an insight may draw on. The merge
+ * already capped each section, so every idea's matches are kept here.
+ */
 export function selectInsightMatches(results: RelevanceResult[], notes: NoteLike[]): InsightMatch[] {
   const byId = new Map(notes.map((note) => [note.id, note]));
   return results
     .filter((result) => result.relevance_score >= INSIGHT_MIN_SCORE && byId.has(result.note_id))
-    .slice(0, MAX_INSIGHT_NOTES)
     .map((result) => ({ note: byId.get(result.note_id)!, result }));
+}
+
+/** How many insights a draft may get: one per idea, plus one about it as a whole. */
+export function maxInsightsFor(sections: DraftSection[]): number {
+  return sections.length > 1 ? sections.length + 1 : MAX_INSIGHTS;
 }
 
 /**
@@ -597,19 +805,30 @@ export interface InsightPromptInput {
   context: GoalContext;
   recentNotes: NoteLike[];
   matches: InsightMatch[];
+  /** The draft's ideas; with more than one, insights are given per idea. */
+  sections?: DraftSection[];
 }
 
-export function buildInsightPrompt({ draft, context, recentNotes, matches }: InsightPromptInput): string {
+export function buildInsightPrompt({ draft, context, recentNotes, matches, sections = [] }: InsightPromptInput): string {
   const askForGoal = Boolean(context.domain && !context.goal);
+  const byIdea = sections.length > 1;
   const recent = recentNotes.length
     ? recentNotes
       .map((note) => `- ${note.created_at.slice(0, 10)}: ${truncate((note.summary || note.raw_text).trim().replace(/\s+/g, " "), MAX_CONTEXT_NOTE_CHARS)}`)
       .join("\n")
     : "(none)";
+  const ideaLine = (result: RelevanceResult) => {
+    if (!byIdea) return "";
+    const section = sections.find((item) => item.id === result.section_id);
+    return `\nIdea: ${section ? `${section.id}${section.label ? ` (${section.label})` : ""}` : "the note as a whole"}`;
+  };
   const related = matches
     .map(({ note, result }) =>
-      `ID: ${note.id}\nWritten: ${note.created_at.slice(0, 10)}\nDirection: ${result.direction === "outbound" ? "outbound (the note being written helps this one)" : "inbound (this note helps the one being written)"}\nHow it relates: ${result.relation_type} - ${result.explanation}\n${truncate(note.raw_text.trim(), MAX_NOTE_CHARS)}`)
+      `ID: ${note.id}\nWritten: ${note.created_at.slice(0, 10)}${ideaLine(result)}\nDirection: ${result.direction === "outbound" ? "outbound (the note being written helps this one)" : "inbound (this note helps the one being written)"}\nHow it relates: ${result.relation_type} - ${result.explanation}\n${truncate(note.raw_text.trim(), MAX_NOTE_CHARS)}`)
     .join("\n\n---\n\n");
+  const howMany = byIdea
+    ? `HOW MANY - the note works on ${sections.length} separate ideas, marked as numbered <idea> blocks, and each related note says which idea it bears on. Give at most one insight per idea, built on that idea's related notes, plus at most one about the note as a whole. Skip any idea where nothing clears the bar; an idea with no insight is a normal, frequent, and correct outcome. Do not stretch to cover every idea.`
+    : `HOW MANY - a note can raise several separate issues. Give one insight per issue that clears the bar, at most ${MAX_INSIGHTS}, strongest first. Each must be about a different passage of the note, and must not repeat another insight's point. One insight is often right, and an empty list is a normal, frequent, and correct answer. Do not stretch to fill the slots.`;
 
   return `Someone is writing a note. You have the past notes of theirs that relate to it. Decide whether anything in those past notes should change what they do next, and if so, tell them in one short card.
 
@@ -632,10 +851,10 @@ A past note that says the same thing as the draft is NOT useful. Reminding someo
 
 GOAL - if they have said what they are working toward in this area, use it to decide what helps. If not, infer it from the draft and their recent notes in the area. If you still cannot tell, offer only something that helps whatever the goal is: a contradiction, a repeated pattern, or a hard number.
 
-HOW MANY - a note can raise several separate issues. Give one insight per issue that clears the bar, at most ${MAX_INSIGHTS}, strongest first. Each must be about a different passage of the note, and must not repeat another insight's point. One insight is often right, and an empty list is a normal, frequent, and correct answer. Do not stretch to fill the slots.
+${howMany}
 
 For each insight:
-ANCHOR - copy, word for word, the shortest phrase or sentence from the note being written that this insight is about, at most 25 words. Copy it exactly: do not paraphrase, fix typos, or add quotation marks. Two insights never share or overlap an anchor.
+ANCHOR - copy, word for word, the shortest phrase or sentence from the note being written that this insight is about, at most 25 words${byIdea ? ", taken from inside the idea it is about" : ""}. Copy it exactly: do not paraphrase, fix typos, or add quotation marks. Two insights never share or overlap an anchor.
 TEXT - one or two plain sentences saying what their past notes add. Name the specifics: people, numbers, what happened. Do not restate the note being written.
 ACTION - one concrete next step, starting with a verb, that they could do this week. Fit it to the intent: for "stuck", a way forward; for "planning", something to add or check; for "deciding", the consideration they are missing; for "capturing", what to do with this (a follow-up, a question for next time); for "reflecting", a question worth answering; for "learning", where to apply it. Never generic advice like "keep going" or "reflect on this".
 NOTE_IDS - the IDs of the past notes this insight rests on, only from the list given.
@@ -659,7 +878,7 @@ ${recent}
 
 The note they are writing:
 <note>
-${draft}
+${renderDraft(draft, sections)}
 </note>
 
 Their related past notes:
@@ -688,11 +907,28 @@ function cleanLine(value: unknown, limit: number): string {
  * highlight, since the card is still worth showing. An insight whose passage
  * overlaps an earlier one is about the same issue, so it is dropped.
  * Older replies with a single "insight" object are still read.
+ *
+ * Each insight belongs to the section its passage is in. Without a passage it
+ * goes where the notes it cites point, and failing that to the first section.
  */
 export function parseInsightResponse(
   raw: string,
-  { draft, allowedNoteIds, askForGoal }: { draft: string; allowedNoteIds: Set<string>; askForGoal: boolean },
+  { draft, allowedNoteIds, askForGoal, sections = [], sectionOfNote = new Map() }: {
+    draft: string;
+    allowedNoteIds: Set<string>;
+    askForGoal: boolean;
+    sections?: DraftSection[];
+    /** Which section each cited note was matched to. */
+    sectionOfNote?: Map<string, string>;
+  },
 ): InsightOutcome {
+  const maxInsights = maxInsightsFor(sections);
+  const sectionIds = new Set(sections.map((section) => section.id));
+  const sectionFor = (span: { start: number } | null, noteIds: string[]): string =>
+    (span && sectionAt(sections, span.start)?.id)
+    || noteIds.map((id) => sectionOfNote.get(id)).find((id): id is string => Boolean(id && sectionIds.has(id)))
+    || sections[0]?.id
+    || WHOLE_DRAFT;
   // A reply that cannot be read, including one cut off at the token budget,
   // is a failure rather than a verdict of "nothing useful".
   const jsonText = extractJsonObject(raw);
@@ -719,7 +955,7 @@ export function parseInsightResponse(
   const spans: { start: number; end: number }[] = [];
   const seenText = new Set<string>();
   for (const entry of cards) {
-    if (insights.length >= MAX_INSIGHTS) break;
+    if (insights.length >= maxInsights) break;
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
     const card = entry as Record<string, unknown>;
 
@@ -738,7 +974,14 @@ export function parseInsightResponse(
     seenText.add(text.toLowerCase());
 
     const cardIntent = INSIGHT_INTENTS.includes(card.intent as InsightIntent) ? (card.intent as InsightIntent) : intent;
-    insights.push({ anchor: span ? draft.slice(span.start, span.end) : "", intent: cardIntent, text, action, note_ids: noteIds });
+    insights.push({
+      anchor: span ? draft.slice(span.start, span.end) : "",
+      intent: cardIntent,
+      text,
+      action,
+      note_ids: noteIds,
+      section_id: sectionFor(span, noteIds),
+    });
   }
 
   return { insights, goal_suggestions: goalSuggestions, intent: statedIntent, failed: false };
@@ -764,16 +1007,20 @@ export interface FindInsightOptions {
   notes: NoteLike[];
   results: RelevanceResult[];
   excludeNoteId: string | null;
+  /** The draft's ideas, as the search used them. */
+  sections?: DraftSection[];
   /** Injected so this module stays free of any particular model client. */
   generate: (prompt: string) => Promise<string>;
 }
 
 /**
  * The step that replaces the combined summary: one model call over the strong
- * matches. Skipped entirely, at no cost, when nothing matched strongly enough.
+ * matches of every idea at once, since an insight can draw on notes that
+ * different agents found. Skipped entirely, at no cost, when nothing matched
+ * strongly enough.
  */
 export async function findInsight(options: FindInsightOptions): Promise<InsightOutcome> {
-  const { draft, context, notes, results, excludeNoteId, generate } = options;
+  const { draft, context, notes, results, excludeNoteId, sections = [], generate } = options;
   const matches = selectInsightMatches(results, notes);
   if (!matches.length) return SKIPPED_INSIGHT;
   const prompt = buildInsightPrompt({
@@ -781,12 +1028,92 @@ export async function findInsight(options: FindInsightOptions): Promise<InsightO
     context,
     recentNotes: recentDomainNotes(notes, context.domain, excludeNoteId),
     matches,
+    sections,
   });
   return parseInsightResponse(await generate(prompt), {
     draft,
     allowedNoteIds: new Set(matches.map((match) => match.note.id)),
     askForGoal: Boolean(context.domain && !context.goal),
+    sections,
+    sectionOfNote: new Map(matches.map((match) => [match.note.id, match.result.section_id])),
   });
+}
+
+
+export interface SearchOptions extends Omit<RunAgentsOptions, "sections"> {
+  /** How many matches each section keeps. */
+  maxPerSection: number;
+  /** Splits the draft into its ideas before any notes are read. Without it the draft is one section. */
+  findSections?: (draft: string) => Promise<DraftSection[]>;
+  /** Optional synthesis of the final matches; failure must not hide the matches. */
+  summarize?: (results: RelevanceResult[]) => Promise<string>;
+  /** Optional insights from the final matches; like the summary, failure must not hide the matches. */
+  findInsight?: (results: RelevanceResult[], sections: DraftSection[]) => Promise<InsightOutcome>;
+  /** Failures of the optional steps, which the search itself survives. */
+  onError?: (error: unknown) => void;
+}
+
+export interface SearchOutcome {
+  sections: DraftSection[];
+  results: RelevanceResult[];
+  notesSearched: number;
+  notesTotal: number;
+  summary: string;
+  /** Null when no insight step was given, or when every agent failed. */
+  insight: InsightOutcome | null;
+}
+
+/**
+ * The whole search: split the draft into its ideas, read every note once
+ * against all of them, keep each idea's best matches, then write insights over
+ * all of them in one call. The vault is read once however many ideas the draft
+ * has. When every agent fails the follow-up steps are skipped, and the caller
+ * sees notesSearched === 0.
+ */
+export async function searchRelevance(options: SearchOptions): Promise<SearchOutcome> {
+  const { maxPerSection, findSections, summarize, findInsight, onError, ...agentOptions } = options;
+  const { draft, notes } = agentOptions;
+  const sections = findSections
+    ? await findSections(draft).catch((error) => {
+      onError?.(error);
+      return splitIntoParagraphs(draft);
+    })
+    : wholeDraftSection(draft);
+
+  const { outcomes } = await runRelevanceAgents({ ...agentOptions, sections });
+  const createdAtById = new Map(notes.map((note) => [note.id, note.created_at]));
+  const { results, notesSearched } = mergeAgentResults(outcomes, createdAtById, maxPerSection);
+  const base = { sections, results, notesSearched, notesTotal: notes.length };
+  if (notesSearched === 0) return { ...base, summary: "", insight: null };
+
+  // Both follow-ups read the same matches, so run them side by side.
+  const [summary, insight] = await Promise.all([
+    results.length && summarize
+      ? summarize(results).catch((error) => { onError?.(error); return ""; })
+      : Promise.resolve(""),
+    findInsight
+      ? findInsight(results, sections).catch((error): InsightOutcome => {
+        onError?.(error);
+        return FAILED_INSIGHT;
+      })
+      : Promise.resolve(null),
+  ]);
+  return { ...base, summary, insight };
+}
+
+/** The body of a finished search, shared by the streamed "done" event and the plain JSON response. */
+export function searchResponseFields(outcome: SearchOutcome) {
+  return {
+    results: outcome.results,
+    sections: outcome.sections,
+    coverage: {
+      notes_searched: outcome.notesSearched,
+      notes_total: outcome.notesTotal,
+      complete: outcome.notesSearched === outcome.notesTotal,
+    },
+    ...(outcome.summary ? { summary: outcome.summary } : {}),
+    ...(outcome.insight ? insightFields(outcome.insight) : {}),
+  };
 }
 
 /**
@@ -797,43 +1124,23 @@ export async function findInsight(options: FindInsightOptions): Promise<InsightO
 export type RelevanceStreamEvent =
   | { type: "start"; notes_total: number; agents_total: number }
   | { type: "progress"; agents_done: number; agents_total: number; matches: number }
-  | {
-      type: "done";
-      results: RelevanceResult[];
-      coverage: { notes_searched: number; notes_total: number; complete: boolean };
-      summary?: string;
-      /** Present whenever an insight step ran; empty means it found nothing worth saying. */
-      insights?: Insight[];
-      /** The first insight, for clients from before there could be several. */
-      insight?: Insight | null;
-      goal_suggestions?: string[];
-      /** What the draft is doing, even with no insights; null when the step was skipped or failed. */
-      note_intent?: InsightIntent | null;
-      /** The insight step errored, as opposed to finding nothing. */
-      insight_failed?: boolean;
-    }
+  | ({ type: "done" } & ReturnType<typeof searchResponseFields>)
   | { type: "error"; error: string };
 
-export interface StreamSearchOptions extends Omit<RunAgentsOptions, "onAgentSettled"> {
-  maxResults: number;
-  /** Optional synthesis of the final matches; failure must not hide the matches. */
-  summarize?: (results: RelevanceResult[]) => Promise<string>;
-  /** Optional insight from the final matches; like the summary, failure must not hide the matches. */
-  findInsight?: (results: RelevanceResult[]) => Promise<InsightOutcome>;
+export interface StreamSearchOptions extends Omit<SearchOptions, "onAgentSettled"> {
   /** Shown when every agent failed, which would otherwise read as "nothing related". */
   allFailedMessage: string;
   /** Shown when the search throws outright; the error itself goes to onError. */
   failedMessage: string;
-  onError?: (error: unknown) => void;
 }
 
 /**
- * Runs the same fan-out and merge as the buffered path, but reports each agent
- * as it finishes. Written against web-standard ReadableStream and TextEncoder
- * so the Deno Edge Function and the Node dev route can both return it as is.
+ * Runs the same search as the buffered path, but reports each agent as it
+ * finishes. Written against web-standard ReadableStream and TextEncoder so the
+ * Deno Edge Function and the Node dev route can both return it as is.
  */
 export function streamRelevanceSearch(options: StreamSearchOptions): ReadableStream<Uint8Array> {
-  const { maxResults, summarize, findInsight, allFailedMessage, failedMessage, onError, ...agentOptions } = options;
+  const { allFailedMessage, failedMessage, ...searchOptions } = options;
   const encoder = new TextEncoder();
 
   return new ReadableStream<Uint8Array>({
@@ -841,51 +1148,26 @@ export function streamRelevanceSearch(options: StreamSearchOptions): ReadableStr
       const send = (event: RelevanceStreamEvent) =>
         controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
 
-      const notesTotal = agentOptions.notes.length;
-      const agentsTotal = dealIntoChunks(agentOptions.notes, agentOptions.agentCount).length;
+      const notesTotal = searchOptions.notes.length;
+      const agentsTotal = dealIntoChunks(searchOptions.notes, searchOptions.agentCount).length;
       const matched = new Set<string>();
       let agentsDone = 0;
 
       send({ type: "start", notes_total: notesTotal, agents_total: agentsTotal });
 
       try {
-        const { outcomes } = await runRelevanceAgents({
-          ...agentOptions,
-          onAgentSettled: (_index, outcome) => {
+        const outcome = await searchRelevance({
+          ...searchOptions,
+          onAgentSettled: (_index, agent) => {
             agentsDone++;
-            outcome.results?.forEach((result) => matched.add(result.note_id));
+            agent.results?.forEach((result) => matched.add(result.note_id));
             send({ type: "progress", agents_done: agentsDone, agents_total: agentsTotal, matches: matched.size });
           },
         });
-
-        const createdAtById = new Map(agentOptions.notes.map((note) => [note.id, note.created_at]));
-        const { results, notesSearched } = mergeAgentResults(outcomes, createdAtById, maxResults);
-
-        if (notesSearched === 0) {
-          send({ type: "error", error: allFailedMessage });
-        } else {
-          // Both follow-ups read the same matches, so run them side by side.
-          const [summary, outcome] = await Promise.all([
-            results.length && summarize
-              ? summarize(results).catch((error) => { onError?.(error); return ""; })
-              : Promise.resolve(""),
-            findInsight
-              ? findInsight(results).catch((error): InsightOutcome => {
-                onError?.(error);
-                return FAILED_INSIGHT;
-              })
-              : Promise.resolve(null),
-          ]);
-          send({
-            type: "done",
-            results,
-            coverage: { notes_searched: notesSearched, notes_total: notesTotal, complete: notesSearched === notesTotal },
-            ...(summary ? { summary } : {}),
-            ...(outcome ? insightFields(outcome) : {}),
-          });
-        }
+        if (outcome.notesSearched === 0) send({ type: "error", error: allFailedMessage });
+        else send({ type: "done", ...searchResponseFields(outcome) });
       } catch (error) {
-        onError?.(error);
+        searchOptions.onError?.(error);
         send({ type: "error", error: failedMessage });
       }
       controller.close();

@@ -12,8 +12,8 @@ import { createNote, deleteNote, findRelevantNotes, findSimilarNotes, getNotes, 
 import { supabase } from '@/lib/supabase';
 import { prepareImportedNoteText } from '@/lib/import-note-content';
 import { IS_LOCAL_MODE } from '@/dev/local-mode';  // DEV-LOCAL-MODE
-import { DomainGoal, InsightIntent, Note, NoteInsight, NoteRelationType, RelevanceCoverage, RelevanceResult } from '@/lib/types';
-import { findAnchor } from '@/supabase/functions/_shared/relevance';
+import { DomainGoal, InsightIntent, Note, NoteInsight, NoteRelationType, RelevanceCoverage, RelevanceResult, RelevanceSection } from '@/lib/types';
+import { findAnchor, splitIntoParagraphs } from '@/supabase/functions/_shared/relevance';
 import { getAiMode, useAiMode } from '@/lib/ai-mode';
 
 type MuseMeta = { title: string; description: string; createdAt: string };
@@ -100,8 +100,9 @@ function stableHash(value: string): number {
 // v3: results carry a goal-aware insight, and the goal is part of the signature.
 // v4: up to three insights, and relations gain helps and solves.
 // v5: every match says which way help flows (inbound or outbound).
+// v6: one search splits the note into ideas and tags each match with its idea.
 // The AI mode is part of the signature, so switching Basic/Best searches again.
-const SAVED_RETRIEVAL_VERSION = 'v5';
+const SAVED_RETRIEVAL_VERSION = 'v6';
 
 function savedRetrievalKey(userId: string, noteId: string): string {
   return `ocreda-saved-retrieval:${SAVED_RETRIEVAL_VERSION}:${userId}:${noteId}`;
@@ -1306,14 +1307,16 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
     const inputs = retrievalInputsRef.current;
     const requestNote = { ...inputs.note, raw_text: inputs.rawText || inputs.note.raw_text };
     const requestSignature = retrievalInputSignature(requestNote.raw_text, inputs.goalText, inputs.aiMode);
-    const requestBody = splitNote(requestNote).body || requestNote.raw_text;
-    const sections = splitIntoNoteSections(requestBody);
+    // The title travels with the body so the search sees the note's whole
+    // point; the sections that come back are moved onto the body, which is
+    // what the reader shows.
+    const searchedText = requestNote.raw_text.trim();
+    const requestBody = splitNote(requestNote).body || searchedText;
     const saved = retrievalAttempt === 0 ? readSavedRetrieval(userId, requestNote) : null;
     const availableNoteIds = new Set(inputs.allNotes.filter((item) => item.id !== requestNote.id).map((item) => item.id));
     const savedHasVisibleNotes = Boolean(saved?.search.results.some((result) => availableNoteIds.has(result.note_id)));
     const savedMatchesMode = Boolean(saved && (retrievalMode === 'similar' || saved.mode === 'relevant'));
-    const savedCoversSections = sections.length <= 1 || saved?.search.sections?.length === sections.length;
-    if (saved && savedHasVisibleNotes && savedMatchesMode && savedCoversSections) {
+    if (saved && savedHasVisibleNotes && savedMatchesMode) {
       setRetrieval(saved.search);
       setRetrievalLoading(false);
       return;
@@ -1325,39 +1328,17 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
     const requestHasOtherNotes = inputs.allNotes.some((item) => item.id !== requestNote.id);
     if (requestTooShort || !requestHasOtherNotes) { setRetrievalLoading(false); return; }
     setRetrievalLoading(true);
-    const searchableSections = sections.filter((section) => section.text.length >= MIN_RELEVANCE_DRAFT_CHARS);
-    const progressBySection = new Map<string, RelevanceProgress>();
-    const reportProgress = (sectionId: string, progress: RelevanceProgress) => {
-      if (!active) return;
-      progressBySection.set(sectionId, progress);
-      const entries = [...progressBySection.values()];
-      setRetrievalProgress({
-        agents_done: entries.reduce((sum, item) => sum + item.agents_done, 0),
-        agents_total: entries.reduce((sum, item) => sum + item.agents_total, 0),
-        matches: entries.reduce((sum, item) => sum + item.matches, 0),
-        notes_total: entries.reduce((sum, item) => sum + item.notes_total, 0),
-      });
-    };
-    const searchSections = async () => {
-      const completed: SectionRelevanceSearch[] = [];
-      // Two sections at a time keeps long notes responsive without flooding the
-      // retrieval service. There is deliberately no per-note section cap.
-      for (let index = 0; index < searchableSections.length; index += 2) {
-        const batch = searchableSections.slice(index, index + 2);
-        const responses = await Promise.all(batch.map(async (section) => {
-          const onProgress = (progress: RelevanceProgress) => reportProgress(section.id, progress);
-          const response = retrievalMode === 'relevant'
-            ? await findRelevantNotes(section.text, requestNote.id, onProgress, inputs.domainName ? { name: inputs.domainName, goal: inputs.goalText } : null)
-            : await findSimilarNotes(section.text, requestNote.id, onProgress, inputs.allNotes);
-          return capSectionSearch(section, response);
-        }));
-        completed.push(...responses);
-      }
-      return combineSectionSearches(completed);
-    };
-    searchSections()
-      .then((response) => {
+    const onProgress = (progress: RelevanceProgress) => { if (active) setRetrievalProgress(progress); };
+    // One search for the whole note. In relevant mode the server splits it
+    // into its ideas and keeps up to three notes for each, reading every note
+    // once however many ideas there are.
+    const search = retrievalMode === 'relevant'
+      ? findRelevantNotes(searchedText, requestNote.id, onProgress, inputs.domainName ? { name: inputs.domainName, goal: inputs.goalText } : null)
+      : findSimilarNotes(searchedText, requestNote.id, onProgress, inputs.allNotes);
+    search
+      .then((found) => {
         if (!active) return;
+        const response: RelevanceSearch = { ...found, sections: sectionsInBody(found.sections, searchedText, requestBody) };
         setRetrieval(response);
         // A failed insight step is not saved, so opening the note again retries it.
         if (!response.insight_failed) persistSavedRetrieval(userId, requestNote, inputs.goalText, retrievalMode, response, requestSignature);
@@ -1391,27 +1372,27 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
   }), [allNotes, note.id, retrieval, userId]);
   const panelNote = panelNoteId ? allNotes.find((item) => item.id === panelNoteId) ?? null : null;
   const displayedBody = body || note.raw_text;
-  const noteSections = useMemo(() => splitIntoNoteSections(displayedBody), [displayedBody]);
-  const retrievalSections = useMemo<SectionRelevanceSearch[]>(() => {
-    if (retrieval?.sections?.length) return retrieval.sections;
-    if (!retrieval) return [];
-    const section = noteSections[0] ?? { id: 'section-1', index: 0, text: displayedBody, start: 0, end: displayedBody.length };
-    return [{ section, ...retrieval }];
-  }, [displayedBody, noteSections, retrieval]);
-  const insights = useMemo(() => retrievalSections.flatMap((section) => section.insights ?? []), [retrievalSections]);
+  const noteSections = useMemo(() => noteSectionsFor(displayedBody, retrieval?.sections), [displayedBody, retrieval]);
+  const insights = useMemo(() => retrieval?.insights ?? [], [retrieval]);
   const insight = insights[Math.min(selectedInsightIndex, insights.length - 1)] ?? null;
-  const sectionForInsight = useCallback((item: NoteInsight) => retrievalSections.find((section) => section.insights?.includes(item)) ?? null, [retrievalSections]);
+  /**
+   * Where each insight sits: its passage, looked for first inside the idea the
+   * server put it in so a phrase repeated elsewhere is not picked, and the
+   * section that passage is in. Without a passage, the section it was given.
+   */
+  const insightPlacements = useMemo(() => insights.map((item) => {
+    const tagged = noteSections.find((section) => section.id === item.section_id) ?? null;
+    const local = item.anchor && tagged ? findAnchor(tagged.text, item.anchor) : null;
+    const span = local && tagged ? { start: tagged.start + local.start, end: tagged.start + local.end } : item.anchor ? findAnchor(displayedBody, item.anchor) : null;
+    const section = (span && noteSections.find((candidate) => span.start >= candidate.start && span.start < candidate.end)) || tagged || noteSections[0] || null;
+    return { span, section };
+  }), [displayedBody, insights, noteSections]);
+  const sectionOfInsight = useCallback((item: NoteInsight) => insightPlacements[insights.indexOf(item)]?.section ?? null, [insightPlacements, insights]);
   /** The relation of an insight's strongest cited note, so its highlight says what it opens. */
-  const relationOf = useCallback((item: NoteInsight) => {
-    const section = sectionForInsight(item);
-    const results = section?.results ?? retrieval?.results ?? [];
-    return item.note_ids.map((id) => results.find((result) => result.note_id === id)?.relation_type).find(Boolean) ?? null;
-  }, [retrieval, sectionForInsight]);
+  const relationOf = useCallback((item: NoteInsight) =>
+    item.note_ids.map((id) => relevanceByNoteId.get(id)?.relation_type).find(Boolean) ?? null, [relevanceByNoteId]);
   /** The insight rests only on notes this one helps, so its card points at where the lesson applies. */
-  const isOutbound = (item: NoteInsight) => {
-    const results = sectionForInsight(item)?.results ?? retrieval?.results ?? [];
-    return item.note_ids.every((id) => results.find((result) => result.note_id === id)?.direction === 'outbound');
-  };
+  const isOutbound = (item: NoteInsight) => item.note_ids.every((id) => relevanceByNoteId.get(id)?.direction === 'outbound');
   const formattedBody = hasNoteFormatting(displayedBody);
   // One highlight per insight whose passage is visible, in reading order.
   // Never while editing, and never two on overlapping text.
@@ -1421,22 +1402,20 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
     insights.forEach((item, index) => {
       const actionId = insightActionId(item, relationOf(item));
       if (insightActionStates[actionId]?.status === 'dismissed') return;
-      const section = sectionForInsight(item)?.section;
-      const localSpan = item.anchor && section ? findAnchor(section.text, item.anchor) : null;
-      const span = localSpan && section ? { start: section.start + localSpan.start, end: section.start + localSpan.end } : item.anchor ? findAnchor(displayedBody, item.anchor) : null;
+      const span = insightPlacements[index]?.span;
       if (span && !found.some((taken) => span.start < taken.end && taken.start < span.end)) found.push({ ...span, index });
     });
     return found.sort((x, y) => x.start - y.start);
-  }, [displayedBody, editing, formattedBody, insightActionStates, insights, relationOf, sectionForInsight]);
+  }, [editing, formattedBody, insightActionStates, insightPlacements, insights, relationOf]);
 
   // A new note/search starts on the first section that has something useful to
   // show. Afterwards the reader's gray section rail controls this selection.
   useEffect(() => {
-    const firstWithInsight = retrievalSections.find((section) => section.insights?.length)?.section.id;
+    const firstWithInsight = noteSections.find((section) => insightPlacements.some((placement) => placement.section?.id === section.id))?.id;
     setSelectedSectionId(firstWithInsight ?? noteSections[0]?.id ?? null);
     setSelectedInsightIndex(0);
     setOpenNotesUsedId(null);
-  }, [note.id, retrieval, noteSections, retrievalSections]);
+  }, [note.id, retrieval, noteSections, insightPlacements]);
 
   const updateInsightAction = (actionId: string, next: InsightActionState) => {
     setInsightActionStates((current) => {
@@ -1450,7 +1429,7 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
     .map((item, index) => {
       const relation = relationOf(item);
       const actionId = insightActionId(item, relation);
-      return { item, index, relation, actionId, section: sectionForInsight(item)?.section ?? noteSections[0] ?? null, actionState: insightActionStates[actionId] ?? IDLE_INSIGHT_ACTION };
+      return { item, index, relation, actionId, section: sectionOfInsight(item) ?? noteSections[0] ?? null, actionState: insightActionStates[actionId] ?? IDLE_INSIGHT_ACTION };
     })
     .filter((entry) => entry.actionState.status !== 'dismissed');
   const visibleInsightEntries = allVisibleInsightEntries.filter((entry) => entry.section?.id === selectedSectionId);
@@ -1463,16 +1442,15 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
   };
 
   const selectInsight = (index: number) => {
-    const sectionId = sectionForInsight(insights[index])?.section.id;
+    const sectionId = insightPlacements[index]?.section?.id;
     if (sectionId) selectSection(sectionId);
     setSelectedInsightIndex(index);
     setSummaryOpen(true);
     requestAnimationFrame(() => document.getElementById(`suggestion-card-${index}`)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }));
   };
 
-  const showCitedNote = (noteId: string, item?: NoteInsight) => {
-    const results = item ? sectionForInsight(item)?.results ?? retrieval?.results ?? [] : retrieval?.results ?? [];
-    setPanelRelevance(results.find((result) => result.note_id === noteId) ?? null);
+  const showCitedNote = (noteId: string) => {
+    setPanelRelevance(relevanceByNoteId.get(noteId) ?? null);
     setPanelNoteId(noteId);
   };
 
@@ -1552,7 +1530,7 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
       const openInsight = () => {
         if (relation === 'extends' && actionState.status === 'merged' && item.note_ids[0]) {
           setSummaryOpen(true);
-          showCitedNote(item.note_ids[0], item);
+          showCitedNote(item.note_ids[0]);
           return;
         }
         selectInsight(span.index);
@@ -1612,7 +1590,7 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
             {editing ? <div className="mx-auto max-w-3xl"><input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} aria-label="Note title" placeholder="Title (optional)" className="w-full bg-transparent text-2xl font-semibold outline-none placeholder:font-normal placeholder:text-[#c4c4c6]" /><textarea ref={bodyRef} value={body} onChange={(event) => setBody(event.target.value)} aria-label="Note text" className="mt-10 min-h-[520px] w-full resize-none bg-transparent text-base leading-[1.7] outline-none" /></div> : <article className="relative mx-auto max-w-3xl">{title.trim() && <button type="button" onClick={() => setEditing(true)} className="block w-full rounded-md px-2 py-1 text-left outline-none hover:bg-[#f8f8f8] focus-visible:ring-2 focus-visible:ring-[#477bea]/20"><h1 className="break-words text-2xl font-semibold">{title}</h1></button>}<div className="mt-2 flex flex-wrap gap-x-3 px-2 text-xs text-[#999]"><NoteDomainPicker category={note.category} muses={muses} saving={saving} onChange={onChangeDomain} showPrefix /><button type="button" onClick={openDate} className="hover:text-[#477bea]">{fullNoteDate(note.created_at)}</button></div>
               <div className="mt-9 flex w-full gap-4 rounded-md px-2 py-2 text-left text-base leading-[1.7]">
                 {noteSections.length > 1 && <nav aria-label="Note sections" onClick={(event) => event.stopPropagation()} className="sticky top-2 flex h-fit w-5 shrink-0 flex-col gap-2 py-1">
-                  {noteSections.map((section) => <button key={section.id} type="button" onClick={() => { selectSection(section.id); document.getElementById(`note-${section.id}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' }); }} aria-label={`Select section ${section.index + 1}`} aria-pressed={selectedSectionId === section.id} className={`h-8 rounded-full transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${selectedSectionId === section.id ? 'w-2.5 bg-[#666]' : 'w-1.5 bg-[#d2d2d5] hover:w-2.5 hover:bg-[#888]'}`} />)}
+                  {noteSections.map((section) => <button key={section.id} type="button" onClick={() => { selectSection(section.id); document.getElementById(`note-${section.id}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' }); }} aria-label={`Select section ${section.index + 1}${section.label ? `: ${section.label}` : ''}`} title={section.label || undefined} aria-pressed={selectedSectionId === section.id} className={`h-8 rounded-full transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${selectedSectionId === section.id ? 'w-2.5 bg-[#666]' : 'w-1.5 bg-[#d2d2d5] hover:w-2.5 hover:bg-[#888]'}`} />)}
                 </nav>}
                 <div className="min-w-0 flex-1 space-y-7">
                   {noteSections.length ? noteSections.map((section) => <section key={section.id} id={`note-${section.id}`} tabIndex={0} aria-label={`Section ${section.index + 1}`} aria-current={selectedSectionId === section.id ? 'true' : undefined} onClick={() => selectSection(section.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectSection(section.id); } }} className={`cursor-pointer scroll-mt-20 border-l-[3px] pl-4 outline-none transition hover:border-[#888] focus-visible:ring-2 focus-visible:ring-[#477bea]/30 ${selectedSectionId === section.id ? 'border-[#666]' : 'border-[#d2d2d5]'}`}>{renderSectionContent(section)}</section>) : <button type="button" onClick={() => setEditing(true)} className="text-left text-[#999]">Tap to start writing.</button>}
@@ -1648,7 +1626,7 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
                     {visibleInsightEntries.map(({ item, index, relation, actionId, actionState, section }, visibleIndex) => <Fragment key={actionId}>
                       {visibleIndex === 0 && section && noteSections.length > 1 && <button type="button" onClick={() => document.getElementById(`note-${section.id}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })} className="sticky top-0 z-[1] flex w-full items-center gap-2 bg-[#f7f7f9]/95 py-1 text-left text-[11px] font-medium uppercase tracking-[0.08em] text-[#999] backdrop-blur"><span className="h-px flex-1 bg-[#d8d8dc]" />Section {section.index + 1}<span className="h-px flex-1 bg-[#d8d8dc]" /></button>}
                       <div id={`suggestion-card-${index}`} onClick={() => setSelectedInsightIndex(index)} className={selectedInsightIndex === index ? 'rounded-xl ring-2 ring-[#477bea]/20' : ''}>
-                        <InsightCard insight={item} notesById={noteById} relation={relation} relevanceResults={sectionForInsight(item)?.results ?? retrieval?.results ?? []} outbound={isOutbound(item)} actionState={actionState} onActionChange={(next) => updateInsightAction(actionId, next)} notesOpen={openNotesUsedId === actionId} onNotesOpenChange={(open) => setOpenNotesUsedId(open ? actionId : null)} onSelectNote={(noteId) => showCitedNote(noteId, item)} />
+                        <InsightCard insight={item} notesById={noteById} relation={relation} relevanceResults={retrieval?.results ?? []} outbound={isOutbound(item)} actionState={actionState} onActionChange={(next) => updateInsightAction(actionId, next)} notesOpen={openNotesUsedId === actionId} onNotesOpenChange={(open) => setOpenNotesUsedId(open ? actionId : null)} onSelectNote={(noteId) => showCitedNote(noteId)} />
                       </div>
                     </Fragment>)}
                     {!visibleInsightEntries.length && insights.length > 0 && <div className="rounded-xl border border-[#e2e2e2] bg-white p-5 text-sm leading-relaxed text-[#777]">This section has no actionable connection. Select another section using its gray line.</div>}
@@ -1900,17 +1878,7 @@ function InstantRetrievalOverlay({ notes, projects, initialQuery = '', saving, o
   );
 }
 
-type NoteSection = { id: string; index: number; text: string; start: number; end: number };
-type SectionRelevanceSearch = {
-  section: NoteSection;
-  results: RelevanceResult[];
-  coverage: RelevanceCoverage;
-  summary?: string;
-  insights?: NoteInsight[];
-  goal_suggestions?: string[];
-  note_intent?: InsightIntent | null;
-  insight_failed?: boolean;
-};
+type NoteSection = { id: string; index: number; label: string; text: string; start: number; end: number };
 type RelevanceSearch = {
   results: RelevanceResult[];
   coverage: RelevanceCoverage;
@@ -1919,54 +1887,47 @@ type RelevanceSearch = {
   goal_suggestions?: string[];
   note_intent?: InsightIntent | null;
   insight_failed?: boolean;
-  sections?: SectionRelevanceSearch[];
+  /** The ideas the search split the note into, with offsets into the note's body. */
+  sections?: RelevanceSection[];
 };
 
-/** Paragraph breaks are explicit idea boundaries. Each section is queried on
- * its own, so a long note cannot let its opening idea drown out later ones. */
-function splitIntoNoteSections(text: string): NoteSection[] {
-  const sections: NoteSection[] = [];
-  const pattern = /\S(?:[\s\S]*?\S)?(?=\n\s*\n|$)/g;
-  for (const match of text.matchAll(pattern)) {
-    const value = match[0].trim();
-    if (!value) continue;
-    const leadingWhitespace = match[0].indexOf(value);
-    const start = (match.index ?? 0) + Math.max(0, leadingWhitespace);
-    sections.push({ id: `section-${sections.length + 1}`, index: sections.length, text: value, start, end: start + value.length });
+/**
+ * The server splits the text it searched, title included, but the reader
+ * shows the body alone. Moves each section onto the body, dropping any part
+ * that was in the title.
+ */
+function sectionsInBody(sections: RelevanceSection[] | undefined, searched: string, body: string): RelevanceSection[] | undefined {
+  const offset = sections?.length ? searched.indexOf(body) : -1;
+  if (!sections || offset < 0) return undefined;
+  const moved: RelevanceSection[] = [];
+  for (const section of sections) {
+    let start = Math.max(section.start, offset) - offset;
+    let end = Math.min(section.end, offset + body.length) - offset;
+    while (start < end && /\s/.test(body[start])) start++;
+    while (end > start && /\s/.test(body[end - 1])) end--;
+    if (end > start) moved.push({ ...section, start, end, text: body.slice(start, end) });
   }
-  if (!sections.length && text.trim()) {
-    const value = text.trim();
-    const start = text.indexOf(value);
-    sections.push({ id: 'section-1', index: 0, text: value, start, end: start + value.length });
-  }
-  return sections;
+  return moved.length ? moved : undefined;
 }
 
-function capSectionSearch(section: NoteSection, search: RelevanceSearch): SectionRelevanceSearch {
-  const results = search.results.slice(0, 3);
-  const resultIds = new Set(results.map((result) => result.note_id));
-  const insights = search.insights?.map((insight) => ({ ...insight, note_ids: insight.note_ids.filter((id) => resultIds.has(id)) })).filter((insight) => insight.note_ids.length > 0);
-  return { section, ...search, results, insights };
-}
-
-function combineSectionSearches(sections: SectionRelevanceSearch[]): RelevanceSearch {
-  const results = Array.from(new Map(sections.flatMap((section) => section.results).map((result) => [result.note_id, result])).values());
-  const insights = sections.flatMap((section) => section.insights ?? []);
-  const goalSuggestions = [...new Set(sections.flatMap((section) => section.goal_suggestions ?? []))].slice(0, 3);
-  return {
-    results,
-    insights,
-    sections,
-    coverage: {
-      notes_searched: sections.reduce((sum, section) => sum + section.coverage.notes_searched, 0),
-      notes_total: sections.reduce((sum, section) => sum + section.coverage.notes_total, 0),
-      complete: sections.every((section) => section.coverage.complete),
-    },
-    summary: sections.map((section) => section.summary?.trim()).filter(Boolean).join(' '),
-    goal_suggestions: goalSuggestions.length ? goalSuggestions : undefined,
-    note_intent: sections.find((section) => section.note_intent)?.note_intent ?? null,
-    insight_failed: sections.some((section) => section.insight_failed),
-  };
+/**
+ * The note's sections: the ideas the last search split it into while they
+ * still line up with the text, and its paragraphs otherwise. Sections only
+ * count as lining up when nothing but whitespace falls between them, since
+ * text outside every section would not be shown.
+ */
+function noteSectionsFor(body: string, searched: RelevanceSection[] | undefined): NoteSection[] {
+  let located: RelevanceSection[] | null = searched?.length ? [] : null;
+  let cursor = 0;
+  for (const section of searched ?? []) {
+    const at = body.indexOf(section.text, cursor);
+    if (at < 0 || body.slice(cursor, at).trim()) { located = null; break; }
+    located?.push({ ...section, start: at, end: at + section.text.length });
+    cursor = at + section.text.length;
+  }
+  if (located && body.slice(cursor).trim()) located = null;
+  return (located ?? splitIntoParagraphs(body))
+    .map((section, index) => ({ id: section.id, index, label: section.label, text: section.text, start: section.start, end: section.end }));
 }
 
 // Keep each visible section focused: never show more than three notes at once.
@@ -2424,7 +2385,7 @@ function RelevantNotesPanel({ notes, relevance, loading, progress, error, stale,
           <p className="px-2 py-12 text-center text-sm leading-relaxed text-[#999]">Nothing in your notes connects to this draft yet.</p>
         ) : (
           <div className="space-y-3">
-            {currentPage === 0 && relevance.insights?.slice(0, 3).map((item, index) => <InsightCard
+            {currentPage === 0 && relevance.insights?.map((item, index) => <InsightCard
               key={index}
               compact
               insight={item}

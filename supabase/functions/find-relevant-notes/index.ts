@@ -12,17 +12,18 @@ import {
   type TokenUsage,
 } from "../_shared/gemini.ts";
 import {
-  condenseDraft,
+  findDraftSections,
   findInsight,
-  insightFields,
   FAILED_INSIGHT,
-  mergeAgentResults,
   readGoalContext,
-  runRelevanceAgents,
+  searchRelevance,
+  searchResponseFields,
   streamRelevanceSearch,
   DEFAULT_AGENT_CONCURRENCY,
   DEFAULT_AGENT_COUNT,
+  MAX_RESULTS_PER_SECTION,
   MIN_DRAFT_CHARS,
+  type DraftSection,
   type GoalContext,
   type InsightOutcome,
   type NoteLike,
@@ -30,8 +31,6 @@ import {
 } from "../_shared/relevance.ts";
 
 const MAX_NOTES = 1000;
-/** The per-note cap from the retrieval workflow: more than this is a list nobody reads. */
-const MAX_RESULTS = 10;
 
 /**
  * The combined "Summary of related notes" is switched off: the insight card
@@ -41,8 +40,16 @@ const MAX_RESULTS = 10;
  */
 const COMBINED_SUMMARY_ENABLED = Deno.env.get("RELEVANCE_COMBINED_SUMMARY") === "on";
 
-/** Same reasoning as SUMMARY_TOKEN_BUDGET below: headroom for a thinking model. */
-const INSIGHT_TOKEN_BUDGET = 3000;
+/**
+ * Same reasoning as SUMMARY_TOKEN_BUDGET below: headroom for a thinking model.
+ * Higher than the summary's because a draft with many ideas gets a card for
+ * each, and a cut-off reply loses every card, not just the last.
+ */
+const INSIGHT_TOKEN_BUDGET = 8000;
+/** The split returns a few words per idea; the rest is room for reasoning. */
+const SECTION_TOKEN_BUDGET = 3000;
+const SECTION_SYSTEM_PROMPT =
+  "You divide a person's note into the separate ideas it contains. You respond with a JSON object and nothing else.";
 const INSIGHT_SYSTEM_PROMPT =
   "You help a person act on their own past notes. You respond with a JSON object and nothing else.";
 /**
@@ -81,10 +88,11 @@ const AGENT_SYSTEM_PROMPT =
  * on real traffic. Operator-only: never add this to a response body. It holds
  * counts only, no note text and no user id.
  */
-function logUsage(usage: TokenUsage, notesTotal: number, startedAt: number, context: GoalContext, tier: ModelTier): void {
+function logUsage(usage: TokenUsage, notesTotal: number, sectionsTotal: number, startedAt: number, context: GoalContext, tier: ModelTier): void {
   console.log(JSON.stringify({
     event: "find_relevant_notes_usage",
     notes_total: notesTotal,
+    sections_total: sectionsTotal,
     has_goal: Boolean(context.goal),
     model_tier: tier,
     llm_calls: usage.calls,
@@ -102,6 +110,7 @@ async function findMatchInsight(
   context: GoalContext,
   notes: NoteLike[],
   results: RelevanceResult[],
+  sections: DraftSection[],
   excludeNoteId: string | null,
   apiKey: string,
   usage: TokenUsage,
@@ -113,6 +122,7 @@ async function findMatchInsight(
       context,
       notes,
       results,
+      sections,
       excludeNoteId,
       generate: async (prompt) => {
         const { text, truncated, usage: callUsage } = await generateWithGeminiResult(
@@ -238,13 +248,41 @@ Deno.serve(async (req: Request) => {
 
     const startedAt = Date.now();
     const usage = emptyTokenUsage();
-    const draft = condenseDraft(draftText);
+    // The whole draft goes to every agent, however long: cutting its middle
+    // would hide the ideas there from the search.
+    const draft = draftText;
     const summarize = COMBINED_SUMMARY_ENABLED
       ? (results: RelevanceResult[]) => summarizeMatches(results, apiKey, usage, model)
       : undefined;
-    const insightFor = (results: RelevanceResult[]) =>
-      findMatchInsight(draft, goalContext, notes, results, excludeNoteId, apiKey, usage, model);
-    const agentOptions = {
+    const insightFor = (results: RelevanceResult[], sections: DraftSection[]) =>
+      findMatchInsight(draft, goalContext, notes, results, sections, excludeNoteId, apiKey, usage, model);
+    let sectionsTotal = 0;
+    const findSections = async (text: string) => {
+      const sections = await findDraftSections({
+        draft: text,
+        generate: async (prompt) => {
+          const { text: reply, truncated, usage: callUsage } = await generateWithGeminiResult(
+            SECTION_SYSTEM_PROMPT,
+            [{ role: "user", content: prompt }],
+            apiKey,
+            model,
+            { responseMimeType: "application/json", temperature: 0.2, maxOutputTokens: SECTION_TOKEN_BUDGET },
+          );
+          addTokenUsage(usage, callUsage);
+          if (truncated) console.error("find-relevant-notes idea split hit the token budget");
+          return reply;
+        },
+        // The search goes on by paragraph; the log says why.
+        onError: (error) => console.error("find-relevant-notes idea split failed:", errorMessage(error)),
+      });
+      sectionsTotal = sections.length;
+      return sections;
+    };
+    const searchOptions = {
+      maxPerSection: MAX_RESULTS_PER_SECTION,
+      findSections,
+      summarize,
+      findInsight: insightFor,
       draft,
       notes,
       goal: goalContext.goal,
@@ -275,10 +313,7 @@ Deno.serve(async (req: Request) => {
     // doesn't still gets the single JSON response below.
     if (body?.stream === true) {
       const stream = streamRelevanceSearch({
-        ...agentOptions,
-        maxResults: MAX_RESULTS,
-        summarize,
-        findInsight: insightFor,
+        ...searchOptions,
         allFailedMessage: "Relevance search is unavailable right now. Please try again.",
         failedMessage: "Relevance search failed. Please try again.",
         onError: (error) =>
@@ -286,40 +321,25 @@ Deno.serve(async (req: Request) => {
       });
       // Log once the stream has ended, when every call has been counted.
       const logged = stream.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
-        flush: () => logUsage(usage, notes.length, startedAt, goalContext, tier),
+        flush: () => logUsage(usage, notes.length, sectionsTotal, startedAt, goalContext, tier),
       }));
       return new Response(logged, {
         headers: { ...corsHeaders, "Content-Type": "application/x-ndjson", "Cache-Control": "no-cache" },
       });
     }
 
-    const { outcomes } = await runRelevanceAgents(agentOptions);
-
-    const createdAtById = new Map(notes.map((note) => [note.id, note.created_at]));
-    const { results, notesSearched } = mergeAgentResults(outcomes, createdAtById, MAX_RESULTS);
+    const outcome = await searchRelevance({
+      ...searchOptions,
+      onError: (error) => console.error("find-relevant-notes follow-up failed:", errorMessage(error)),
+    });
+    logUsage(usage, notes.length, sectionsTotal, startedAt, goalContext, tier);
 
     // Every agent failed: report an outage rather than an empty result set,
     // which would read as "nothing in your notes is related".
-    if (notesSearched === 0) {
-      logUsage(usage, notes.length, startedAt, goalContext, tier);
+    if (outcome.notesSearched === 0) {
       return json({ error: "Relevance search is unavailable right now. Please try again." }, 502);
     }
-
-    const [summary, outcome] = await Promise.all([
-      summarize && results.length ? summarize(results) : Promise.resolve(""),
-      insightFor(results),
-    ]);
-    logUsage(usage, notes.length, startedAt, goalContext, tier);
-    return json({
-      results,
-      ...(summary ? { summary } : {}),
-      ...insightFields(outcome),
-      coverage: {
-        notes_searched: notesSearched,
-        notes_total: notes.length,
-        complete: notesSearched === notes.length,
-      },
-    });
+    return json(searchResponseFields(outcome));
   } catch (error) {
     console.error("find-relevant-notes failed:", errorMessage(error));
     return json({ error: "Relevance search failed. Please try again." }, 500);
