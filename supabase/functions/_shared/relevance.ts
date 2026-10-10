@@ -862,16 +862,16 @@ ${howMany}
 For each insight:
 ANCHOR - copy, word for word, the shortest phrase or sentence from the note being written that this insight is about, at most 25 words${byIdea ? ", taken from inside the idea it is about" : ""}. Copy it exactly: do not paraphrase, fix typos, or add quotation marks. Two insights never share or overlap an anchor.
 TEXT - one or two plain sentences saying what their past notes add. Name the specifics: people, numbers, what happened. Do not restate the note being written.
-ACTION - one concrete next step, starting with a verb, that they could do this week. Fit it to the intent: for "stuck", a way forward; for "planning", something to add or check; for "deciding", the consideration they are missing; for "capturing", what to do with this (a follow-up, a question for next time); for "reflecting", a question worth answering; for "learning", where to apply it. Never generic advice like "keep going" or "reflect on this".
+ACTION - write the exact one or two sentences that should be added to the note being written at the ANCHOR. This is note content, not an instruction sent outside the note. For "solves", write the solution or resolved next step. For "helps", write a concrete next-step sentence. For "extends", write the additional fact, consequence, or detail. For "contradicts", write the clarification or unresolved question. For every other relation, write the observation worth preserving. Match the note's plain language. Never tell them to "think about", "consider", or "reflect on" something; never say "this week", "you should", or "try to". Do not include a heading—the interface adds it.
 NOTE_IDS - the IDs of the past notes this insight rests on, only from the list given.
-OUTBOUND - when the notes an insight rests on are outbound, the insight is about where this lesson applies. TEXT names that earlier situation and when it was ("On Sept 12 you were stuck on..."), and ACTION applies the lesson to it.
+OUTBOUND - when the notes an insight rests on are outbound, the insight is about where this lesson applies. TEXT names that earlier situation and when it was ("On Sept 12 you were stuck on..."). ACTION adds that concrete application to the current note; it never edits or assigns work in the earlier note.
 ${askForGoal ? `
 GOAL_SUGGESTIONS - they have not said what this area is for. Offer 2 or 3 short guesses at it, 2 to 6 words each and starting with a verb ("Validate pricing", "Find first 10 users"), based on the note and their recent notes in the area. Include these even when there are no insights.
 ` : ""}
 VOICE - these are their own notes. Speak to them as "you", like a friend who remembers everything they have written. Plain words, no jargon. Never say "the user", "the author", or "this note highlights".
 
 OUTPUT - a JSON object and nothing else, in this shape:
-{"intent": "<stuck|planning|deciding|capturing|reflecting|learning>", "insights": [{"anchor": "<exact quote>", "text": "<one or two sentences>", "action": "<one step>", "note_ids": ["<id>"]}]${askForGoal ? ', "goal_suggestions": ["<guess>"]' : ""}}
+{"intent": "<stuck|planning|deciding|capturing|reflecting|learning>", "insights": [{"anchor": "<exact quote>", "text": "<one or two sentences>", "action": "<one or two note-ready sentences>", "note_ids": ["<id>"]}]${askForGoal ? ', "goal_suggestions": ["<guess>"]' : ""}}
 with "insights" as [] when nothing clears the bar.
 
 ========================================
