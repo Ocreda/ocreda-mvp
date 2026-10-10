@@ -101,8 +101,9 @@ function stableHash(value: string): number {
 // v4: up to three insights, and relations gain helps and solves.
 // v5: every match says which way help flows (inbound or outbound).
 // v6: one search splits the note into ideas and tags each match with its idea.
+// v7: results also carry the exact passage used from every retrieved note.
 // The AI mode is part of the signature, so switching Basic/Best searches again.
-const SAVED_RETRIEVAL_VERSION = 'v6';
+const SAVED_RETRIEVAL_VERSION = 'v7';
 
 function savedRetrievalKey(userId: string, noteId: string): string {
   return `ocreda-saved-retrieval:${SAVED_RETRIEVAL_VERSION}:${userId}:${noteId}`;
@@ -226,6 +227,9 @@ export default function OcredaHome() {
   const [displayName, setDisplayName] = useState('');
   const [noteEditor, setNoteEditor] = useState<NoteEditorState | null>(null);
   const [activeNoteId, setActiveNoteId] = useState<string | null>(null);
+  // Set only for note-to-note navigation. It drives the contextual return
+  // arrow; notes opened from a list or project deliberately have no arrow.
+  const [previousNoteId, setPreviousNoteId] = useState<string | null>(null);
   const [activeNoteRetrievalMode, setActiveNoteRetrievalMode] = useState<'similar' | 'relevant'>('relevant');
   // Note-to-note navigation enables this so the destination restores or finds
   // its own connections without requiring another click.
@@ -401,7 +405,13 @@ export default function OcredaHome() {
     setView('muses');
   }, []);
   const openNewNote = (muse = AUTOMATIC_MUSE) => { setError(''); setNoteEditor({ note: null, title: '', body: '', muse, context: 'domain' }); };
-  const openExistingNote = (note: Note, autoSearch = true) => { setError(''); setActiveNoteRetrievalMode('relevant'); setActiveNoteAutoSearch(autoSearch); setActiveNoteId(note.id); };
+  const openExistingNote = (note: Note, autoSearch = true, fromNoteId: string | null = null) => {
+    setError('');
+    setActiveNoteRetrievalMode('relevant');
+    setActiveNoteAutoSearch(autoSearch);
+    setPreviousNoteId(fromNoteId);
+    setActiveNoteId(note.id);
+  };
   const createMuseFromEditor = (value: string) => {
     const requested = cleanCategory(value);
     if (!requested) return;
@@ -436,7 +446,7 @@ export default function OcredaHome() {
         processNote(created.id).catch(() => {});
         savedNoteId = created.id;
       }
-      setNoteEditor(null); setActiveNoteRetrievalMode('relevant'); setActiveNoteAutoSearch(true); setActiveNoteId(savedNoteId);
+      setNoteEditor(null); setActiveNoteRetrievalMode('relevant'); setActiveNoteAutoSearch(true); setPreviousNoteId(null); setActiveNoteId(savedNoteId);
       if (!findRelevant) flashSaved();
     } catch (err) { setError(safeErrorMessage(err, 'Unable to save this note.')); }
     finally { setSaving(false); }
@@ -484,6 +494,7 @@ export default function OcredaHome() {
       persistMuseAssignments([note.id], null);
       setNotes((items) => items.filter((item) => item.id !== note.id));
       if (activeNoteId === note.id) setActiveNoteId(null);
+      if (previousNoteId === note.id) setPreviousNoteId(null);
     } catch (err) { setError(safeErrorMessage(err, 'Unable to delete this page.')); }
     finally { setSaving(false); }
   };
@@ -672,6 +683,7 @@ export default function OcredaHome() {
   const activeProject = activeProjectId ? projects.find((project) => project.id === activeProjectId) ?? null : null;
   const activePage = activeProject && activePageId ? activeProject.pages.find((page) => page.id === activePageId) ?? null : null;
   const activeNote = activeNoteId ? notes.find((note) => note.id === activeNoteId) ?? null : null;
+  const previousNote = previousNoteId ? notes.find((note) => note.id === previousNoteId) ?? null : null;
 
   return (
     <main className="light h-[100dvh] w-full overflow-hidden bg-white text-[#141414]">
@@ -684,7 +696,7 @@ export default function OcredaHome() {
           : <CortexHome projects={projects} muses={muses} pinnedMuseTitles={pinnedMuseTitles} notes={notes} notesByMuse={notesByMuse} userEmail={user?.email ?? ''} busy={saving} onOpenMuses={() => setView('muses')} onOpenMuse={openMuse} onTogglePin={togglePinnedMuse} onAddMuse={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onAddNote={() => openNewNote()} onOpenImport={() => setImportOpen(true)} onOpenPage={(project, page) => { setActiveProjectId(project.id); setActivePageId(page.id); }} onOpenNote={openExistingNote} onSaveRetrieval={saveInstantRetrieval} />}
         {error && !noteEditor && !museEditor && !projectEditor && <div role="alert" className="fixed bottom-5 left-1/2 z-40 max-w-[90vw] -translate-x-1/2 rounded-lg bg-[#202020] px-4 py-3 text-sm text-white shadow-xl">{error}<button type="button" onClick={() => setError('')} aria-label="Dismiss error" className="ml-4"><X className="inline h-4 w-4" /></button></div>}
       </section>
-      {activeNote && <NoteReadingWorkspace key={activeNote.id} note={activeNote} allNotes={notes} muses={muses} projects={projects} saving={saving} userId={user?.id ?? 'local'} initialRetrievalMode={activeNoteRetrievalMode} autoSearch={activeNoteAutoSearch} onBack={() => setActiveNoteId(null)} onAddNote={() => { setActiveNoteId(null); openNewNote(cleanCategory(activeNote.category) ?? AUTOMATIC_MUSE); }} onOpenNote={(note, autoSearch) => openExistingNote(note, autoSearch)} onOpenPage={(project, page) => { setActiveNoteId(null); setActiveProjectId(project.id); setActivePageId(page.id); }} onUpdate={updateReadingNote} onChangeDomain={(category) => void changeReadingNoteDomain(activeNote.id, category)} onDelete={removeReadingNote} onSaveRetrieval={saveInstantRetrieval} onSetDomainGoal={setDomainGoal} />}
+      {activeNote && <NoteReadingWorkspace key={activeNote.id} note={activeNote} previousNote={previousNote} allNotes={notes} muses={muses} projects={projects} saving={saving} userId={user?.id ?? 'local'} initialRetrievalMode={activeNoteRetrievalMode} autoSearch={activeNoteAutoSearch} onClose={() => { setActiveNoteId(null); setPreviousNoteId(null); }} onReturnToPrevious={() => { if (previousNote) { setActiveNoteId(previousNote.id); setPreviousNoteId(null); } }} onAddNote={() => { setActiveNoteId(null); setPreviousNoteId(null); openNewNote(cleanCategory(activeNote.category) ?? AUTOMATIC_MUSE); }} onOpenNote={(note, autoSearch) => openExistingNote(note, autoSearch, activeNote.id)} onOpenPage={(project, page) => { setActiveNoteId(null); setPreviousNoteId(null); setActiveProjectId(project.id); setActivePageId(page.id); }} onUpdate={updateReadingNote} onChangeDomain={(category) => void changeReadingNoteDomain(activeNote.id, category)} onDelete={removeReadingNote} onSaveRetrieval={saveInstantRetrieval} onSetDomainGoal={setDomainGoal} />}
       {noteEditor && <NoteEditor state={noteEditor} muses={muses} notes={notes} saving={saving} error={error} onChange={setNoteEditor} onCreateMuse={createMuseFromEditor} onClose={() => { setNoteEditor(null); setError(''); }} onSave={() => void saveNote()} onFindRelevantNotes={() => void saveNote(true)} onImport={() => { setImportError(''); setImportOpen(true); }} onDelete={noteEditor.note ? () => void removeNote() : undefined} />}
       {museEditor && <MuseEditor state={museEditor} saving={saving} error={error} onChange={setMuseEditor} onClose={() => { setMuseEditor(null); setError(''); }} onSave={() => void saveMuse()} />}
       {projectEditor && <ProjectEditor state={projectEditor} error={error} onChange={setProjectEditor} onClose={() => { setProjectEditor(null); setError(''); }} onSave={saveProject} />}
@@ -1201,6 +1213,20 @@ function NoteDomainPicker({ category, muses, saving, onChange, showPrefix = fals
   );
 }
 
+/** Shows the exact candidate-note passage the retrieval used, in place. */
+function RetrievalMatchedBody({ text, matchedText }: { text: string; matchedText: string }) {
+  const span = matchedText ? findAnchor(text, matchedText) : null;
+  if (!span) return <FormattedNoteBody text={text} />;
+  return <div className="whitespace-pre-wrap break-words">
+    {text.slice(0, span.start)}
+    <mark className="rounded-sm bg-[#fff4c7] px-0.5 text-inherit underline decoration-[#e5b72f] decoration-2 underline-offset-4 [box-decoration-break:clone]" title="Text used for retrieval">
+      {text.slice(span.start, span.end)}
+    </mark>
+    <span className="ml-1 inline-block rounded bg-[#fff7d8] px-1 align-[1px] text-[10px] font-medium leading-4 text-[#9a7300]">Used for retrieval</span>
+    {text.slice(span.end)}
+  </div>;
+}
+
 function RelatedNotePanel({ note, relevance, onClose, onOpenFull }: {
   note: Note;
   relevance?: RelevanceResult;
@@ -1209,6 +1235,7 @@ function RelatedNotePanel({ note, relevance, onClose, onOpenFull }: {
 }) {
   const content = splitNote(note);
   const reason = relevance?.explanation.trim() ?? '';
+  const matchedText = relevance?.matched_text?.trim() ?? '';
   const relation = relevance?.relation_type ? RELATION_BADGES[relevance.relation_type] : null;
 
   return <div className="flex min-h-0 flex-1 flex-col bg-[#f7f7f9]">
@@ -1223,13 +1250,13 @@ function RelatedNotePanel({ note, relevance, onClose, onOpenFull }: {
         <button type="button" onClick={onClose} aria-label="Close related note" title="Back to suggestions" className="flex h-8 w-8 items-center justify-center rounded-md text-[#666] hover:bg-white hover:text-[#222] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]"><X className="h-5 w-5" /></button>
       </div>
     </header>
-    <div className="min-h-0 flex-1 overflow-y-auto px-7 py-10 sm:px-10">
+    <div className="min-h-0 flex-1 cursor-default overflow-y-auto px-7 py-10 sm:px-10" onDoubleClick={onOpenFull} title="Double-click to open this note">
       <article className="mx-auto max-w-2xl">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <h2 className="min-w-0 flex-1 break-words text-2xl font-semibold text-[#171717]">{content.title || 'Untitled note'}</h2>
           {relation && <span className={`shrink-0 rounded px-2 py-1 text-[10px] font-medium ${relation.className}`}>{relation.label}</span>}
         </div>
-        {content.body && <div className="mt-8 text-base leading-[1.7] text-[#2d2d2d]"><FormattedNoteBody text={content.body} /></div>}
+        {content.body && <div className="mt-8 text-base leading-[1.7] text-[#2d2d2d]"><RetrievalMatchedBody text={content.body} matchedText={matchedText} /></div>}
       </article>
     </div>
     {reason && <div className="shrink-0 border-t border-[#e4e4e4] bg-white px-5 py-4">
@@ -1238,9 +1265,9 @@ function RelatedNotePanel({ note, relevance, onClose, onOpenFull }: {
   </div>;
 }
 
-function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId, initialRetrievalMode, autoSearch, onBack, onAddNote, onOpenNote, onOpenPage, onUpdate, onChangeDomain, onDelete, onSaveRetrieval, onSetDomainGoal }: {
-  note: Note; allNotes: Note[]; muses: MuseMeta[]; projects: CortexProject[]; saving: boolean; userId: string; initialRetrievalMode: 'similar' | 'relevant'; autoSearch: boolean;
-  onBack: () => void; onAddNote: () => void; onOpenNote: (note: Note, autoSearch?: boolean) => void; onOpenPage: (project: CortexProject, page: ProjectPage) => void;
+function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, saving, userId, initialRetrievalMode, autoSearch, onClose, onReturnToPrevious, onAddNote, onOpenNote, onOpenPage, onUpdate, onChangeDomain, onDelete, onSaveRetrieval, onSetDomainGoal }: {
+  note: Note; previousNote: Note | null; allNotes: Note[]; muses: MuseMeta[]; projects: CortexProject[]; saving: boolean; userId: string; initialRetrievalMode: 'similar' | 'relevant'; autoSearch: boolean;
+  onClose: () => void; onReturnToPrevious: () => void; onAddNote: () => void; onOpenNote: (note: Note, autoSearch?: boolean) => void; onOpenPage: (project: CortexProject, page: ProjectPage) => void;
   onUpdate: (noteId: string, rawText: string) => Promise<void>; onChangeDomain: (category: string | null) => void; onDelete: (note: Note) => Promise<void>;
   onSaveRetrieval: (queryText: string, resultNotes: Note[], projectId: string, newProjectTitle?: string) => Promise<void>;
   onSetDomainGoal: (domainTitle: string, goal: string) => void;
@@ -1397,7 +1424,7 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
   // One highlight per insight whose passage is visible, in reading order.
   // Never while editing, and never two on overlapping text.
   const highlights = useMemo(() => {
-    if (editing || formattedBody) return [];
+    if (editing) return [];
     const found: { start: number; end: number; index: number }[] = [];
     insights.forEach((item, index) => {
       const actionId = insightActionId(item, relationOf(item));
@@ -1406,7 +1433,7 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
       if (span && !found.some((taken) => span.start < taken.end && taken.start < span.end)) found.push({ ...span, index });
     });
     return found.sort((x, y) => x.start - y.start);
-  }, [editing, formattedBody, insightActionStates, insightPlacements, insights, relationOf]);
+  }, [editing, insightActionStates, insightPlacements, insights, relationOf]);
 
   // A new note/search starts on the first section that has something useful to
   // show. Afterwards the reader's gray section rail controls this selection.
@@ -1473,7 +1500,16 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
       try { await latestSaveRef.current(note.id, rawText); setSaveState('saved'); }
       catch { setSaveState('error'); return; }
     }
-    if (next) onOpenNote(next, autoSearch); else onBack();
+    if (next) onOpenNote(next, autoSearch); else onClose();
+  };
+
+  const returnToPrevious = async () => {
+    if (rawText && rawText !== note.raw_text.trim()) {
+      setSaveState('saving');
+      try { await latestSaveRef.current(note.id, rawText); setSaveState('saved'); }
+      catch { setSaveState('error'); return; }
+    }
+    onReturnToPrevious();
   };
 
   const finishEditing = () => {
@@ -1510,9 +1546,8 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
   const openDate = () => setSearchRequest({ query: '', filter: { kind: 'date', value: localDateKey(note.created_at), label: fullNoteDate(note.created_at) } });
 
   const renderSectionContent = (section: NoteSection) => {
-    if (formattedBody) return <FormattedNoteBody text={section.text} />;
     const sectionHighlights = highlights.filter((span) => span.start >= section.start && span.end <= section.end);
-    if (!sectionHighlights.length) return <span className="whitespace-pre-wrap break-words">{section.text}</span>;
+    if (!sectionHighlights.length) return formattedBody ? <FormattedNoteBody text={section.text} /> : <span className="whitespace-pre-wrap break-words">{section.text}</span>;
     return <span className="whitespace-pre-wrap break-words">{sectionHighlights.map((span, position) => {
       const item = insights[span.index];
       const relation = relationOf(item);
@@ -1558,8 +1593,7 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
     <div role="dialog" aria-modal="true" aria-label={title || 'Note'} className="flex h-[min(94dvh,980px)] min-h-0 w-full max-w-[1760px] flex-col overflow-hidden rounded-xl bg-white p-3 shadow-2xl sm:p-5">
       <header className="relative flex h-14 shrink-0 items-center px-1 sm:px-2">
         <div className="flex items-center gap-1 text-[#777] sm:gap-2">
-          <button type="button" onClick={() => void leaveWorkspace()} aria-label="Back to notes" title="Back to notes" className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-[#f4f4f4]"><ArrowLeft className="h-5 w-5" /></button>
-          <span className="mx-1 h-7 w-px bg-[#e5e5e5]" />
+          {previousNote && <><button type="button" onClick={() => void returnToPrevious()} aria-label={`Back to ${noteLabel(previousNote)}`} title={`Back to ${noteLabel(previousNote)}`} className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-[#f4f4f4]"><ArrowLeft className="h-5 w-5" /></button><span className="mx-1 h-7 w-px bg-[#e5e5e5]" /></>}
           <button type="button" onClick={onAddNote} aria-label="Add a note" title="Add a note" className="flex h-8 w-8 items-center justify-center rounded-md bg-[#477bea] text-white hover:bg-[#3d6ed7]"><Plus className="h-5 w-5" /></button>
           <button type="button" onClick={() => setInstantRetrievalOpen(true)} aria-label="Open Instant Retrieval" title="Open Instant Retrieval" className="flex h-9 w-9 items-center justify-center rounded-md text-[#477bea] hover:bg-[#edf3ff]"><ScanSearch className="h-5 w-5" /></button>
           <button type="button" onClick={() => setSearchRequest({ query: '' })} aria-label="Search notes, pages, and Domains" title="Search notes, pages, and Domains" className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-[#f4f4f4]"><Search className="h-5 w-5" /></button>
@@ -1576,7 +1610,7 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
           <button type="button" disabled={!newerNote} onClick={() => newerNote && void leaveWorkspace(newerNote)} aria-label="Newer note" title="Newer note" className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-[#f4f4f4] disabled:opacity-25"><ChevronLeft className="h-4 w-4" /></button>
           <button type="button" disabled={!olderNote} onClick={() => olderNote && void leaveWorkspace(olderNote)} aria-label="Older note" title="Older note" className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-[#f4f4f4] disabled:opacity-25"><ChevronRight className="h-4 w-4" /></button>
           <button type="button" onClick={() => setMenuOpen((open) => !open)} aria-label="Note options" aria-expanded={menuOpen} className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-[#f4f4f4]"><MoreHorizontal className="h-5 w-5" /></button>
-          {menuOpen && <div className="absolute right-0 top-11 z-30 w-40 overflow-hidden rounded-lg border border-[#ddd] bg-white py-1 text-sm shadow-xl"><button type="button" onClick={() => { setMenuOpen(false); setEditing(true); requestAnimationFrame(() => bodyRef.current?.focus()); }} className="block w-full px-4 py-2.5 text-left hover:bg-[#f5f5f5]">Edit note</button><button type="button" disabled={saving} onClick={() => { setMenuOpen(false); void onDelete(note); }} className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-red-600 hover:bg-red-50"><Trash2 className="h-4 w-4" /> Delete note</button></div>}
+          {menuOpen && <div className="absolute right-0 top-11 z-30 w-40 overflow-hidden rounded-lg border border-[#ddd] bg-white py-1 text-sm shadow-xl"><button type="button" disabled={saving} onClick={() => { setMenuOpen(false); void onDelete(note); }} className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-red-600 hover:bg-red-50"><Trash2 className="h-4 w-4" /> Delete note</button></div>}
         </div>
       </header>
 
@@ -1587,13 +1621,13 @@ function NoteReadingWorkspace({ note, allNotes, muses, projects, saving, userId,
             {!summaryOpen && <button type="button" onClick={() => setSummaryOpen(true)} aria-controls="note-suggestions-panel" className="rounded-md border border-[#dedede] bg-white px-3 py-1.5 text-xs text-[#555] shadow-sm hover:border-[#adc3ff] hover:text-[#477bea] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">Show suggestions</button>}
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto px-7 pb-24 pt-12 sm:px-12 xl:px-[8%]">
-            {editing ? <div className="mx-auto max-w-3xl"><input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} aria-label="Note title" placeholder="Title (optional)" className="w-full bg-transparent text-2xl font-semibold outline-none placeholder:font-normal placeholder:text-[#c4c4c6]" /><textarea ref={bodyRef} value={body} onChange={(event) => setBody(event.target.value)} aria-label="Note text" className="mt-10 min-h-[520px] w-full resize-none bg-transparent text-base leading-[1.7] outline-none" /></div> : <article className="relative mx-auto max-w-3xl">{title.trim() && <button type="button" onClick={() => setEditing(true)} className="block w-full rounded-md px-2 py-1 text-left outline-none hover:bg-[#f8f8f8] focus-visible:ring-2 focus-visible:ring-[#477bea]/20"><h1 className="break-words text-2xl font-semibold">{title}</h1></button>}<div className="mt-2 flex flex-wrap gap-x-3 px-2 text-xs text-[#999]"><NoteDomainPicker category={note.category} muses={muses} saving={saving} onChange={onChangeDomain} showPrefix /><button type="button" onClick={openDate} className="hover:text-[#477bea]">{fullNoteDate(note.created_at)}</button></div>
+            {editing ? <div className="mx-auto max-w-3xl"><input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} aria-label="Note title" placeholder="Title (optional)" className="w-full bg-transparent text-2xl font-semibold outline-none placeholder:font-normal placeholder:text-[#c4c4c6]" /><textarea ref={bodyRef} value={body} onChange={(event) => setBody(event.target.value)} aria-label="Note text" className="mt-10 min-h-[520px] w-full resize-none bg-transparent text-base leading-[1.7] outline-none" /></div> : <article className="relative mx-auto max-w-3xl" onDoubleClick={() => { setEditing(true); requestAnimationFrame(() => bodyRef.current?.focus()); }} title="Double-click to edit">{title.trim() && <h1 className="break-words px-2 py-1 text-2xl font-semibold">{title}</h1>}<div className="mt-2 flex flex-wrap gap-x-3 px-2 text-xs text-[#999]" onDoubleClick={(event) => event.stopPropagation()}><NoteDomainPicker category={note.category} muses={muses} saving={saving} onChange={onChangeDomain} showPrefix /><button type="button" onClick={openDate} className="hover:text-[#477bea]">{fullNoteDate(note.created_at)}</button></div>
               <div className="mt-9 flex w-full gap-4 rounded-md px-2 py-2 text-left text-base leading-[1.7]">
                 {noteSections.length > 1 && <nav aria-label="Note sections" onClick={(event) => event.stopPropagation()} className="sticky top-2 flex h-fit w-5 shrink-0 flex-col gap-2 py-1">
                   {noteSections.map((section) => <button key={section.id} type="button" onClick={() => { selectSection(section.id); document.getElementById(`note-${section.id}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' }); }} aria-label={`Select section ${section.index + 1}${section.label ? `: ${section.label}` : ''}`} title={section.label || undefined} aria-pressed={selectedSectionId === section.id} className={`h-8 rounded-full transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${selectedSectionId === section.id ? 'w-2.5 bg-[#666]' : 'w-1.5 bg-[#d2d2d5] hover:w-2.5 hover:bg-[#888]'}`} />)}
                 </nav>}
                 <div className="min-w-0 flex-1 space-y-7">
-                  {noteSections.length ? noteSections.map((section) => <section key={section.id} id={`note-${section.id}`} tabIndex={0} aria-label={`Section ${section.index + 1}`} aria-current={selectedSectionId === section.id ? 'true' : undefined} onClick={() => selectSection(section.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectSection(section.id); } }} className={`cursor-pointer scroll-mt-20 border-l-[3px] pl-4 outline-none transition hover:border-[#888] focus-visible:ring-2 focus-visible:ring-[#477bea]/30 ${selectedSectionId === section.id ? 'border-[#666]' : 'border-[#d2d2d5]'}`}>{renderSectionContent(section)}</section>) : <button type="button" onClick={() => setEditing(true)} className="text-left text-[#999]">Tap to start writing.</button>}
+                  {noteSections.length ? noteSections.map((section) => <section key={section.id} id={`note-${section.id}`} tabIndex={0} aria-label={`Section ${section.index + 1}`} aria-current={selectedSectionId === section.id ? 'true' : undefined} onClick={() => selectSection(section.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectSection(section.id); } }} className={`cursor-text scroll-mt-20 border-l-[3px] pl-4 outline-none transition hover:border-[#888] focus-visible:ring-2 focus-visible:ring-[#477bea]/30 ${selectedSectionId === section.id ? 'border-[#666]' : 'border-[#d2d2d5]'}`}>{renderSectionContent(section)}</section>) : <span className="text-left text-[#999]">Double-click to start writing.</span>}
                 </div>
               </div>
             </article>}
