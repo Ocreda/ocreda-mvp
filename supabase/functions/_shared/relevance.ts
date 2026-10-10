@@ -110,6 +110,8 @@ export interface RelevanceResult {
   gist: string;
   /** How the note bears on the draft. */
   explanation: string;
+  /** Exact words copied from the candidate note that support the match. */
+  matched_text: string;
 }
 
 export function truncate(text: string, limit: number): string {
@@ -188,6 +190,8 @@ EXPLANATION - one or two short sentences, in plain language, written to the pers
 Write both the way you would explain it to a friend. Address them as "you" and call the draft "your draft". No jargon, no academic register, and never open with "This note highlights/underscores/demonstrates".
 Do the thinking for them: spell the connection out rather than gesturing at it. Never say two things are "both about X" without saying what about X ties them together.
 
+MATCHED TEXT - copy, word for word, the shortest sentence or passage from the candidate note that you actually used to make this match. Do not paraphrase, fix typos, or add quotation marks. Keep it under 45 words.
+
 CRITICAL RULES:
 - Many candidate notes will be irrelevant. Returning [] is correct when nothing connects. Do not pad your response.
 - Never include a note merely because it shares words, names, or a broad category with the draft. The connection must be about substance.
@@ -197,13 +201,13 @@ CRITICAL RULES:
 - Use the exact ID string as given. Never invent an ID, and never return one that is not listed above.
 
 Worked examples:
-- Draft: "From The Mom Test: ask people about what they did in the past, not what they would do in the future." Candidate note: "Tester interviews keep going nowhere - everyone says they'd use it, then nobody does." Score 0.91, relation_type "solves", direction "outbound", gist: "Your tester interviews keep ending with people saying they'd use it and then never doing.", explanation: "Your draft is the fix for this: those interviews asked what testers would do, which is exactly the question the book says gets you polite yeses."
+- Draft: "From The Mom Test: ask people about what they did in the past, not what they would do in the future." Candidate note: "Tester interviews keep going nowhere - everyone says they'd use it, then nobody does." Score 0.91, relation_type "solves", direction "outbound", gist: "Your tester interviews keep ending with people saying they'd use it and then never doing.", explanation: "Your draft is the fix for this: those interviews asked what testers would do, which is exactly the question the book says gets you polite yeses.", matched_text: "everyone says they'd use it, then nobody does"
 - Draft: "Charging per seat punishes teams for adding people, so we should move to usage-based pricing." Candidate note: "Talked to Maya - she stopped adding teammates to the tool because each one cost another $12/mo." Score 0.94, relation_type "supports", gist: "You talked to Maya, a customer, who stopped adding teammates to the tool because each extra seat cost another $12 a month.", explanation: "That is the exact thing your draft argues, already happening to someone real - the problem with per-seat pricing isn't theoretical, she felt it and acted on it."
 - Draft: "I'm always running late, however early I start." Candidate note: "I'm the last one in my friend group to get married. Good things seem to reach me last." Score 0.84, relation_type "parallel", gist: "You're the last of your friends to get married, and feel like good things tend to reach you last.", explanation: "It's not about punctuality at all, but it's the same shape as your draft - being behind turns up in two different corners of your life, one you cause and one you don't, which is worth sitting with."
 - Draft: the pricing one again. Candidate note: "Pricing page redesign - make the CTA green and move testimonials above the fold." Omitted entirely: it shares the word "pricing" but has nothing to do with the draft's argument.
 
 OUTPUT - a JSON array and nothing else, in this shape:
-[{"note_id": "<exact id>", "relevance_score": <number>, "relation_type": "<solves|helps|supports|extends|contradicts|question|parallel>", "direction": "<inbound|outbound>", "gist": "<one sentence>", "explanation": "<one or two short sentences>"}]
+[{"note_id": "<exact id>", "relevance_score": <number>, "relation_type": "<solves|helps|supports|extends|contradicts|question|parallel>", "direction": "<inbound|outbound>", "gist": "<one sentence>", "explanation": "<one or two short sentences>", "matched_text": "<exact quote from candidate note>"}]
 
 ========================================
 
@@ -269,6 +273,7 @@ export function parseAgentResponse(raw: string, allowedIds: Set<string>): Releva
     // A missing gist is not worth losing a relevant note over; the UI just
     // won't offer the summary side for it.
     const gist = typeof row.gist === "string" ? row.gist.trim() : "";
+    const matchedText = typeof row.matched_text === "string" ? row.matched_text.trim() : "";
 
     seen.add(noteId);
     results.push({
@@ -279,6 +284,7 @@ export function parseAgentResponse(raw: string, allowedIds: Set<string>): Releva
       direction: DIRECTIONS.includes(row.direction as Direction) ? (row.direction as Direction) : "inbound",
       gist: truncate(gist, MAX_GIST_CHARS),
       explanation: truncate(explanation, MAX_EXPLANATION_CHARS),
+      matched_text: truncate(matchedText, 500),
     });
   }
 

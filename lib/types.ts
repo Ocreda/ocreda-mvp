@@ -61,6 +61,8 @@ export interface RelevanceResult {
   gist: string;
   /** How the note bears on the draft. */
   explanation: string;
+  /** Exact words from the related note that the retrieval decision relied on. */
+  matched_text?: string;
 }
 
 /**

@@ -120,6 +120,11 @@ test('keeps the gist alongside the explanation', () => {
   assert.strictEqual(out[0].explanation, 'because');
 });
 
+test('keeps the exact candidate passage used for retrieval', () => {
+  const out = parseAgentResponse(row({ matched_text: '  the exact source words  ' }), allowed);
+  assert.strictEqual(out[0].matched_text, 'the exact source words');
+});
+
 test('keeps a row with no gist, leaving it empty', () => {
   const out = parseAgentResponse(row({ gist: 42 }), allowed);
   assert.strictEqual(out.length, 1);
