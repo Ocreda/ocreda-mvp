@@ -63,6 +63,21 @@ export interface RelevanceResult {
   explanation: string;
   /** Exact words from the related note that the retrieval decision relied on. */
   matched_text?: string;
+  /** Which of the draft's sections the note bears on, or "whole". Missing from similarity-only results. */
+  section_id?: string;
+}
+
+/**
+ * One idea in the searched text, as the server split it. Sections are in
+ * reading order, do not overlap, and offsets index into the searched text.
+ */
+export interface RelevanceSection {
+  id: string;
+  /** A few words naming the idea; empty when the text was split by paragraphs. */
+  label: string;
+  start: number;
+  end: number;
+  text: string;
 }
 
 /**
@@ -97,6 +112,8 @@ export interface NoteInsight {
   action: string;
   /** The notes the insight rests on, all of them among the results. */
   note_ids: string[];
+  /** The section the insight is about. Missing from servers that predate sections. */
+  section_id?: string;
 }
 
 /** The Domain a search is made from, and what the person said they want from it. */
@@ -108,10 +125,13 @@ export interface DomainGoal {
 export interface RelevantNotesResponse {
   results: RelevanceResult[];
   coverage: RelevanceCoverage;
+  /** The searched text's ideas. Missing from similarity search and from servers that predate sections. */
+  sections?: RelevanceSection[];
   /** A short synthesis of the related notes as a group, when the server has it switched on. */
   summary?: string;
   /**
-   * Up to three, each about a different passage. Undefined when the server
+   * Each about a different passage: up to three for a single idea, one per
+   * idea otherwise. Undefined when the server
    * ran no insight step (similar-notes mode, or an older server); empty when
    * it ran and found nothing worth saying.
    */

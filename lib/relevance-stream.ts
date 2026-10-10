@@ -1,4 +1,4 @@
-import { InsightIntent, NoteInsight, RelevanceCoverage, RelevanceProgress, RelevanceResult, RelevantNotesResponse } from '@/lib/types';
+import { InsightIntent, NoteInsight, RelevanceCoverage, RelevanceProgress, RelevanceResult, RelevanceSection, RelevantNotesResponse } from '@/lib/types';
 
 const INTENTS: InsightIntent[] = ['stuck', 'planning', 'deciding', 'capturing', 'reflecting', 'learning'];
 
@@ -17,7 +17,22 @@ function readInsight(value: unknown, resultIds: Set<string>): NoteInsight | null
     text,
     action,
     note_ids: noteIds,
+    ...(typeof row.section_id === 'string' ? { section_id: row.section_id } : {}),
   };
+}
+
+/** Sections are only kept when every one is well formed, so offsets can be trusted. */
+function readSections(value: unknown): RelevanceSection[] | undefined {
+  if (!Array.isArray(value) || !value.length) return undefined;
+  const sections = value.map((item): RelevanceSection | null => {
+    if (!item || typeof item !== 'object') return null;
+    const row = item as Record<string, unknown>;
+    const start = Number(row.start);
+    const end = Number(row.end);
+    if (typeof row.id !== 'string' || typeof row.text !== 'string' || !Number.isInteger(start) || !Number.isInteger(end) || end <= start) return null;
+    return { id: row.id, label: typeof row.label === 'string' ? row.label : '', start, end, text: row.text };
+  });
+  return sections.every(Boolean) ? (sections as RelevanceSection[]) : undefined;
 }
 
 function toRelevantNotesResponse(payload: Record<string, unknown> | null): RelevantNotesResponse {
@@ -35,8 +50,10 @@ function toRelevantNotesResponse(payload: Record<string, unknown> | null): Relev
   const goalSuggestions = Array.isArray(rawSuggestions)
     ? rawSuggestions.filter((item): item is string => typeof item === 'string' && Boolean(item.trim())).map((item) => item.trim())
     : [];
+  const sections = readSections(payload?.sections);
   return {
     results,
+    ...(sections ? { sections } : {}),
     summary: typeof payload?.summary === 'string' ? payload.summary.trim() : undefined,
     ...(insights ? { insights } : {}),
     ...(goalSuggestions.length ? { goal_suggestions: goalSuggestions } : {}),

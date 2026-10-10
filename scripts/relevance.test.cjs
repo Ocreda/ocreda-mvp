@@ -10,8 +10,13 @@ const {
   mergeAgentResults,
   runRelevanceAgents,
   streamRelevanceSearch,
-  condenseDraft,
   truncate,
+  splitIntoParagraphs,
+  parseSectionResponse,
+  findDraftSections,
+  wholeDraftSection,
+  searchRelevance,
+  maxInsightsFor,
   buildPrompt,
   buildInsightPrompt,
   parseInsightResponse,
@@ -191,7 +196,7 @@ const streamOptions = (over) => ({
   concurrency: 3,
   generate: matchEveryNote,
   isRetryable: () => false,
-  maxResults: 50,
+  maxPerSection: 50,
   allFailedMessage: 'all failed',
   failedMessage: 'failed',
   ...over,
@@ -276,7 +281,7 @@ test('all agents succeeding counts every note', () => {
 });
 
 
-test('caps the returned list at maxResults', () => {
+test('caps the returned list at the per-section limit', () => {
   const many = Array.from({ length: 80 }, (_, i) => res(`n-${i}`, 0.5 + i / 1000));
   assert.strictEqual(mergeAgentResults([{ chunkSize: 80, results: many }], new Map(), 50).results.length, 50);
 });
@@ -392,16 +397,9 @@ test('results only survive if the id belongs to that agent’s own chunk', async
 
 // ------------------------------------------------------------ draft prep
 
-test('a short draft passes through untouched', () => {
-  assert.strictEqual(condenseDraft('hello'), 'hello');
-});
-
-test('a long draft keeps both the opening and the most recent writing', () => {
-  const long = 'A'.repeat(4000) + 'B'.repeat(5000) + 'ZZZ-TAIL';
-  const out = condenseDraft(long);
-  assert.ok(out.startsWith('A'.repeat(100)), 'head must survive');
-  assert.ok(out.endsWith('ZZZ-TAIL'), 'tail must survive');
-  assert.ok(out.length < long.length);
+test('a long draft reaches the agents whole, middle included', () => {
+  const long = 'A'.repeat(4000) + 'MIDDLE-IDEA' + 'B'.repeat(5000) + 'ZZZ-TAIL';
+  assert.ok(buildPrompt(long, [note('a')]).includes(long));
 });
 
 test('truncate only trims past the limit', () => {
@@ -688,6 +686,174 @@ test('variety never lets a much weaker match jump a strong one', () => {
 
 test('variety stops at the limit', () => {
   assert.strictEqual(diversifyByRelation([hit('a', 0.9), hit('b', 0.8), hit('c', 0.7)], 2).length, 2);
+});
+
+// ------------------------------------------------------------- sections
+
+const IDEAS_DRAFT = 'Tester said she would pay $20/month if it synced with Notion.\n\nShe got lost on the empty home screen. Nobody knew what to do first.\n\nSeparately, I keep pushing the investor update back a week.';
+const ideasReply = (...ideas) => JSON.stringify({ ideas: ideas.map(([starts_with, label]) => ({ starts_with, label })) });
+
+test('paragraphs split at blank lines, trimmed, with offsets into the draft', () => {
+  const draft = '  First idea here.\n\n\nSecond one\nstill second.\n';
+  const sections = splitIntoParagraphs(draft);
+  assert.deepStrictEqual(sections.map((s) => s.text), ['First idea here.', 'Second one\nstill second.']);
+  assert.deepStrictEqual(sections.map((s) => s.id), ['1', '2']);
+  sections.forEach((s) => assert.strictEqual(draft.slice(s.start, s.end), s.text));
+});
+
+test('ideas run from where each starts to where the next starts, and cover the whole draft', () => {
+  const sections = parseSectionResponse(ideasReply(['Tester said she would pay', 'Pricing'], ['Separately, I keep pushing the investor update', 'Investor update']), IDEAS_DRAFT);
+  assert.strictEqual(sections.length, 2);
+  assert.ok(sections[0].text.startsWith('Tester said'));
+  assert.ok(sections[0].text.endsWith('Nobody knew what to do first.'), 'the paragraph with no idea of its own stays with the one before it');
+  assert.strictEqual(sections[1].text, 'Separately, I keep pushing the investor update back a week.');
+  assert.deepStrictEqual(sections.map((s) => s.label), ['Pricing', 'Investor update']);
+});
+
+test('an idea can start inside a paragraph', () => {
+  const sections = parseSectionResponse(ideasReply(['Tester said she would pay', 'Pricing'], ['She got lost on the empty home screen', 'Onboarding'], ['Nobody knew what to do first', 'First step']), IDEAS_DRAFT);
+  assert.deepStrictEqual(sections.map((s) => s.text.slice(0, 12)), ['Tester said ', 'She got lost', 'Nobody knew ']);
+});
+
+test('the first idea also takes any text before its opening words', () => {
+  const sections = parseSectionResponse(ideasReply(['She got lost on the empty home screen', 'Onboarding']), IDEAS_DRAFT);
+  assert.strictEqual(sections.length, 1);
+  assert.strictEqual(sections[0].text, IDEAS_DRAFT);
+});
+
+test('opening words that are not in the draft, or are out of order, fold into the idea before', () => {
+  const sections = parseSectionResponse(ideasReply(
+    ['Separately, I keep pushing the investor update', 'Investor'],
+    ['Tester said she would pay', 'Pricing'],
+    ['words that never appear anywhere at all', 'Made up'],
+  ), IDEAS_DRAFT);
+  assert.strictEqual(sections.length, 1);
+  assert.strictEqual(sections[0].text, IDEAS_DRAFT);
+});
+
+test('an unusable idea split is reported as null', () => {
+  assert.strictEqual(parseSectionResponse('not json', IDEAS_DRAFT), null);
+  assert.strictEqual(parseSectionResponse('{"ideas": []}', IDEAS_DRAFT), null);
+  assert.strictEqual(parseSectionResponse(ideasReply(['nothing like the note at all', 'x']), IDEAS_DRAFT), null);
+});
+
+test('a short single paragraph is one idea without a model call', async () => {
+  let calls = 0;
+  const sections = await findDraftSections({ draft: 'One short thought about pricing.', generate: async () => { calls++; return ''; } });
+  assert.strictEqual(calls, 0);
+  assert.deepStrictEqual(sections.map((s) => s.text), ['One short thought about pricing.']);
+});
+
+test('a failed or unusable idea split falls back to paragraphs, never losing text', async () => {
+  const failed = await findDraftSections({ draft: IDEAS_DRAFT, generate: async () => { throw new Error('down'); } });
+  assert.strictEqual(failed.length, 3);
+  const garbled = await findDraftSections({ draft: IDEAS_DRAFT, generate: async () => 'nope' });
+  assert.strictEqual(garbled.length, 3);
+});
+
+test('agents see the whole draft with each idea numbered, and only when there are several', () => {
+  const prompt = buildPrompt(IDEAS_DRAFT, [note('a')], null, splitIntoParagraphs(IDEAS_DRAFT));
+  assert.ok(prompt.includes('<idea id="1">\nTester said'));
+  assert.ok(prompt.includes('<idea id="3">\nSeparately'));
+  assert.ok(!buildPrompt(IDEAS_DRAFT, [note('a')], null, wholeDraftSection(IDEAS_DRAFT)).includes('<idea id='));
+});
+
+test('ideas do not disturb the shared prompt prefix that caching relies on', () => {
+  const prefix = (text) => text.slice(0, text.indexOf('<draft>'));
+  assert.strictEqual(prefix(buildPrompt(IDEAS_DRAFT, [note('a')], null, splitIntoParagraphs(IDEAS_DRAFT))), prefix(buildPrompt('d', [note('a')])));
+});
+
+test('each match is tagged with its idea, and an unknown idea means the whole draft', () => {
+  const ids3 = ['1', '2', '3'];
+  assert.strictEqual(parseAgentResponse(row({ idea: 2 }), allowed, ids3)[0].section_id, '2');
+  assert.strictEqual(parseAgentResponse(row({ idea: '3' }), allowed, ids3)[0].section_id, '3');
+  assert.strictEqual(parseAgentResponse(row({ idea: 'whole' }), allowed, ids3)[0].section_id, 'whole');
+  assert.strictEqual(parseAgentResponse(row({ idea: 9 }), allowed, ids3)[0].section_id, 'whole');
+  assert.strictEqual(parseAgentResponse(row({ idea: 'whole' }), allowed, ['1'])[0].section_id, '1', 'with one section, every match is about it');
+});
+
+const inSection = (id, score, section, relation = 'extends') => ({ ...res(id, score), relation_type: relation, section_id: section });
+
+test('each idea keeps its own best three, so the main idea cannot crowd out the rest', () => {
+  const big = Array.from({ length: 6 }, (_, i) => inSection(`big-${i}`, 0.95 - i / 100, '1'));
+  const small = [inSection('small-0', 0.66, '2'), inSection('small-1', 0.65, '2')];
+  const { results } = mergeAgentResults([{ chunkSize: 8, results: [...big, ...small] }], new Map(), 3);
+  assert.deepStrictEqual(results.map((r) => r.note_id), ['big-0', 'big-1', 'big-2', 'small-0', 'small-1']);
+});
+
+test('there is no cap for the note as a whole', () => {
+  const many = Array.from({ length: 7 }, (_, s) => [0, 1, 2].map((i) => inSection(`s${s}-${i}`, 0.9 - i / 100, String(s + 1)))).flat();
+  assert.strictEqual(mergeAgentResults([{ chunkSize: 21, results: many }], new Map(), 3).results.length, 21);
+});
+
+const TWO_IDEAS = 'Tester said she would pay $20/month for this.\n\nI keep pushing the investor update back a week.';
+const TWO_SECTIONS = splitIntoParagraphs(TWO_IDEAS);
+
+test('an insight belongs to the idea its passage is in', () => {
+  const raw = JSON.stringify({ intent: 'capturing', insights: [
+    card({ anchor: 'pushing the investor update back', text: 'You did this in May too.', action: 'Send it Friday.' }),
+    card(),
+  ] });
+  const { insights } = parseInsightResponse(raw, { draft: TWO_IDEAS, allowedNoteIds: insightIds, askForGoal: false, sections: TWO_SECTIONS });
+  assert.deepStrictEqual(insights.map((i) => i.section_id), ['2', '1']);
+});
+
+test('an insight without a passage goes where its notes point', () => {
+  const raw = JSON.stringify({ intent: 'capturing', insights: [card({ anchor: 'not in the draft at all', note_ids: ['n2'] })] });
+  const out = parseInsightResponse(raw, {
+    draft: TWO_IDEAS, allowedNoteIds: insightIds, askForGoal: false, sections: TWO_SECTIONS, sectionOfNote: new Map([['n2', '2']]),
+  });
+  assert.strictEqual(out.insights[0].section_id, '2');
+});
+
+test('a draft with several ideas may get one insight per idea, plus one for the whole', () => {
+  assert.strictEqual(maxInsightsFor(splitIntoParagraphs(IDEAS_DRAFT)), 4);
+  assert.strictEqual(maxInsightsFor(wholeDraftSection(IDEAS_DRAFT)), 3);
+  const prompt = buildInsightPrompt({
+    draft: IDEAS_DRAFT, context: { domain: null, goal: 'g' }, recentNotes: [],
+    matches: [{ note: note('a'), result: { ...hit('a', 0.9), section_id: '2' } }], sections: splitIntoParagraphs(IDEAS_DRAFT),
+  });
+  assert.ok(prompt.includes('at most one insight per idea'));
+  assert.ok(prompt.includes('Idea: 2'));
+});
+
+test('the search splits the draft once and reads every note once, whatever the number of ideas', async () => {
+  let agentCalls = 0;
+  let splitCalls = 0;
+  const outcome = await searchRelevance({
+    ...streamOptions(),
+    draft: IDEAS_DRAFT,
+    generate: (prompt) => { agentCalls++; return matchEveryNote(prompt); },
+    findSections: async (draft) => { splitCalls++; return splitIntoParagraphs(draft); },
+  });
+  assert.strictEqual(splitCalls, 1);
+  assert.strictEqual(agentCalls, 3, 'one call per agent, not one per idea');
+  assert.strictEqual(outcome.sections.length, 3);
+  assert.strictEqual(outcome.notesSearched, 6);
+});
+
+test('the insight step is given the sections the search used', async () => {
+  let seen = null;
+  await searchRelevance({
+    ...streamOptions(),
+    draft: IDEAS_DRAFT,
+    findSections: async (draft) => splitIntoParagraphs(draft),
+    findInsight: async (_results, sections) => { seen = sections; return { insights: [], goal_suggestions: [], intent: null, failed: false }; },
+  });
+  assert.strictEqual(seen.length, 3);
+});
+
+test('a throwing idea split still searches, by paragraph', async () => {
+  const outcome = await searchRelevance({ ...streamOptions(), draft: IDEAS_DRAFT, findSections: async () => { throw new Error('down'); } });
+  assert.strictEqual(outcome.sections.length, 3);
+  assert.ok(outcome.results.length > 0);
+});
+
+test('the done event carries the sections', async () => {
+  const events = await readEvents(streamRelevanceSearch(streamOptions({ draft: IDEAS_DRAFT, findSections: async (draft) => splitIntoParagraphs(draft) })));
+  const done = events.at(-1);
+  assert.strictEqual(done.type, 'done');
+  assert.deepStrictEqual(done.sections.map((s) => s.id), ['1', '2', '3']);
 });
 
 run();

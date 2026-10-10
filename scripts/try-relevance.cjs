@@ -22,15 +22,18 @@
 const fs = require('fs');
 const path = require('path');
 const {
-  condenseDraft, findInsight, mergeAgentResults, runRelevanceAgents,
+  findDraftSections, findInsight, mergeAgentResults, runRelevanceAgents,
   DEFAULT_AGENT_COUNT: AGENT_COUNT,
   DEFAULT_AGENT_CONCURRENCY: AGENT_CONCURRENCY,
 } = require('../.relevance-build/relevance.js');
 const { generateWithGemini, isRetryableGeminiError, modelForTier } = require('../.relevance-build/gemini.js');
 
+// Per idea. Kept high so the eval sees everything that cleared its bar.
 const MAX_RESULTS = 50;
 const INSIGHT_SYSTEM_PROMPT =
   'You help a person act on their own past notes. You respond with a JSON object and nothing else.';
+const SECTION_SYSTEM_PROMPT =
+  "You divide a person's note into the separate ideas it contains. You respond with a JSON object and nothing else.";
 const AGENT_SYSTEM_PROMPT =
   "You identify meaningful relationships between a person's notes. You respond with a JSON array and nothing else.";
 
@@ -197,10 +200,24 @@ async function main() {
   console.log(`\nSearching across ${AGENT_COUNT} agents, ${AGENT_CONCURRENCY} at a time...\n`);
 
   const started = Date.now();
-  const draft = condenseDraft(draftText.trim());
+  const draft = draftText.trim();
+  const sections = await findDraftSections({
+    draft,
+    generate: (prompt) =>
+      generateWithGemini(SECTION_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], apiKey, model, {
+        responseMimeType: 'application/json',
+        temperature: 0.2,
+        maxOutputTokens: 3000,
+      }),
+    onError: (error) => console.log(`  idea split unusable, using paragraphs: ${error.message}`),
+  });
+  console.log(`Ideas (${sections.length}):`);
+  sections.forEach((section) => console.log(`  [${section.id}] ${section.label || '(paragraph)'}: ${section.text.slice(0, 60).replace(/\s+/g, ' ')}...`));
+  console.log('');
   const { outcomes } = await runRelevanceAgents({
     draft,
     notes,
+    sections,
     goal: args.goal || null,
     agentCount: AGENT_COUNT,
     concurrency: AGENT_CONCURRENCY,
@@ -233,7 +250,7 @@ async function main() {
     const pick = picks.get(result.note_id);
     const tag = picks.size ? (pick ? `[#${String(pick.order).padStart(2)}]` : '[ --]') : '';
     const pct = `${Math.round(result.relevance_score * 100)}%`;
-    console.log(`\n${String(index + 1).padStart(2)}. ${tag} ${pct.padStart(4)}  ${RELATION_SHORT[result.relation_type]} ${result.direction === 'outbound' ? 'OUT' : 'in '} ${result.note_id} ${titleOf(textById.get(result.note_id))}`);
+    console.log(`\n${String(index + 1).padStart(2)}. ${tag} ${pct.padStart(4)}  ${RELATION_SHORT[result.relation_type]} ${result.direction === 'outbound' ? 'OUT' : 'in '} idea ${result.section_id.padEnd(5)} ${result.note_id} ${titleOf(textById.get(result.note_id))}`);
     if (result.gist) console.log(wrap(`Gist: ${result.gist}`, 72, '      '));
     console.log(wrap(`AI:  ${result.explanation}`, 72, '      '));
     if (pick && pick.why) console.log(wrap(`You: ${pick.why}`, 72, '      '));
@@ -244,12 +261,13 @@ async function main() {
     context: { domain: 'Eval', goal: args.goal || null },
     notes,
     results,
+    sections,
     excludeNoteId: null,
     generate: (prompt) =>
       generateWithGemini(INSIGHT_SYSTEM_PROMPT, [{ role: 'user', content: prompt }], apiKey, model, {
         responseMimeType: 'application/json',
         temperature: 0.2,
-        maxOutputTokens: 3000,
+        maxOutputTokens: 8000,
       }),
   });
 
@@ -257,7 +275,7 @@ async function main() {
   console.log('INSIGHT');
   console.log('='.repeat(78));
   outcome.insights.forEach((insight, index) => {
-    console.log(`\n  #${index + 1}  intent ${insight.intent}`);
+    console.log(`\n  #${index + 1}  intent ${insight.intent}, idea ${insight.section_id}`);
     console.log(wrap(`anchor:  ${insight.anchor ? `"${insight.anchor}"` : '(quote not found in draft - no highlight)'}`, 72, '  '));
     console.log(wrap(`insight: ${insight.text}`, 72, '  '));
     console.log(wrap(`action:  ${insight.action}`, 72, '  '));
