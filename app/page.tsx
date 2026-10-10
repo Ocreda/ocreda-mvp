@@ -1481,6 +1481,24 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
     setPanelNoteId(noteId);
   };
 
+  const applyInsightToCurrentNote = async (item: NoteInsight, kind: SuggestionKind, proposal: string): Promise<boolean> => {
+    const nextBody = insertActionIntoNote(body, item.anchor, proposal, kind);
+    if (nextBody === body) return Boolean(proposal.trim() && body.includes(proposal.trim()));
+    const nextRawText = title.trim() && nextBody.trim() ? `${title.trim()}\n\n${nextBody.trim()}` : title.trim() || nextBody.trim();
+    if (!nextRawText) return false;
+    setBody(nextBody);
+    setSaveState('saving');
+    try {
+      await latestSaveRef.current(note.id, nextRawText);
+      setSaveState('saved');
+      return true;
+    } catch {
+      setBody(body);
+      setSaveState('error');
+      return false;
+    }
+  };
+
   const [dismissedGoalDomains, setDismissedGoalDomains] = useState(() => readGoalPromptDismissed(userId));
   const goalSuggestions = retrieval?.goal_suggestions ?? [];
   const goalPrompt = domainName && !goalText && !dismissedGoalDomains.includes(domainName.toLowerCase()) && goalSuggestions.length
@@ -1561,15 +1579,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
           : effectiveRelation ? RELATION_BADGES[effectiveRelation]?.className ?? 'bg-[#eef1f6] text-[#5d6b85]' : '';
       const highlightStyle = HIGHLIGHT_STYLES[suggestionKindFor(effectiveRelation)];
       const active = item === insight;
-      const mergedExtension = relation === 'extends' && actionState.status === 'merged' ? actionState.response || item.action : '';
-      const openInsight = () => {
-        if (relation === 'extends' && actionState.status === 'merged' && item.note_ids[0]) {
-          setSummaryOpen(true);
-          showCitedNote(item.note_ids[0]);
-          return;
-        }
-        selectInsight(span.index);
-      };
+      const openInsight = () => selectInsight(span.index);
       const previousEnd = position === 0 ? section.start : sectionHighlights[position - 1].end;
       return <Fragment key={`${section.id}-${span.index}`}>
         {displayedBody.slice(previousEnd, span.start)}
@@ -1579,10 +1589,9 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
           onClick={(event) => { event.stopPropagation(); openInsight(); }}
           onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); event.stopPropagation(); openInsight(); } }}
           aria-pressed={active}
-          title={relation === 'extends' && actionState.status === 'merged' ? 'Open the note that extends this' : 'See what your notes say about this'}
+          title="See what your notes say about this"
           className={`cursor-pointer rounded-sm px-0.5 text-inherit underline decoration-2 underline-offset-4 [box-decoration-break:clone] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${active ? highlightStyle.active : `${highlightStyle.idle} hover:brightness-[0.98]`}`}
         >{displayedBody.slice(span.start, span.end)}{relationLabel && <span className={`ml-1 inline-block rounded px-1 align-[1px] text-[10px] font-medium leading-4 ${relationClass}`}>{relationLabel}</span>}</mark>
-        {mergedExtension && <button type="button" onClick={(event) => { event.stopPropagation(); openInsight(); }} className="mt-2 block w-full rounded-lg border border-[#d8c4ef] bg-white px-3 py-2 text-left text-[13px] leading-relaxed text-[#4d3569] shadow-sm hover:border-[#9a72c5] hover:bg-[#fbf8ff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#8254b5]">{mergedExtension}</button>}
         {position === sectionHighlights.length - 1 ? displayedBody.slice(span.end, section.end) : null}
       </Fragment>;
     })}</span>;
@@ -1660,7 +1669,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
                     {visibleInsightEntries.map(({ item, index, relation, actionId, actionState, section }, visibleIndex) => <Fragment key={actionId}>
                       {visibleIndex === 0 && section && noteSections.length > 1 && <button type="button" onClick={() => document.getElementById(`note-${section.id}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' })} className="sticky top-0 z-[1] flex w-full items-center gap-2 bg-[#f7f7f9]/95 py-1 text-left text-[11px] font-medium uppercase tracking-[0.08em] text-[#999] backdrop-blur"><span className="h-px flex-1 bg-[#d8d8dc]" />Section {section.index + 1}<span className="h-px flex-1 bg-[#d8d8dc]" /></button>}
                       <div id={`suggestion-card-${index}`} onClick={() => setSelectedInsightIndex(index)} className={selectedInsightIndex === index ? 'rounded-xl ring-2 ring-[#477bea]/20' : ''}>
-                        <InsightCard insight={item} notesById={noteById} relation={relation} relevanceResults={retrieval?.results ?? []} outbound={isOutbound(item)} actionState={actionState} onActionChange={(next) => updateInsightAction(actionId, next)} notesOpen={openNotesUsedId === actionId} onNotesOpenChange={(open) => setOpenNotesUsedId(open ? actionId : null)} onSelectNote={(noteId) => showCitedNote(noteId)} />
+                        <InsightCard insight={item} notesById={noteById} relation={relation} relevanceResults={retrieval?.results ?? []} outbound={isOutbound(item)} actionState={actionState} onActionChange={(next) => updateInsightAction(actionId, next)} onApplyToNote={(kind, text) => applyInsightToCurrentNote(item, kind, text)} notesOpen={openNotesUsedId === actionId} onNotesOpenChange={(open) => setOpenNotesUsedId(open ? actionId : null)} onSelectNote={(noteId) => showCitedNote(noteId)} />
                       </div>
                     </Fragment>)}
                     {!visibleInsightEntries.length && insights.length > 0 && <div className="rounded-xl border border-[#e2e2e2] bg-white p-5 text-sm leading-relaxed text-[#777]">This section has no actionable connection. Select another section using its gray line.</div>}
@@ -2003,7 +2012,7 @@ const INTENT_LABELS: Record<InsightIntent, string> = {
 
 type SuggestionKind = 'contradiction' | 'solution' | 'helps' | 'extension' | 'insight';
 
-type InsightActionStatus = 'idle' | 'writing' | 'saved' | 'declined' | 'solved' | 'helps' | 'merging' | 'merged' | 'dismissed';
+type InsightActionStatus = 'idle' | 'writing' | 'saved' | 'declined' | 'applied' | 'solved' | 'helps' | 'merging' | 'merged' | 'dismissed';
 type InsightActionState = { status: InsightActionStatus; response?: string };
 type InsightActionStates = Record<string, InsightActionState>;
 
@@ -2021,7 +2030,7 @@ function insightActionsStorageKey(userId: string, noteId: string): string {
 function readInsightActionStates(userId: string, noteId: string): InsightActionStates {
   try {
     const parsed = JSON.parse(localStorage.getItem(insightActionsStorageKey(userId, noteId)) ?? '{}') as Record<string, unknown>;
-    const statuses: InsightActionStatus[] = ['idle', 'writing', 'saved', 'declined', 'solved', 'helps', 'merging', 'merged', 'dismissed'];
+    const statuses: InsightActionStatus[] = ['idle', 'writing', 'saved', 'declined', 'applied', 'solved', 'helps', 'merging', 'merged', 'dismissed'];
     return Object.fromEntries(Object.entries(parsed).flatMap(([key, value]) => {
       if (!value || typeof value !== 'object') return [];
       const candidate = value as { status?: unknown; response?: unknown };
@@ -2065,12 +2074,34 @@ function suggestionKindFor(relation: NoteRelationType | null): SuggestionKind {
   return 'insight';
 }
 
-function InsightActionBox({ kind, insight, state, onChange, onSelectNote }: {
+function noteActionHeading(kind: SuggestionKind): string {
+  if (kind === 'solution') return 'Solution';
+  if (kind === 'helps') return 'Next step';
+  if (kind === 'contradiction') return 'Clarification';
+  if (kind === 'insight') return 'Observation';
+  return '';
+}
+
+/** Inserts a model proposal after the paragraph containing its anchor. */
+function insertActionIntoNote(text: string, anchor: string, proposal: string, kind: SuggestionKind): string {
+  const cleanProposal = proposal.trim();
+  if (!cleanProposal || text.includes(cleanProposal)) return text;
+  const span = anchor ? findAnchor(text, anchor) : null;
+  const followingBreak = span ? text.slice(span.end).match(/\n\s*\n/) : null;
+  const insertAt = span && followingBreak?.index !== undefined ? span.end + followingBreak.index : text.length;
+  const heading = noteActionHeading(kind);
+  const block = heading ? `**${heading}**\n${cleanProposal}` : cleanProposal;
+  const before = text.slice(0, insertAt).trimEnd();
+  const after = text.slice(insertAt).trimStart();
+  return `${before}${before ? '\n\n' : ''}${block}${after ? `\n\n${after}` : ''}`;
+}
+
+function InsightActionBox({ kind, insight, state, onChange, onApplyToNote }: {
   kind: SuggestionKind;
   insight: NoteInsight;
   state: InsightActionState;
   onChange: (state: InsightActionState) => void;
-  onSelectNote: (noteId: string) => void;
+  onApplyToNote: (text: string, kind?: SuggestionKind) => Promise<boolean>;
 }) {
   const [draft, setDraft] = useState(state.response ?? (kind === 'extension' ? insight.action : ''));
 
@@ -2079,13 +2110,15 @@ function InsightActionBox({ kind, insight, state, onChange, onSelectNote }: {
   }, [insight.action, kind, state.response, state.status]);
 
   if (kind === 'helps') return <div className="mt-4 rounded-lg bg-[#eef8f1] px-3 py-3">
-    <p className="text-[11px] font-medium text-[#2c7b45]">This might help</p>
+    <p className="flex items-center gap-1.5 text-[11px] font-medium text-[#2c7b45]">{state.status === 'applied' || state.status === 'helps' ? <><Check className="h-3.5 w-3.5" /> Added to note</> : 'Add this next step'}</p>
     <p className="mt-1 text-[13px] leading-relaxed text-[#28623b]">{insight.action}</p>
+    {state.status !== 'applied' && state.status !== 'helps' && <button type="button" onClick={async (event) => { event.stopPropagation(); if (await onApplyToNote(insight.action)) onChange({ status: 'applied', response: insight.action }); }} className="mt-3 rounded-md bg-white px-3 py-1.5 text-xs font-medium text-[#2c7b45] shadow-sm hover:bg-[#e0f4e6] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#72b987]">Add to note</button>}
   </div>;
 
   if (kind === 'insight') return <div className="mt-4 rounded-lg bg-[#fff9df] px-3 py-3">
-    <p className="text-[11px] font-medium text-[#8a6a00]">A pattern across your notes</p>
+    <p className="flex items-center gap-1.5 text-[11px] font-medium text-[#8a6a00]">{state.status === 'applied' ? <><Check className="h-3.5 w-3.5" /> Added to note</> : 'Add this observation'}</p>
     <p className="mt-1 text-[13px] leading-relaxed text-[#735d12]">{insight.action}</p>
+    {state.status !== 'applied' && <button type="button" onClick={async (event) => { event.stopPropagation(); if (await onApplyToNote(insight.action)) onChange({ status: 'applied', response: insight.action }); }} className="mt-3 rounded-md bg-white px-3 py-1.5 text-xs font-medium text-[#8a6a00] shadow-sm hover:bg-[#fff2b8] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#dfbf4f]">Add to note</button>}
   </div>;
 
   if (kind === 'solution') {
@@ -2093,35 +2126,42 @@ function InsightActionBox({ kind, insight, state, onChange, onSelectNote }: {
       <p className="flex items-center gap-1.5 text-[11px] font-medium text-[#287141]"><Check className="h-3.5 w-3.5" /> Solved</p>
       <p className="mt-1 text-[13px] leading-relaxed text-[#28623b]">{insight.action}</p>
     </div>;
+    if (state.status === 'applied') return <div className="mt-4 rounded-lg border border-[#bfd2ff] bg-[#edf3ff] px-3 py-3">
+      <p className="flex items-center gap-1.5 text-[11px] font-medium text-[#315fc5]"><Check className="h-3.5 w-3.5" /> Applied to note</p>
+      <p className="mt-1 text-[13px] leading-relaxed text-[#315078]">{state.response || insight.action}</p>
+      <div className="mt-3 flex gap-2">
+        <button type="button" onClick={(event) => { event.stopPropagation(); onChange({ status: 'solved', response: state.response || insight.action }); }} className="rounded-md bg-[#477bea] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#3d6ed7]">Mark solved</button>
+        <button type="button" onClick={(event) => { event.stopPropagation(); onChange({ status: 'helps', response: state.response || insight.action }); }} className="rounded-md bg-white px-3 py-1.5 text-xs font-medium text-[#555] shadow-sm hover:bg-[#f5f5f5]">Helpful, not solved</button>
+      </div>
+    </div>;
     return <div className="mt-4 rounded-lg bg-[#edf3ff] px-3 py-3">
-      <p className="text-[11px] font-medium text-[#315fc5]">Is this solved?</p>
+      <p className="text-[11px] font-medium text-[#315fc5]">Apply this solution</p>
       <p className="mt-1 text-[13px] leading-relaxed text-[#315078]">{insight.action}</p>
       <div className="mt-3 flex gap-2">
-        <button type="button" onClick={(event) => { event.stopPropagation(); onChange({ status: 'solved' }); }} aria-label="Mark this as solved" title="Solved" className="flex h-8 w-8 items-center justify-center rounded-md bg-[#477bea] text-white hover:bg-[#3d6ed7] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] focus-visible:ring-offset-2"><Check className="h-4 w-4" /></button>
-        <button type="button" onClick={(event) => { event.stopPropagation(); onChange({ status: 'helps' }); }} aria-label="This helps but does not solve it" title="Not solved — keep as helpful" className="flex h-8 w-8 items-center justify-center rounded-md bg-white text-[#999] hover:bg-[#f5f5f5] hover:text-[#555] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]"><X className="h-4 w-4" /></button>
+        <button type="button" onClick={async (event) => { event.stopPropagation(); if (await onApplyToNote(insight.action)) onChange({ status: 'applied', response: insight.action }); }} className="rounded-md bg-[#477bea] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#3d6ed7] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] focus-visible:ring-offset-2">Apply to note</button>
+        <button type="button" onClick={async (event) => { event.stopPropagation(); if (await onApplyToNote(insight.action, 'helps')) onChange({ status: 'helps', response: insight.action }); }} className="rounded-md bg-white px-3 py-1.5 text-xs font-medium text-[#777] shadow-sm hover:bg-[#f5f5f5]">Add as helpful</button>
       </div>
     </div>;
   }
 
   if (kind === 'extension') {
     if (state.status === 'merging') return <div className="mt-4 rounded-lg bg-[#f6f0fc] px-3 py-3">
-      <label className="text-[11px] font-medium text-[#7348a7]" htmlFor={`extension-${Math.abs(stableHash(insight.text))}`}>Edit the extension</label>
+      <label className="text-[11px] font-medium text-[#7348a7]" htmlFor={`extension-${Math.abs(stableHash(insight.text))}`}>Edit what will be added</label>
       <textarea id={`extension-${Math.abs(stableHash(insight.text))}`} autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onClick={(event) => event.stopPropagation()} rows={3} className="mt-2 w-full resize-y rounded-md border border-[#d8c4ef] bg-white px-3 py-2 text-[13px] leading-relaxed text-[#4d3569] outline-none focus:border-[#9a72c5] focus:ring-2 focus:ring-[#d8c4ef]" />
       <div className="mt-2 flex gap-2">
-        <button type="button" disabled={!draft.trim()} onClick={(event) => { event.stopPropagation(); onChange({ status: 'merged', response: draft.trim() }); }} className="rounded-md bg-[#8254b5] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#70449f] disabled:opacity-40">Save extension</button>
+        <button type="button" disabled={!draft.trim()} onClick={async (event) => { event.stopPropagation(); if (await onApplyToNote(draft.trim())) onChange({ status: 'merged', response: draft.trim() }); }} className="rounded-md bg-[#8254b5] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#70449f] disabled:opacity-40">Add to note</button>
         <button type="button" onClick={(event) => { event.stopPropagation(); onChange({ status: 'dismissed' }); }} aria-label="Dismiss extension" className="flex h-7 w-7 items-center justify-center rounded-md bg-white text-[#999] hover:text-[#555]"><X className="h-3.5 w-3.5" /></button>
       </div>
     </div>;
     if (state.status === 'merged') return <div className="mt-4 rounded-lg bg-[#f6f0fc] px-3 py-3">
-      <p className="text-[11px] font-medium text-[#7348a7]">Extends this</p>
-      <button type="button" onClick={(event) => { event.stopPropagation(); if (insight.note_ids[0]) onSelectNote(insight.note_ids[0]); }} className="mt-1 block w-full rounded text-left text-[13px] leading-relaxed text-[#62408a] hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#8254b5]">{state.response || insight.action}</button>
-      <button type="button" onClick={(event) => { event.stopPropagation(); setDraft(state.response || insight.action); onChange({ status: 'merging', response: state.response || insight.action }); }} className="mt-2 text-xs font-medium text-[#7348a7] hover:underline">Edit</button>
+      <p className="flex items-center gap-1.5 text-[11px] font-medium text-[#7348a7]"><Check className="h-3.5 w-3.5" /> Added to note</p>
+      <p className="mt-1 text-[13px] leading-relaxed text-[#62408a]">{state.response || insight.action}</p>
     </div>;
     return <div className="mt-4 rounded-lg bg-[#f6f0fc] px-3 py-3">
       <p className="text-[11px] font-medium text-[#7348a7]">Extends this</p>
       <p className="mt-1 text-[13px] leading-relaxed text-[#62408a]">{insight.action}</p>
       <div className="mt-3 flex gap-2">
-        <button type="button" onClick={(event) => { event.stopPropagation(); setDraft(insight.action); onChange({ status: 'merging', response: insight.action }); }} className="rounded-md bg-white px-3 py-1.5 text-xs font-medium text-[#7348a7] shadow-sm hover:bg-[#eee2fb]">Merge</button>
+        <button type="button" onClick={(event) => { event.stopPropagation(); setDraft(insight.action); onChange({ status: 'merging', response: insight.action }); }} className="rounded-md bg-white px-3 py-1.5 text-xs font-medium text-[#7348a7] shadow-sm hover:bg-[#eee2fb]">Review and add</button>
         <button type="button" onClick={(event) => { event.stopPropagation(); onChange({ status: 'dismissed' }); }} aria-label="Dismiss extension" title="Dismiss" className="flex h-8 w-8 items-center justify-center rounded-md bg-white text-[#999] hover:text-[#555]"><X className="h-4 w-4" /></button>
       </div>
     </div>;
@@ -2131,7 +2171,7 @@ function InsightActionBox({ kind, insight, state, onChange, onSelectNote }: {
     <label className="text-[11px] font-medium text-[#c64747]" htmlFor={`contradiction-${Math.abs(stableHash(insight.text))}`}>Reconcile these beliefs</label>
     <textarea id={`contradiction-${Math.abs(stableHash(insight.text))}`} autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onClick={(event) => event.stopPropagation()} rows={3} placeholder="Write what you believe now…" className="mt-2 w-full resize-y rounded-md border border-[#f3c2c2] bg-white px-3 py-2 text-[13px] leading-relaxed text-[#6f3333] outline-none focus:border-[#d47a7a] focus:ring-2 focus:ring-[#f3c2c2]" />
     <div className="mt-2 flex gap-2">
-      <button type="button" disabled={!draft.trim()} onClick={(event) => { event.stopPropagation(); onChange({ status: 'saved', response: draft.trim() }); }} className="rounded-md bg-[#d65d5d] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#c34f4f] disabled:opacity-40">Save</button>
+      <button type="button" disabled={!draft.trim()} onClick={async (event) => { event.stopPropagation(); if (await onApplyToNote(draft.trim())) onChange({ status: 'saved', response: draft.trim() }); }} className="rounded-md bg-[#d65d5d] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#c34f4f] disabled:opacity-40">Add to note</button>
       <button type="button" onClick={(event) => { event.stopPropagation(); onChange({ status: 'declined' }); }} aria-label="Decline writing" className="flex h-7 w-7 items-center justify-center rounded-md bg-white text-[#999] hover:text-[#555]"><X className="h-3.5 w-3.5" /></button>
     </div>
   </div>;
@@ -2178,7 +2218,7 @@ function CitedNoteCard({ note, relevance, onOpen }: { note: Note; relevance?: Re
   </li>;
 }
 
-function InsightCard({ insight, notesById, relation = null, relevanceResults = [], outbound = false, position, compact = false, showAnchor = true, actionState, onActionChange, notesOpen, onNotesOpenChange, onSelectNote }: {
+function InsightCard({ insight, notesById, relation = null, relevanceResults = [], outbound = false, position, compact = false, showAnchor = true, actionState, onActionChange, onApplyToNote, notesOpen, onNotesOpenChange, onSelectNote }: {
   insight: NoteInsight; notesById: Map<string, Note>; relation?: NoteRelationType | null; compact?: boolean; showAnchor?: boolean;
   relevanceResults?: RelevanceResult[];
   /** True when this note is the lesson and the cited notes are where it applies. */
@@ -2187,6 +2227,7 @@ function InsightCard({ insight, notesById, relation = null, relevanceResults = [
   position?: { index: number; total: number; onSelect: (index: number) => void };
   actionState?: InsightActionState;
   onActionChange?: (state: InsightActionState) => void;
+  onApplyToNote?: (kind: SuggestionKind, text: string) => Promise<boolean>;
   /** Controlled by the note reader so only one card can expose its sources at a time. */
   notesOpen?: boolean;
   onNotesOpenChange?: (open: boolean) => void;
@@ -2215,7 +2256,7 @@ function InsightCard({ insight, notesById, relation = null, relevanceResults = [
       </div>
       {showAnchor && insight.anchor && <blockquote className="mt-3 border-l-2 border-[#f0c85a] pl-3 text-xs italic leading-relaxed text-[#777]">“{insight.anchor}”</blockquote>}
       <p className={`mt-3 leading-relaxed text-[#222] ${compact ? 'text-[13px]' : 'text-[15px]'}`}>{insight.text}</p>
-      <InsightActionBox kind={kind} insight={insight} state={currentActionState} onChange={updateActionState} onSelectNote={onSelectNote} />
+      <InsightActionBox kind={kind} insight={insight} state={currentActionState} onChange={updateActionState} onApplyToNote={(text, overrideKind) => onApplyToNote ? onApplyToNote(overrideKind ?? kind, text) : Promise.resolve(false)} />
       {cited.length > 0 && <div className="mt-4 border-t border-[#ececef] pt-3">
         <button type="button" onClick={(event) => { event.stopPropagation(); setCitationsOpen(!citationsOpen); }} aria-expanded={citationsOpen} className="flex w-full items-center justify-center gap-1 text-[11px] text-[#aaa] hover:text-[#666] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]"><span>{citationsOpen ? 'Hide notes' : outbound ? 'Where this applies' : 'Notes used'}</span><ChevronDown className={`h-3.5 w-3.5 transition-transform ${citationsOpen ? 'rotate-180' : ''}`} /></button>
         {citationsOpen && <><ul className="mt-4 space-y-3">
@@ -2356,9 +2397,9 @@ function SearchProgress({ notes, progress }: { notes: Note[]; progress: Relevanc
   );
 }
 
-function RelevantNotesPanel({ notes, relevance, loading, progress, error, stale, page, onPageChange, onRetry, onClose }: {
+function RelevantNotesPanel({ notes, relevance, loading, progress, error, stale, page, onPageChange, onApplyToNote, onRetry, onClose }: {
   notes: Note[]; relevance: RelevanceSearch | null; loading: boolean; progress: RelevanceProgress | null; error: string; stale: boolean;
-  page: number; onPageChange: (page: number) => void; onRetry: () => void; onClose: () => void;
+  page: number; onPageChange: (page: number) => void; onApplyToNote: (insight: NoteInsight, kind: SuggestionKind, text: string) => Promise<boolean>; onRetry: () => void; onClose: () => void;
 }) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   // Cards whose annotation has been flipped from the summary to "why it's relevant".
@@ -2426,6 +2467,7 @@ function RelevantNotesPanel({ notes, relevance, loading, progress, error, stale,
               relation={item.note_ids.map((id) => results.find((result) => result.note_id === id)?.relation_type).find(Boolean) ?? null}
               outbound={item.note_ids.every((id) => results.find((result) => result.note_id === id)?.direction === 'outbound')}
               notesById={noteById}
+              onApplyToNote={(kind, text) => onApplyToNote(item, kind, text)}
               onSelectNote={(noteId) => {
                 const index = results.findIndex((result) => result.note_id === noteId);
                 if (index === -1) return;
@@ -2629,7 +2671,7 @@ function NoteEditor({ state, muses, notes, saving, error, onChange, onCreateMuse
             <input value={state.title} onFocus={() => setEditingStarted(true)} onChange={(event) => onChange({ ...state, title: event.target.value })} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); setEditingStarted(true); bodyRef.current?.focus(); } }} placeholder={domainCapture ? 'Title' : 'What’s on your mind?'} aria-label="Note title" className={`w-full shrink-0 bg-transparent outline-none placeholder:text-[#555] ${domainCapture ? 'max-w-2xl text-xl font-semibold sm:text-2xl' : 'text-xl font-medium italic sm:text-2xl'}`} />
             <textarea ref={bodyRef} value={state.body} onFocus={() => setEditingStarted(true)} onChange={(event) => onChange({ ...state, body: event.target.value })} placeholder={editingStarted ? '' : domainCapture ? 'Knowledge is what makes people special, and special people do special things, so make this one count.' : "For example: Someone made the point that we mostly don't choose our beliefs, we absorb them and backfill reasons after. Uncomfortable but I can't argue with it. Makes me wonder how much of what I think is actually mine."} aria-label="Note body" className={`mt-5 min-h-0 w-full flex-1 resize-none bg-transparent text-base leading-relaxed outline-none placeholder:text-[#aaa] ${domainCapture ? 'max-w-2xl sm:text-lg sm:leading-[1.65]' : ''}`} />
           </div>
-          {panelOpen && <RelevantNotesPanel notes={notes} relevance={relevance} loading={relevanceLoading} progress={relevanceProgress} error={relevanceError} stale={draftChangedSinceSearch} page={relevancePage} onPageChange={setRelevancePage} onRetry={() => void runRelevanceSearch()} onClose={() => setPanelOpen(false)} />}
+          {panelOpen && <RelevantNotesPanel notes={notes} relevance={relevance} loading={relevanceLoading} progress={relevanceProgress} error={relevanceError} stale={draftChangedSinceSearch} page={relevancePage} onPageChange={setRelevancePage} onApplyToNote={async (item, kind, text) => { const nextBody = insertActionIntoNote(state.body, item.anchor, text, kind); if (nextBody === state.body) return Boolean(text.trim() && state.body.includes(text.trim())); onChange({ ...state, body: nextBody }); return true; }} onRetry={() => void runRelevanceSearch()} onClose={() => setPanelOpen(false)} />}
         </div>
         <div className={`relative border-t border-[#eee] bg-[#f8f8fa] px-3 py-2 text-sm text-[#555] sm:px-5 ${domainCapture ? 'flex min-h-[62px] flex-col items-stretch gap-2 lg:flex-row lg:items-center lg:gap-1' : 'flex min-h-[58px] flex-wrap items-center gap-1'}`}>
           <div className={`${domainCapture ? 'flex w-full min-w-0 items-center gap-1 overflow-x-auto pb-1 lg:flex-1 lg:overflow-visible lg:pb-0' : 'contents'}`}>

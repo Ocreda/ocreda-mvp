@@ -562,6 +562,16 @@ test('the insight prompt asks for goal suggestions only when the Domain has no g
   assert.ok(!buildInsightPrompt({ ...base, context: { domain: null, goal: null } }).includes('GOAL_SUGGESTIONS'));
 });
 
+test('the insight prompt makes actions edits to the current note, not outside homework', () => {
+  const prompt = buildInsightPrompt({
+    draft: 'Pricing is unclear.', context: { domain: 'Product', goal: 'Choose pricing' }, recentNotes: [],
+    matches: [{ note: note('a'), result: hit('a', 0.9, 'solves') }],
+  });
+  assert.ok(prompt.includes('exact one or two sentences that should be added to the note'));
+  assert.ok(prompt.includes('This is note content, not an instruction sent outside the note'));
+  assert.ok(prompt.includes('never say "this week", "you should", or "try to"'));
+});
+
 test('no strong matches means no insight call at all', async () => {
   let calls = 0;
   const out = await findInsight({
