@@ -1358,6 +1358,8 @@ export interface StreamSearchOptions extends Omit<SearchOptions, "onAgentSettled
   failedMessage: string;
   /** Told when the search stopped early because the reader went away, and how far it had got. */
   onCancelled?: (stage: string) => void;
+  /** Told exactly once how the search ended, after its last model call, e.g. to record what it cost. */
+  onSettled?: (outcome: "done" | "failed" | "cancelled") => void;
 }
 
 /**
@@ -1370,7 +1372,7 @@ export interface StreamSearchOptions extends Omit<SearchOptions, "onAgentSettled
  * stops paying for the rest of it.
  */
 export function streamRelevanceSearch(options: StreamSearchOptions): ReadableStream<Uint8Array> {
-  const { allFailedMessage, failedMessage, onCancelled, signal: callerSignal, ...searchOptions } = options;
+  const { allFailedMessage, failedMessage, onCancelled, onSettled, signal: callerSignal, ...searchOptions } = options;
   const encoder = new TextEncoder();
   const cancel = new AbortController();
   if (callerSignal?.aborted) cancel.abort();
@@ -1398,6 +1400,7 @@ export function streamRelevanceSearch(options: StreamSearchOptions): ReadableStr
 
       send({ type: "start", notes_total: notesTotal, agents_total: agentsTotal });
 
+      let settled: "done" | "failed" | "cancelled" = "done";
       try {
         const outcome = await searchRelevance({
           ...searchOptions,
@@ -1408,15 +1411,26 @@ export function streamRelevanceSearch(options: StreamSearchOptions): ReadableStr
             send({ type: "progress", agents_done: agentsDone, agents_total: agentsTotal, matches: matched.size });
           },
         });
-        if (outcome.notesSearched === 0) send({ type: "error", error: allFailedMessage });
-        else send({ type: "done", ...searchResponseFields(outcome) });
+        if (outcome.notesSearched === 0) {
+          settled = "failed";
+          send({ type: "error", error: allFailedMessage });
+        } else {
+          send({ type: "done", ...searchResponseFields(outcome) });
+        }
       } catch (error) {
         if (error instanceof SearchCancelledError || cancel.signal.aborted) {
+          settled = "cancelled";
           onCancelled?.(agentsDone === 0 ? "before the agents finished" : `after ${agentsDone} of ${agentsTotal} agents`);
         } else {
+          settled = "failed";
           searchOptions.onError?.(error);
           send({ type: "error", error: failedMessage });
         }
+      }
+      try {
+        onSettled?.(settled);
+      } catch (error) {
+        searchOptions.onError?.(error);
       }
       try {
         controller.close();

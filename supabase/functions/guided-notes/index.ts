@@ -1,10 +1,15 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
-import { corsHeaders, extractJson, generateWithGemini } from "../_shared/gemini.ts";
+import { BEST_MODEL, corsHeaders, extractJson, generateWithGeminiResult } from "../_shared/gemini.ts";
+import { isAuthenticationError, verifiedUserId } from "../_shared/auth.ts";
+import { recordUsageInBackground } from "../_shared/usage.ts";
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
 
   try {
+    // Signed-in people only: this spends AI credit, and the public key alone
+    // must not be enough to do that.
+    const userId = await verifiedUserId(req);
     const { answers, corpus } = await req.json() as {
       answers: string[];
       corpus: Array<{ id: string; title: string | null; body: string }>;
@@ -33,11 +38,16 @@ ${corpus.map((note) => `ID: ${note.id}\nTitle: ${note.title ?? "Untitled"}\nBody
 Return JSON only in this exact shape:
 {"notes":[{"existing_note_id":"...","title":"...","body":"..."}]}`;
 
-    const raw = await generateWithGemini(
+    const startedAt = Date.now();
+    const { text: raw, usage } = await generateWithGeminiResult(
       "You retrieve the most relevant existing notes from a supplied corpus and return only valid JSON.",
       [{ role: "user", content: prompt }],
-      Deno.env.get("OPENROUTER_API_KEY")!
+      Deno.env.get("OPENROUTER_API_KEY")!,
+      BEST_MODEL,
     );
+    if (usage) {
+      recordUsageInBackground({ userId, feature: "guided-notes", billedBy: "openrouter", model: BEST_MODEL, steps: { notes: usage }, status: "ok", startedAt });
+    }
     const json = extractJson(raw);
     if (!json) throw new Error("Model did not return valid JSON");
     const parsed = JSON.parse(json);
@@ -53,8 +63,14 @@ Return JSON only in this exact shape:
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Unknown error";
-    return new Response(JSON.stringify({ error: message }), {
+    if (isAuthenticationError(error)) {
+      return new Response(JSON.stringify({ error: "Sign in to continue." }), {
+        status: 401,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
+      });
+    }
+    console.error("guided-notes failed:", error instanceof Error ? error.message : error);
+    return new Response(JSON.stringify({ error: "Something went wrong. Please try again." }), {
       status: 500,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });

@@ -10,7 +10,8 @@ import {
   noteTitle,
   sha256,
 } from "../_shared/embeddings.ts";
-import { corsHeaders } from "../_shared/gemini.ts";
+import { addTokenUsage, corsHeaders, emptyTokenUsage, googleTokenUsage } from "../_shared/gemini.ts";
+import { recordUsageInBackground } from "../_shared/usage.ts";
 import { cleanIds, isEmbeddingEligible } from "../_shared/stage1.ts";
 
 interface EmbedNotesRequest {
@@ -44,6 +45,9 @@ Deno.serve(async (req: Request) => {
 
   try {
     const { user } = await authenticateRequest(req);
+    const startedAt = Date.now();
+    // One row for the whole batch: each note embedded is one call.
+    const usage = emptyTokenUsage();
     const body = await req.json().catch(() => ({})) as EmbedNotesRequest;
     const requestedIds = cleanIds(body.note_ids, 101);
     if (requestedIds.length > 100) {
@@ -140,6 +144,7 @@ Deno.serve(async (req: Request) => {
           "RETRIEVAL_DOCUMENT",
           noteTitle(note.raw_text),
         );
+        addTokenUsage(usage, googleTokenUsage(EMBEDDING_MODEL, embeddingResult.tokenCount));
         const { data: saved, error: saveError } = await service
           .from("notes")
           .update({
@@ -206,6 +211,8 @@ Deno.serve(async (req: Request) => {
         );
       }
     }
+
+    recordUsageInBackground({ userId: user.id, feature: "embed-notes", billedBy: "google", model: EMBEDDING_MODEL, steps: { embeddings: usage }, status: "ok", startedAt });
 
     return json({
       success: true,

@@ -158,3 +158,8 @@ mark.key-point-highlight {
   .animate-ocreda-fade-up,
   .animate-ocreda-slide-in-right { animation: none; }
 }
+
+/* While exploring the sample notes, a banner sits above everything, and every
+   full-screen surface starts below it so it is never covered. */
+:root { --sample-banner-height: 40px; }
+body.ocreda-sample-mode .fixed.inset-0 { top: var(--sample-banner-height); }

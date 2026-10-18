@@ -11,6 +11,7 @@
 import { DomainGoal, Note, NoteImportInput, RelevanceProgress, RelevantNotesResponse } from '@/lib/types';
 import { readRelevanceResponse } from '@/lib/relevance-stream';
 import { getAiMode } from '@/lib/ai-mode';
+import { getSampleMode } from '@/lib/sample-mode';
 
 export const IS_LOCAL_MODE = process.env.NEXT_PUBLIC_LOCAL_MODE === '1';
 
@@ -48,11 +49,12 @@ function writeAll(notes: Note[]): void {
   }
 }
 
-function newNote(rawText: string, category: string | null): Note {
+function newNote(rawText: string, category: string | null, isSample = getSampleMode(LOCAL_USER_ID)): Note {
   return {
     id: crypto.randomUUID(),
     user_id: LOCAL_USER_ID,
     raw_text: rawText,
+    is_sample: isSample,
     summary: null,
     target_date: null,
     time_of_day: null,
@@ -62,8 +64,23 @@ function newNote(rawText: string, category: string | null): Note {
   };
 }
 
+/** Only one set at a time, as on the server: the sample notes while exploring them, otherwise your own. */
 export function localGetNotes(): Note[] {
-  return readAll().sort((a, b) => b.created_at.localeCompare(a.created_at));
+  const samples = getSampleMode(LOCAL_USER_ID);
+  return readAll()
+    .filter((note) => Boolean(note.is_sample) === samples)
+    .sort((a, b) => b.created_at.localeCompare(a.created_at));
+}
+
+/** Saves the sample vault, with the dates it should appear to have been written on. */
+export function localAddSampleNotes(inputs: Array<{ rawText: string; createdAt: string }>): Note[] {
+  const created = inputs.map((input) => ({ ...newNote(input.rawText, null, true), created_at: input.createdAt }));
+  writeAll([...created, ...readAll()]);
+  return created;
+}
+
+export function localRemoveSampleNotes(): void {
+  writeAll(readAll().filter((note) => !note.is_sample));
 }
 
 export function localCreateNote(rawText: string, category: string | null): Note {

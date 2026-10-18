@@ -1,6 +1,9 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2";
-import { corsHeaders } from "../_shared/gemini.ts";
+import { addTokenUsage, corsHeaders, emptyTokenUsage, googleTokenUsage, type TokenUsage } from "../_shared/gemini.ts";
+import { recordUsageInBackground, type UsageStatus } from "../_shared/usage.ts";
+
+const DOCUMENT_MODEL = Deno.env.get("GEMINI_DOCUMENT_MODEL") || "gemini-3.6-flash";
 
 interface ExtractDocumentRequest {
   file_name: string;
@@ -68,11 +71,13 @@ function cleanTranscription(value: string): string {
   return (fenced?.[1] ?? trimmed).trim();
 }
 
+/** `usage` collects the tokens Google reports, even for a reply that is then rejected. */
 async function generateTranscription(
   apiKey: string,
-  parts: Array<Record<string, unknown>>
+  parts: Array<Record<string, unknown>>,
+  usage: TokenUsage,
 ): Promise<string> {
-  const model = Deno.env.get("GEMINI_DOCUMENT_MODEL") || "gemini-3.6-flash";
+  const model = DOCUMENT_MODEL;
   const result = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
     {
@@ -93,6 +98,10 @@ async function generateTranscription(
   }
 
   const payload = await result.json();
+  const tokens = payload.usageMetadata ?? {};
+  const count = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : 0);
+  // Thinking tokens are billed as output, like the transcription itself.
+  addTokenUsage(usage, googleTokenUsage(model, count(tokens.promptTokenCount), count(tokens.candidatesTokenCount) + count(tokens.thoughtsTokenCount)));
   const candidate = payload.candidates?.[0];
   if (candidate?.finishReason === "MAX_TOKENS") {
     throw new Error("This document contains too much text to import as one note. Split it into smaller files and try again.");
@@ -199,24 +208,33 @@ Deno.serve(async (req: Request) => {
     const apiKey = Deno.env.get("GEMINI_API_KEY");
     if (!apiKey) throw new Error("GEMINI_API_KEY is not configured");
 
+    const startedAt = Date.now();
+    const usage = emptyTokenUsage();
+    let status: UsageStatus = "failed";
     let text: string;
-    if (INLINE_MIME_TYPES.has(mime_type)) {
-      text = await generateTranscription(apiKey, [{
-        inline_data: { mime_type, data },
-      }]);
-    } else {
-      const uploaded = await uploadGeminiFile(apiKey, file_name, mime_type, bytes);
-      try {
-        const activeFile = await waitForFile(apiKey, uploaded);
+    try {
+      if (INLINE_MIME_TYPES.has(mime_type)) {
         text = await generateTranscription(apiKey, [{
-          file_data: {
-            mime_type: activeFile.mimeType || mime_type,
-            file_uri: activeFile.uri,
-          },
-        }]);
-      } finally {
-        await deleteGeminiFile(apiKey, uploaded.name);
+          inline_data: { mime_type, data },
+        }], usage);
+      } else {
+        const uploaded = await uploadGeminiFile(apiKey, file_name, mime_type, bytes);
+        try {
+          const activeFile = await waitForFile(apiKey, uploaded);
+          text = await generateTranscription(apiKey, [{
+            file_data: {
+              mime_type: activeFile.mimeType || mime_type,
+              file_uri: activeFile.uri,
+            },
+          }], usage);
+        } finally {
+          await deleteGeminiFile(apiKey, uploaded.name);
+        }
       }
+      status = "ok";
+    } finally {
+      // Recorded even when the transcription was rejected: Google still billed it.
+      recordUsageInBackground({ userId: authData.user.id, feature: "extract-document", billedBy: "google", model: DOCUMENT_MODEL, steps: { transcription: usage }, status, startedAt });
     }
 
     return response({

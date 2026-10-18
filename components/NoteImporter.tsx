@@ -304,7 +304,7 @@ export default function NoteImporter({
         {selectionError && <p role="alert" className="mt-3 rounded-lg border border-destructive/20 bg-destructive/[0.05] px-3 py-2 text-xs text-destructive">{selectionError}</p>}
 
         <button type="button" onClick={continueToFiles} className="mx-auto mt-5 flex h-9 min-w-[180px] items-center justify-center rounded-md bg-primary px-5 text-sm font-medium text-primary-foreground hover:bg-primary/90">
-          {existingDomains.length > 0 || domainDrafts.some((domain) => domain.title.trim() || domain.description.trim()) ? 'Continue to notes' : 'Continue with Orphans'}
+          {existingDomains.length > 0 || domainDrafts.some((domain) => domain.title.trim() || domain.description.trim()) ? 'Continue to notes' : 'Continue without Domain'}
         </button>
         <p className="mt-2 text-center text-[11px] text-muted-foreground">Notes that do not match a Domain will go to Orphans.</p>
       </div>

@@ -30,6 +30,15 @@ export async function authenticateRequest(
   return { token, user: data.user, userClient };
 }
 
+/**
+ * The verified signed-in user behind a request. Functions that read or write a
+ * person's data with the service role must scope every query to this id, and
+ * never to a user id taken from the request body, which anyone can set.
+ */
+export async function verifiedUserId(req: Request): Promise<string> {
+  return (await authenticateRequest(req)).user.id;
+}
+
 export function isAuthenticationError(error: unknown): boolean {
   return error instanceof Error &&
     (error.message === "AUTHENTICATION_REQUIRED" ||

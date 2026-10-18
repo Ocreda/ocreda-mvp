@@ -9,6 +9,10 @@ import { supabase } from '@/lib/supabase';
 import { useTheme, ThemePreference } from '@/lib/theme-context';
 import { AiMode, setAiMode, useAiMode } from '@/lib/ai-mode';
 import { getNotes } from '@/lib/notes-api';
+import { setSampleMode, useSampleMode } from '@/lib/sample-mode';
+import { removeSampleNotes } from '@/lib/sample-vault';
+import { isAdmin } from '@/lib/admin-usage';
+import Link from 'next/link';
 import {
   Camera,
   Check,
@@ -42,12 +46,22 @@ export default function ProfilePage() {
   const { user, signOut } = useAuth();
   const { preference: themePref, setPreference: setThemePref } = useTheme();
   const aiMode = useAiMode();
+  const sampleMode = useSampleMode(user?.id);
+  const [removingSamples, setRemovingSamples] = useState(false);
+  const [samplesMessage, setSamplesMessage] = useState('');
 
   const [profile, setProfile] = useState<ProfileData>({ full_name: '', avatar_url: null });
   const [editName, setEditName] = useState('');
   const [nameDirty, setNameDirty] = useState(false);
   const [savingName, setSavingName] = useState(false);
   const [nameSaved, setNameSaved] = useState(false);
+
+  const [showAdminLink, setShowAdminLink] = useState(false);
+  useEffect(() => {
+    let active = true;
+    isAdmin().then((admin) => { if (active) setShowAdminLink(admin); });
+    return () => { active = false; };
+  }, [user]);
 
   const [stats, setStats] = useState<Stats | null>(null);
   const [loadingStats, setLoadingStats] = useState(true);
@@ -86,11 +100,36 @@ export default function ProfilePage() {
     }
   }, [user]);
 
+  // The count is of whichever set is showing: the sample notes or your own.
+  useEffect(() => { void loadStats(); }, [loadStats, sampleMode]);
+
   useEffect(() => {
     if (!user) { router.replace('/auth'); return; }
     loadProfile();
-    loadStats();
-  }, [user, loadProfile, loadStats, router]);
+  }, [user, loadProfile, router]);
+
+  const chooseSampleMode = (on: boolean) => {
+    if (!user || on === sampleMode) return;
+    setSamplesMessage('');
+    setSampleMode(user.id, on);
+    // The vault is copied in and opened from the home page.
+    if (on) router.push('/');
+  };
+
+  const removeSamples = async () => {
+    if (!user) return;
+    if (!confirm('Remove all sample notes? This deletes the sample vault and any notes you wrote while exploring it. Your own notes are not touched.')) return;
+    setRemovingSamples(true);
+    setSamplesMessage('');
+    try {
+      await removeSampleNotes(user.id);
+      setSamplesMessage('Sample notes removed.');
+    } catch {
+      setSamplesMessage('The sample notes could not be removed. Please try again.');
+    } finally {
+      setRemovingSamples(false);
+    }
+  };
 
   const saveName = async () => {
     if (!user) return;
@@ -273,6 +312,53 @@ export default function ProfilePage() {
                 : 'The full model, used by default. Gives the most careful related notes and insights.'}
             </p>
           </div>
+
+          <div className="bg-card border border-border rounded-2xl p-6 mb-4 shadow-sm">
+            <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-4">Sample notes</h2>
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="flex items-center gap-2" role="radiogroup" aria-label="Sample notes">
+                {[false, true].map((option) => {
+                  const active = sampleMode === option;
+                  return (
+                    <button
+                      key={String(option)}
+                      role="radio"
+                      aria-checked={active}
+                      onClick={() => chooseSampleMode(option)}
+                      className={`px-4 py-1.5 rounded-lg text-sm font-medium border transition-all ${
+                        active
+                          ? 'text-white border-transparent'
+                          : 'text-muted-foreground border-border hover:text-foreground hover:border-border/80'
+                      }`}
+                      style={active ? { backgroundColor: '#487BE9', borderColor: '#487BE9' } : undefined}
+                    >
+                      {option ? 'On' : 'Off'}
+                    </button>
+                  );
+                })}
+              </div>
+              <button
+                type="button"
+                onClick={() => void removeSamples()}
+                disabled={removingSamples}
+                className="ml-auto flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm text-red-600 hover:bg-red-50 disabled:opacity-50 dark:hover:bg-red-950/30"
+              >
+                {removingSamples ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Trash2 className="w-3.5 h-3.5" />}
+                Remove sample notes
+              </button>
+            </div>
+            <p className="text-[11px] text-muted-foreground/50 mt-3">
+              {sampleMode
+                ? 'You are exploring the sample notes. Your own notes are hidden until you turn this off, and notes you write meanwhile stay with the samples.'
+                : 'Explore a ready-made vault of 68 notes. While it is on, only the samples are shown and searched; your own notes are hidden, not changed.'}
+            </p>
+            {samplesMessage && <p className="text-xs text-muted-foreground mt-2" role="status">{samplesMessage}</p>}
+          </div>
+
+          {showAdminLink && <div className="bg-card border border-border rounded-2xl p-6 mb-4 shadow-sm">
+            <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">Admin</h2>
+            <Link href="/admin" className="text-sm font-medium text-[#487BE9] hover:underline">AI usage: spend, requests, and models per person →</Link>
+          </div>}
 
           <div className="bg-card border border-border rounded-2xl p-6 mb-4 shadow-sm">
             <h2 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-4">Account Stats</h2>

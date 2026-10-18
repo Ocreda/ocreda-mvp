@@ -10,6 +10,8 @@ export interface Note {
   category: string | null;
   category_updated_at: string | null;
   created_at: string;
+  /** Part of the sample vault, or written while exploring it. */
+  is_sample?: boolean;
 }
 
 export interface NoteImportInput {

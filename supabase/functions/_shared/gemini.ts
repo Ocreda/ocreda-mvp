@@ -94,10 +94,14 @@ export interface TokenUsage {
   cachedInputTokens: number;
   /** OpenRouter's own billed figure in USD, when it reports one. */
   costUsd: number;
+  /** Calls per model that answered, as the provider named it. */
+  models: Record<string, number>;
+  /** Calls per provider that served them, e.g. "Morph"; empty where none is reported. */
+  providers: Record<string, number>;
 }
 
 export function emptyTokenUsage(): TokenUsage {
-  return { calls: 0, inputTokens: 0, outputTokens: 0, reasoningTokens: 0, cachedInputTokens: 0, costUsd: 0 };
+  return { calls: 0, inputTokens: 0, outputTokens: 0, reasoningTokens: 0, cachedInputTokens: 0, costUsd: 0, models: {}, providers: {} };
 }
 
 export function addTokenUsage(total: TokenUsage, usage: TokenUsage | null): void {
@@ -108,11 +112,23 @@ export function addTokenUsage(total: TokenUsage, usage: TokenUsage | null): void
   total.reasoningTokens += usage.reasoningTokens;
   total.cachedInputTokens += usage.cachedInputTokens;
   total.costUsd += usage.costUsd;
+  for (const [name, count] of Object.entries(usage.models)) total.models[name] = (total.models[name] ?? 0) + count;
+  for (const [name, count] of Object.entries(usage.providers)) total.providers[name] = (total.providers[name] ?? 0) + count;
 }
 
-function readUsage(raw: unknown): TokenUsage | null {
-  if (!raw || typeof raw !== "object") return null;
-  const usage = raw as Record<string, unknown>;
+/** The sum of several usages, such as the steps of one search. */
+export function sumTokenUsage(parts: TokenUsage[]): TokenUsage {
+  const total = emptyTokenUsage();
+  for (const part of parts) addTokenUsage(total, part);
+  return total;
+}
+
+/**
+ * One answered call. A reply with no usage block still counts as a call, so a
+ * request is never recorded as costing nothing when it did not.
+ */
+function readUsage(raw: unknown, model: string, provider: unknown): TokenUsage {
+  const usage = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
   const num = (value: unknown) => (typeof value === "number" && Number.isFinite(value) ? value : 0);
   const details = (key: string) => (usage[key] ?? {}) as Record<string, unknown>;
   return {
@@ -122,6 +138,23 @@ function readUsage(raw: unknown): TokenUsage | null {
     reasoningTokens: num(details("completion_tokens_details").reasoning_tokens),
     cachedInputTokens: num(details("prompt_tokens_details").cached_tokens),
     costUsd: num(usage.cost),
+    models: { [model]: 1 },
+    providers: typeof provider === "string" && provider ? { [provider]: 1 } : {},
+  };
+}
+
+/**
+ * Usage for a call to Google directly (documents, embeddings). Google reports
+ * tokens but no price, so the cost stays 0 and the record says Google billed it.
+ */
+export function googleTokenUsage(model: string, inputTokens: number | null | undefined, outputTokens = 0, calls = 1): TokenUsage {
+  return {
+    ...emptyTokenUsage(),
+    calls,
+    inputTokens: inputTokens ?? 0,
+    outputTokens,
+    models: { [model]: calls },
+    providers: { Google: calls },
   };
 }
 
@@ -183,7 +216,7 @@ export async function generateWithGeminiResult(
   return {
     text: choice?.message?.content ?? "",
     truncated: choice?.finish_reason === "length",
-    usage: readUsage(data.usage),
+    usage: readUsage(data.usage, typeof data.model === "string" && data.model ? data.model : model, data.provider),
   };
 }
 
