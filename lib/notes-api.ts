@@ -28,6 +28,37 @@ const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 
 export type DocumentExtractionMethod = 'ocr' | 'document';
 
+export type DomainClassificationInput = { title: string; description: string };
+
+/** Classify note text against the person's Domain goals. Null means no confident match. */
+export async function classifyNotesIntoDomains(
+  texts: string[],
+  domains: DomainClassificationInput[]
+): Promise<Array<string | null>> {
+  if (!texts.length || !domains.length) return texts.map(() => null);
+  if (IS_LOCAL_MODE) return texts.map(() => null);  // DEV-LOCAL-MODE
+  const { data, error } = await supabase.auth.getSession();
+  const accessToken = data.session?.access_token;
+  if (error || !accessToken) throw new Error('Your session has expired. Sign in again to organize notes.');
+  const response = await fetch(`${SUPABASE_URL}/functions/v1/classify-domains`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      apikey: SUPABASE_ANON_KEY,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ texts, domains, model_tier: getAiMode() }),
+  });
+  if (!response.ok) throw new Error('Automatic organization is temporarily unavailable.');
+  const payload = await response.json().catch(() => null) as { assignments?: unknown } | null;
+  const assignments = payload?.assignments;
+  if (!Array.isArray(assignments) || assignments.length !== texts.length) {
+    throw new Error('Automatic organization returned an invalid response.');
+  }
+  const valid = new Set(domains.map((domain) => domain.title));
+  return assignments.map((value) => typeof value === 'string' && valid.has(value) ? value : null);
+}
+
 const LEGACY_NOTE_FIELDS = 'id, user_id, raw_text, summary, target_date, time_of_day, created_at';
 const CATEGORY_NOTE_FIELDS = `${LEGACY_NOTE_FIELDS}, category, category_updated_at`;
 let categoryColumnsAvailable: boolean | null = null;
