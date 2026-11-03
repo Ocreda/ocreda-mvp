@@ -24,6 +24,8 @@ type Row = {
   insight: unknown;
   text: string | null;
   target_note_id: string | null;
+  target_section_key: string | null;
+  resolved_at?: string | null;
 };
 
 const CHOICES: CardChoice[] = ['solved', 'downgraded', 'helped', 'merged', 'today', 'earlier', 'both', 'confirmed', 'rejected'];
@@ -41,6 +43,7 @@ function toDecision(row: Row): CardDecision | null {
     insight,
     ...(typeof row.text === 'string' ? { text: row.text } : {}),
     ...(row.target_note_id ? { targetNoteId: row.target_note_id } : {}),
+    ...(row.target_section_key ? { targetSectionKey: row.target_section_key } : {}),
   };
 }
 
@@ -53,6 +56,8 @@ function toRow(noteId: string, cardId: string, decision: CardDecision): Row {
     insight: decision.insight,
     text: decision.text ?? null,
     target_note_id: decision.targetNoteId ?? null,
+    target_section_key: decision.targetSectionKey ?? null,
+    resolved_at: decision.choice === 'solved' || decision.choice === 'helped' ? new Date().toISOString() : null,
   };
 }
 
@@ -102,10 +107,10 @@ function adoptLegacyRows(userId: string, noteId: string): void {
   try {
     const raw = localStorage.getItem(legacyBrowserKey(userId, noteId));
     if (!raw) return;
-    const legacy = JSON.parse(raw) as Record<string, Omit<Row, 'note_id' | 'card_id' | 'target_note_id'>>;
+    const legacy = JSON.parse(raw) as Record<string, Omit<Row, 'note_id' | 'card_id' | 'target_note_id' | 'target_section_key' | 'resolved_at'>>;
     const rows = readBrowserRows(userId).filter((row) => row.note_id !== noteId || !(row.card_id in legacy));
     for (const [cardId, value] of Object.entries(legacy)) {
-      rows.push({ note_id: noteId, card_id: cardId, choice: value.choice, kind: value.kind, insight: value.insight, text: value.text ?? null, target_note_id: null });
+      rows.push({ note_id: noteId, card_id: cardId, choice: value.choice, kind: value.kind, insight: value.insight, text: value.text ?? null, target_note_id: null, target_section_key: null, resolved_at: null });
     }
     writeBrowserRows(userId, rows);
     localStorage.removeItem(legacyBrowserKey(userId, noteId));
@@ -115,7 +120,11 @@ function adoptLegacyRows(userId: string, noteId: string): void {
 }
 
 function saveBrowserRow(userId: string, noteId: string, cardId: string, decision: CardDecision | null): void {
-  const rows = readBrowserRows(userId).filter((row) => !(row.note_id === noteId && row.card_id === cardId));
+  const rows = readBrowserRows(userId).filter((row) => {
+    if (row.note_id === noteId && row.card_id === cardId) return false;
+    if (!decision?.targetNoteId || !decision.targetSectionKey || (decision.choice !== 'solved' && decision.choice !== 'helped')) return true;
+    return !(row.target_note_id === decision.targetNoteId && row.target_section_key === decision.targetSectionKey && (row.choice === 'solved' || row.choice === 'helped'));
+  });
   if (decision) rows.push(toRow(noteId, cardId, decision));
   writeBrowserRows(userId, rows);
 }
@@ -165,7 +174,7 @@ export async function loadCardDecisions(noteId: string): Promise<NoteCardDecisio
     await uploadBrowserRows(userId).catch(() => undefined);
     const { data, error } = await supabase
       .from(TABLE)
-      .select('note_id,card_id,choice,kind,insight,text,target_note_id')
+      .select('note_id,card_id,choice,kind,insight,text,target_note_id,target_section_key,resolved_at')
       .or(`note_id.eq.${noteId},target_note_id.eq.${noteId}`);
     if (!error) return split((data ?? []) as Row[], noteId);
     if (!isMissingTable(error)) throw new Error('Could not load your choices on these suggestions.');
@@ -184,6 +193,7 @@ export async function saveCardDecision(noteId: string, cardId: string, decision:
     ? await supabase.from(TABLE).upsert({ ...toRow(noteId, cardId, decision), user_id: userId }, { onConflict: 'user_id,note_id,card_id' })
     : await supabase.from(TABLE).delete().eq('user_id', userId).eq('note_id', noteId).eq('card_id', cardId);
   if (!error) return;
+  if (error.code === '23505' && decision?.targetSectionKey) throw new Error('This situation already has an accepted solution or help.');
   if (!isMissingTable(error)) throw new Error('Could not save your choice on this suggestion.');
   saveBrowserRow(userId, noteId, cardId, decision);
 }
