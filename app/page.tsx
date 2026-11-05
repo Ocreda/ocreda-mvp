@@ -8,9 +8,9 @@ import NoteImporter, { ImportDomainDraft, ImportNoteDraft } from '@/components/N
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { useAuth } from '@/lib/auth-context';
-import { classifyNotesIntoDomains, createNote, deleteNote, findRelevantNotes, findSimilarNotes, getNotes, importNotes, MIN_RELEVANCE_DRAFT_CHARS, moveNotesToCategory, processNote, updateNote } from '@/lib/notes-api';
+import { createNote, deleteNote, findRelevantNotes, findSimilarNotes, getNotes, importNotes, MIN_RELEVANCE_DRAFT_CHARS, moveNotesToCategory, processNote, updateNote } from '@/lib/notes-api';
 import { supabase } from '@/lib/supabase';
-import { firstFiveWordTitle, prepareImportedNoteText } from '@/lib/import-note-content';
+import { prepareImportedNoteText } from '@/lib/import-note-content';
 import { IS_LOCAL_MODE } from '@/dev/local-mode';  // DEV-LOCAL-MODE
 import { CardChoice, CardDecision, CardKind, DomainGoal, IncomingCardDecision, InsightIntent, Note, NoteInsight, NoteRelationType, RelevanceCoverage, RelevanceResult, RelevanceSection, SuggestionKind } from '@/lib/types';
 import { loadCardDecisions, saveCardDecision } from '@/lib/card-decisions';
@@ -18,14 +18,8 @@ import { findAnchor, splitIntoParagraphs } from '@/supabase/functions/_shared/re
 import { getAiMode, useAiMode } from '@/lib/ai-mode';
 import { setSampleMode, useSampleMode, workspaceScope } from '@/lib/sample-mode';
 import { isSampleGuide, loadSampleVault, SampleVault } from '@/lib/sample-vault';
-import {
-  createDomain as createServerDomain,
-  deleteDomain as deleteServerDomain,
-  migrateBrowserWorkspace,
-  updateDomain as updateServerDomain,
-} from '@/lib/workspace-api';
 
-type MuseMeta = { id?: string; title: string; description: string; createdAt: string };
+type MuseMeta = { title: string; description: string; createdAt: string };
 type ProjectPage = { id: string; title: string; content: string; sourceNoteIds: string[]; createdAt: string; updatedAt: string };
 type CortexProject = { id: string; title: string; description: string; content: string; pages: ProjectPage[]; createdAt: string; updatedAt: string };
 type NoteEditorState = { note: Note | null; title: string; body: string; muse: string; context: 'domain' };
@@ -369,39 +363,23 @@ export default function OcredaHome() {
     const request = ++loadRequestRef.current;
     try {
       let loaded: Note[];
-      let workspace: Awaited<ReturnType<typeof migrateBrowserWorkspace>> | null = null;
       if (sampleMode && scope) {
         const vault = await loadSampleVault();
         if (request !== loadRequestRef.current) return;
         seedSampleWorkspace(scope, vault);
         loaded = vault.notes;
       } else {
-        [loaded, workspace] = await Promise.all([
-          getNotes(),
-          user && !IS_LOCAL_MODE ? migrateBrowserWorkspace(user.id) : Promise.resolve(null),
-        ]);
+        loaded = await getNotes();
       }
       if (request !== loadRequestRef.current) return;
       if (scope) {
+        // The latest load decides which Domains show, so a switch always
+        // ends with the Domains of the notes it loaded.
+        setMuseMeta(readStoredList<MuseMeta>(`ocreda-muses:${scope}`).filter((item) => item && typeof item.title === 'string'));
         setPinnedMuseTitles([...new Set(readStoredList<string>(`ocreda-pinned-muses:${scope}`).filter((title): title is string => typeof title === 'string'))].slice(0, 3));
       }
-      if (sampleMode || IS_LOCAL_MODE) {
-        setMuseMeta(scope ? readStoredList<MuseMeta>(`ocreda-muses:${scope}`).filter((item) => item && typeof item.title === 'string') : []);
-      } else if (workspace) {
-        setMuseMeta(workspace.domains.map((domain) => ({
-          id: domain.id,
-          title: domain.title,
-          description: domain.description,
-          createdAt: domain.createdAt,
-        })));
-        setProjects(workspace.projects);
-      }
-      const localMuses = scope && (sampleMode || IS_LOCAL_MODE) ? readMuseAssignments(scope) : {};
-      setNotes(loaded.map((note) => {
-        const serverDomain = workspace?.noteDomainNames[note.id];
-        const category = note.category ?? serverDomain ?? localMuses[note.id];
-        return category ? { ...note, category } : note;
-      }));
+      const localMuses = scope ? readMuseAssignments(scope) : {};
+      setNotes(loaded.map((note) => localMuses[note.id] ? { ...note, category: localMuses[note.id] } : note));
       setNotesScope(scope);
     }
     catch (err) {
@@ -410,21 +388,8 @@ export default function OcredaHome() {
       }
     }
     finally { if (request === loadRequestRef.current) setLoading(false); }
-  }, [sampleMode, scope, user]);
+  }, [sampleMode, scope]);
   useEffect(() => { void load(); }, [load]);
-  useEffect(() => {
-    if (!user || IS_LOCAL_MODE || sampleMode) return;
-    const refresh = () => void load();
-    window.addEventListener('focus', refresh);
-    const channel = supabase.channel(`workspace-sync:${user.id}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'domains', filter: `user_id=eq.${user.id}` }, refresh)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'notes', filter: `user_id=eq.${user.id}` }, refresh)
-      .subscribe();
-    return () => {
-      window.removeEventListener('focus', refresh);
-      void supabase.removeChannel(channel);
-    };
-  }, [load, sampleMode, user]);
 
   // Switching between the sample notes and your own starts from the dashboard.
   const previousSampleModeRef = useRef(sampleMode);
@@ -460,28 +425,32 @@ export default function OcredaHome() {
 
   useEffect(() => {
     if (!user || !scope) return;
-    if (sampleMode || IS_LOCAL_MODE) {
-      const museKey = `ocreda-muses:${scope}`;
-      const projectKey = `ocreda-projects:${scope}`;
-      const legacy = readStoredList<MuseMeta>(`ocreda-cortexes:${scope}`).filter((item) => item && typeof item.title === 'string');
-      const storedMuses = readStoredList<MuseMeta>(museKey).filter((item) => item && typeof item.title === 'string');
-      setMuseMeta(storedMuses.length ? storedMuses : legacy);
-      if (!storedMuses.length && legacy.length) localStorage.setItem(museKey, JSON.stringify(legacy));
-      const storedProjects = readStoredList<CortexProject>(projectKey).filter((item) => item && typeof item.id === 'string' && typeof item.title === 'string').map(normalizeProject);
-      if (storedProjects.length) setProjects(storedProjects);
-      else if (legacy.length) {
-        const migrated = legacy.map((item) => ({
-          id: createProjectId(),
-          title: item.title,
-          description: item.description,
-          content: '',
-          pages: [],
-          createdAt: item.createdAt,
-          updatedAt: item.createdAt,
-        }));
-        setProjects(migrated);
-        localStorage.setItem(projectKey, JSON.stringify(migrated));
-      } else setProjects([]);
+    const museKey = `ocreda-muses:${scope}`;
+    const projectKey = `ocreda-projects:${scope}`;
+    const legacy = readStoredList<MuseMeta>(`ocreda-cortexes:${scope}`).filter((item) => item && typeof item.title === 'string');
+    const storedMuses = readStoredList<MuseMeta>(museKey).filter((item) => item && typeof item.title === 'string');
+    const nextMuses = storedMuses.length ? storedMuses : legacy;
+    setMuseMeta(nextMuses);
+    setPinnedMuseTitles([...new Set(readStoredList<string>(`ocreda-pinned-muses:${scope}`).filter((title): title is string => typeof title === 'string'))].slice(0, 3));
+    if (!storedMuses.length && legacy.length) localStorage.setItem(museKey, JSON.stringify(legacy));
+
+    const storedProjects = readStoredList<CortexProject>(projectKey).filter((item) => item && typeof item.id === 'string' && typeof item.title === 'string').map(normalizeProject);
+    if (storedProjects.length) {
+      setProjects(storedProjects);
+    } else if (legacy.length) {
+      const migrated = legacy.map((item) => ({
+        id: createProjectId(),
+        title: item.title,
+        description: item.description,
+        content: '',
+        pages: [],
+        createdAt: item.createdAt,
+        updatedAt: item.createdAt,
+      }));
+      setProjects(migrated);
+      localStorage.setItem(projectKey, JSON.stringify(migrated));
+    } else {
+      setProjects([]);
     }
     if (IS_LOCAL_MODE) {  // DEV-LOCAL-MODE
       setDisplayName('you');
@@ -491,12 +460,12 @@ export default function OcredaHome() {
         setDisplayName(data?.full_name?.trim() || authName || user.email?.split('@')[0] || 'you');
       });
     }
-  }, [sampleMode, scope, user]);
+  }, [scope, user]);
 
   const persistMuseMeta = useCallback((next: MuseMeta[]) => {
     setMuseMeta(next);
-    if (scope && (sampleMode || IS_LOCAL_MODE)) localStorage.setItem(`ocreda-muses:${scope}`, JSON.stringify(next));
-  }, [sampleMode, scope]);
+    if (scope) localStorage.setItem(`ocreda-muses:${scope}`, JSON.stringify(next));
+  }, [scope]);
 
   const persistPinnedMuses = useCallback((next: string[]) => {
     setPinnedMuseTitles(next);
@@ -521,10 +490,6 @@ export default function OcredaHome() {
 
   const persistMuseAssignments = useCallback((noteIds: string[], category: string | null) => {
     if (!scope || !noteIds.length) return;
-    if (!sampleMode && !IS_LOCAL_MODE) {
-      setNotes((current) => current.map((note) => noteIds.includes(note.id) ? { ...note, category, category_updated_at: new Date().toISOString() } : note));
-      return;
-    }
     const assignments = readMuseAssignments(scope);
     noteIds.forEach((noteId) => {
       if (category) assignments[noteId] = category;
@@ -532,51 +497,43 @@ export default function OcredaHome() {
     });
     localStorage.setItem(`ocreda-note-muses:${scope}`, JSON.stringify(assignments));
     setNotes((current) => current.map((note) => noteIds.includes(note.id) ? { ...note, category, category_updated_at: new Date().toISOString() } : note));
-  }, [sampleMode, scope]);
+  }, [scope]);
 
   useEffect(() => {
     // The sample vault arrives sorted, so this is for your own notes only.
     if (!user || loading || sampleMode || notesScope !== scope || orphanMigrationStartedRef.current) return;
     const migrationKey = `ocreda-orphans-migration:${ORPHANS_MIGRATION_VERSION}:${user.id}`;
+    if (localStorage.getItem(migrationKey) === 'complete') return;
+
+    orphanMigrationStartedRef.current = true;
     const uncategorizedIds = notes.filter((note) => !cleanCategory(note.category)).map((note) => note.id);
-    const existingOrphans = museMeta.find((muse) => muse.title.toLowerCase() === ORPHANS_MUSE.toLowerCase());
     // Nothing to sort: a new account keeps its welcome screen instead of an empty Orphans Domain.
-    if (!uncategorizedIds.length && !existingOrphans) {
+    if (!uncategorizedIds.length) {
       localStorage.setItem(migrationKey, 'complete');
       return;
     }
-    const orphanNoteCount = notes.filter((note) => cleanCategory(note.category)?.toLowerCase() === ORPHANS_MUSE.toLowerCase()).length;
-    const migrationComplete = localStorage.getItem(migrationKey) === 'complete';
-    if (migrationComplete && (orphanNoteCount > 0 || !existingOrphans)) return;
+    const existingOrphans = museMeta.find((muse) => muse.title.toLowerCase() === ORPHANS_MUSE.toLowerCase());
+    if (!existingOrphans) {
+      persistMuseMeta([
+        ...museMeta,
+        { title: ORPHANS_MUSE, description: ORPHANS_DESCRIPTION, createdAt: new Date().toISOString() },
+      ]);
+    }
 
-    orphanMigrationStartedRef.current = true;
     const migrate = async () => {
       try {
-        if (!migrationComplete && uncategorizedIds.length) {
-          let orphanMeta = existingOrphans;
-          if (!orphanMeta) {
-            orphanMeta = IS_LOCAL_MODE
-              ? { title: ORPHANS_MUSE, description: ORPHANS_DESCRIPTION, createdAt: new Date().toISOString() }
-              : await createServerDomain(ORPHANS_MUSE, ORPHANS_DESCRIPTION);
-            persistMuseMeta([...museMeta, orphanMeta]);
-          }
+        if (uncategorizedIds.length) {
           await moveNotesToCategory(uncategorizedIds, ORPHANS_MUSE);
           persistMuseAssignments(uncategorizedIds, ORPHANS_MUSE);
         }
-        if (!migrationComplete) localStorage.setItem(migrationKey, 'complete');
-        if (existingOrphans && orphanNoteCount === 0 && !uncategorizedIds.length) {
-          if (!IS_LOCAL_MODE && existingOrphans.id) await deleteServerDomain(existingOrphans.id);
-          persistMuseMeta(museMeta.filter((muse) => muse.title.toLowerCase() !== ORPHANS_MUSE.toLowerCase()));
-          persistPinnedMuses(pinnedMuseTitles.filter((title) => title.toLowerCase() !== ORPHANS_MUSE.toLowerCase()));
-        }
+        localStorage.setItem(migrationKey, 'complete');
       } catch (err) {
-        setError(safeErrorMessage(err, 'Unable to move existing uncategorized notes to Orphans.'));
-      } finally {
         orphanMigrationStartedRef.current = false;
+        setError(safeErrorMessage(err, 'Unable to move existing uncategorized notes to Orphans.'));
       }
     };
     void migrate();
-  }, [loading, museMeta, notes, notesScope, persistMuseAssignments, persistMuseMeta, persistPinnedMuses, pinnedMuseTitles, sampleMode, scope, user]);
+  }, [loading, museMeta, notes, notesScope, persistMuseAssignments, persistMuseMeta, sampleMode, scope, user]);
 
   const muses = useMemo(() => {
     const map = new Map<string, MuseMeta>();
@@ -592,18 +549,10 @@ export default function OcredaHome() {
   const setDomainGoal = (domainTitle: string, goal: string) => {
     const key = domainTitle.toLowerCase();
     const existing = museMeta.find((item) => item.title.toLowerCase() === key);
-    const next = existing
+    persistMuseMeta(existing
       ? museMeta.map((item) => item.title.toLowerCase() === key ? { ...item, description: goal } : item)
       // A Domain that exists only through its notes' category gets its metadata now.
-      : [...museMeta, { title: domainTitle, description: goal, createdAt: muses.find((item) => item.title.toLowerCase() === key)?.createdAt ?? new Date().toISOString() }];
-    persistMuseMeta(next);
-    if (!IS_LOCAL_MODE && !sampleMode) {
-      const save = existing?.id
-        ? updateServerDomain(existing.id, existing.title, goal)
-        : createServerDomain(domainTitle, goal);
-      void save.then((saved) => persistMuseMeta(next.map((item) => item.title.toLowerCase() === key ? { ...item, id: saved.id } : item)))
-        .catch((err) => setError(safeErrorMessage(err, 'Unable to save this Domain goal.')));
-    }
+      : [...museMeta, { title: domainTitle, description: goal, createdAt: muses.find((item) => item.title.toLowerCase() === key)?.createdAt ?? new Date().toISOString() }]);
   };
 
   const notesByMuse = useMemo(() => {
@@ -650,24 +599,12 @@ export default function OcredaHome() {
 
   const saveNote = async (findRelevant = false) => {
     if (!noteEditor) return;
-    let title = noteEditor.title.trim(); const body = noteEditor.body.trim();
+    const title = noteEditor.title.trim(); const body = noteEditor.body.trim();
     if (!title && !body) { setError('Write something before saving.'); return; }
-    if (!title && body) title = firstFiveWordTitle(body);
     const rawText = title && body ? `${title}\n\n${body}` : title || body;
+    const category = noteEditor.muse === AUTOMATIC_MUSE ? inferMuse(rawText, muses) : cleanCategory(noteEditor.muse);
     setSaving(true); setError('');
     try {
-      let category = noteEditor.muse === AUTOMATIC_MUSE ? null : cleanCategory(noteEditor.muse);
-      if (noteEditor.muse === AUTOMATIC_MUSE) {
-        const matchingDomains = muses.filter((muse) => muse.title.toLowerCase() !== ORPHANS_MUSE.toLowerCase());
-        const [classified] = await classifyNotesIntoDomains([rawText], matchingDomains).catch(() => [inferMuse(rawText, matchingDomains)]);
-        category = classified ?? ORPHANS_MUSE;
-        if (category === ORPHANS_MUSE && !muses.some((muse) => muse.title.toLowerCase() === ORPHANS_MUSE.toLowerCase())) {
-          const orphan = IS_LOCAL_MODE || sampleMode
-            ? { title: ORPHANS_MUSE, description: ORPHANS_DESCRIPTION, createdAt: new Date().toISOString() }
-            : await createServerDomain(ORPHANS_MUSE, ORPHANS_DESCRIPTION);
-          persistMuseMeta([...museMeta, orphan]);
-        }
-      }
       let savedNoteId: string;
       if (noteEditor.note) {
         const updated = await updateNote(noteEditor.note.id, rawText, category);
@@ -785,13 +722,7 @@ export default function OcredaHome() {
       }
       const originalKey = museEditor.originalTitle?.toLowerCase();
       const next = museMeta.filter((item) => item.title.toLowerCase() !== originalKey && item.title.toLowerCase() !== title.toLowerCase());
-      const existingMeta = museMeta.find((item) => item.title.toLowerCase() === originalKey);
-      const savedDomain = IS_LOCAL_MODE || sampleMode
-        ? null
-        : existingMeta?.id
-          ? await updateServerDomain(existingMeta.id, title, description)
-          : await createServerDomain(title, description);
-      next.push({ id: savedDomain?.id ?? existingMeta?.id, title, description, createdAt: savedDomain?.createdAt ?? existingMeta?.createdAt ?? new Date().toISOString() });
+      next.push({ title, description, createdAt: museMeta.find((item) => item.title.toLowerCase() === originalKey)?.createdAt ?? new Date().toISOString() });
       persistMuseMeta(next);
       if (museEditor.originalTitle && museEditor.originalTitle !== title) {
         persistPinnedMuses(pinnedMuseTitles.map((pinned) => pinned.toLowerCase() === museEditor.originalTitle?.toLowerCase() ? title : pinned));
@@ -811,8 +742,6 @@ export default function OcredaHome() {
       const updates = new Map(updated.map((note) => [note.id, note]));
       setNotes((current) => current.map((note) => updates.get(note.id) ?? note));
       persistMuseAssignments((notesByMuse.get(title) ?? []).map((note) => note.id), null);
-      const domain = museMeta.find((item) => item.title.toLowerCase() === title.toLowerCase());
-      if (!IS_LOCAL_MODE && !sampleMode && domain?.id) await deleteServerDomain(domain.id);
       persistMuseMeta(museMeta.filter((item) => item.title.toLowerCase() !== title.toLowerCase()));
       persistPinnedMuses(pinnedMuseTitles.filter((pinned) => pinned.toLowerCase() !== title.toLowerCase()));
       setActiveMuse(null);
@@ -885,28 +814,21 @@ export default function OcredaHome() {
           });
         }
       });
-      let importDomains = Array.from(importDomainMap.values());
-      let matchingDomains = importDomains.filter((domain) => domain.title.toLowerCase() !== ORPHANS_MUSE.toLowerCase());
-      const preparedTexts = drafts.map((draft) => prepareImportedNoteText(draft.rawText));
-      const assignments = await classifyNotesIntoDomains(preparedTexts, matchingDomains)
-        .catch(() => preparedTexts.map((text) => inferMuse(text, matchingDomains)));
-      if (assignments.some((assignment) => !assignment) && !importDomainMap.has(ORPHANS_MUSE.toLowerCase())) {
-        const orphan = IS_LOCAL_MODE || sampleMode
-          ? { title: ORPHANS_MUSE, description: ORPHANS_DESCRIPTION, createdAt: now }
-          : await createServerDomain(ORPHANS_MUSE, ORPHANS_DESCRIPTION);
-        importDomainMap.set(ORPHANS_MUSE.toLowerCase(), orphan);
+      if (!importDomainMap.has(ORPHANS_MUSE.toLowerCase())) {
+        importDomainMap.set(ORPHANS_MUSE.toLowerCase(), {
+          title: ORPHANS_MUSE,
+          description: ORPHANS_DESCRIPTION,
+          createdAt: now,
+        });
       }
-      if (!IS_LOCAL_MODE && !sampleMode) {
-        for (const domain of importDomainMap.values()) {
-          if (domain.id) continue;
-          const saved = await createServerDomain(domain.title, domain.description);
-          importDomainMap.set(domain.title.toLowerCase(), { ...domain, id: saved.id, createdAt: saved.createdAt });
-        }
-      }
-      importDomains = Array.from(importDomainMap.values());
-      matchingDomains = importDomains.filter((domain) => domain.title.toLowerCase() !== ORPHANS_MUSE.toLowerCase());
+
+      const importDomains = Array.from(importDomainMap.values());
+      const matchingDomains = importDomains.filter((domain) => domain.title.toLowerCase() !== ORPHANS_MUSE.toLowerCase());
       const orphanTitle = importDomainMap.get(ORPHANS_MUSE.toLowerCase())?.title ?? ORPHANS_MUSE;
-      const inputs = preparedTexts.map((rawText, index) => ({ rawText, category: assignments[index] ?? orphanTitle }));
+      const inputs = drafts.map((draft) => {
+        const rawText = prepareImportedNoteText(draft.rawText);
+        return { rawText, category: inferMuse(rawText, matchingDomains) ?? orphanTitle };
+      });
       const imported = await importNotes(
         inputs,
         (completed, total) => setImportProgress({ completed, total })
@@ -1063,6 +985,7 @@ function CortexHome({ projects, muses, pinnedMuseTitles, notes, notesByMuse, use
   onSaveRetrieval: (queryText: string, resultNotes: Note[], projectId: string, newProjectTitle?: string) => Promise<void>;
 }) {
   const [searchOpen, setSearchOpen] = useState(false);
+  const [instantRetrievalOpen, setInstantRetrievalOpen] = useState(false);
   const pinnedMuses = pinnedMuseTitles.map((title) => muses.find((muse) => muse.title.toLowerCase() === title.toLowerCase())).filter((muse): muse is MuseMeta => Boolean(muse));
   const unpinnedMuses = muses.filter((muse) => !pinnedMuseTitles.some((title) => title.toLowerCase() === muse.title.toLowerCase()));
 
@@ -1072,6 +995,7 @@ function CortexHome({ projects, muses, pinnedMuseTitles, notes, notesByMuse, use
         <div className="flex items-center gap-2 text-[#222]">
           <button type="button" onClick={onAddNote} className="flex h-10 items-center gap-2 rounded-md px-2 text-sm hover:bg-[#f5f5f6]" title="Add a note"><span className="flex h-7 w-16 items-center justify-center rounded-md bg-[#477bea] text-white"><Plus className="h-4 w-4" /></span><span className="hidden sm:inline">Add a note</span></button>
           <button type="button" onClick={() => setSearchOpen(true)} aria-label="Search notes, pages, and Domains" title="Search notes, pages, and Domains" className="flex h-10 w-10 items-center justify-center rounded-md hover:bg-[#f5f5f6]"><Search className="h-5 w-5" /></button>
+          <button type="button" onClick={() => setInstantRetrievalOpen(true)} aria-label="Open Instant Retrieval" title="Instant Retrieval" className="flex h-10 w-10 items-center justify-center rounded-md text-[#477bea] hover:bg-[#edf3ff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]"><ScanSearch className="h-5 w-5" /></button>
           <button type="button" onClick={onOpenImport} aria-label="Import notes" title="Import notes" className="flex h-10 w-10 items-center justify-center rounded-md hover:bg-[#f5f5f6]"><Upload className="h-5 w-5" /></button>
         </div>
         <h1 className="pointer-events-none absolute left-1/2 hidden -translate-x-1/2 text-sm font-normal text-[#b2b2b2] lg:block lg:text-base">Your knowledge</h1>
@@ -1102,7 +1026,8 @@ function CortexHome({ projects, muses, pinnedMuseTitles, notes, notesByMuse, use
         <span>{notes.length} {notes.length === 1 ? 'Note' : 'Notes'}</span>
       </button>
 
-      {searchOpen && <KnowledgeSearchOverlay request={{ query: '' }} notes={notes} muses={muses} projects={projects} hideProjectColumn onClose={() => setSearchOpen(false)} onOpenPage={(project, page) => { setSearchOpen(false); onOpenPage(project, page); }} onOpenNote={(note) => { setSearchOpen(false); onOpenNote(note); }} />}
+      {searchOpen && <KnowledgeSearchOverlay request={{ query: '' }} notes={notes} muses={muses} projects={projects} hideProjectColumn onClose={() => setSearchOpen(false)} onOpenPage={(project, page) => { setSearchOpen(false); onOpenPage(project, page); }} onOpenNote={(note) => { setSearchOpen(false); onOpenNote(note); }} onInstantRetrieval={() => { setSearchOpen(false); setInstantRetrievalOpen(true); }} />}
+      {instantRetrievalOpen && <InstantRetrievalOverlay notes={notes} muses={muses} projects={projects} saving={busy} onClose={() => setInstantRetrievalOpen(false)} onOpenNote={(note) => { setInstantRetrievalOpen(false); onOpenNote(note); }} onSave={onSaveRetrieval} />}
     </div>
   );
 }
@@ -1111,10 +1036,9 @@ function MuseHomeCard({ muse, notes, pinned, onClick, onTogglePin }: { muse: Mus
   const preview = muse.description.trim() || notes.slice(0, 3).map((note) => noteLabel(note)).join('\n') || 'Add notes to build this Domain.';
   return (
     <div className="relative h-[286px]">
-      <button type="button" onClick={onClick} aria-label={`Open ${muse.title} Domain`} className="relative flex h-full w-full flex-col overflow-hidden rounded-lg border border-[#e0e0e0] bg-white px-6 pb-12 pt-6 text-left shadow-[0_2px_9px_rgba(0,0,0,0.14)] transition hover:-translate-y-0.5 hover:border-[#8fb1ff] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">
-        <strong className="line-clamp-2 text-base leading-snug text-[#222]">{muse.title}</strong>
-        <span className="mt-5 line-clamp-[8] overflow-hidden whitespace-pre-line text-sm leading-relaxed text-[#777]">{preview}</span>
-        <span className="absolute inset-x-6 bottom-4 flex items-center justify-between gap-3 pr-8 text-xs text-[#999]"><span>Domain</span><span className="shrink-0">{notes.length} {notes.length === 1 ? 'entry' : 'entries'}</span></span>
+      <button type="button" onClick={onClick} aria-label={`Open ${muse.title} Domain`} className="relative flex h-full w-full flex-col overflow-hidden rounded-md border border-[#e0e0e0] bg-[#f7f7f9] p-2 text-left shadow-[0_2px_9px_rgba(0,0,0,0.14)] transition hover:-translate-y-0.5 hover:border-[#8fb1ff] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">
+        <span className="block min-h-0 flex-1 overflow-hidden rounded bg-white px-5 py-5 text-sm leading-relaxed text-[#777]"><span className="line-clamp-[9] whitespace-pre-line">{preview}</span></span>
+        <span className="flex h-10 w-full shrink-0 items-center justify-between gap-3 px-3 pr-11 text-xs"><strong className="min-w-0 truncate font-semibold text-[#666]">{muse.title}</strong><span className="shrink-0 text-[#999]">{notes.length} {notes.length === 1 ? 'entry' : 'entries'}</span></span>
       </button>
       <button type="button" onClick={onTogglePin} aria-label={`${pinned ? 'Unpin' : 'Pin'} ${muse.title} Domain`} aria-pressed={pinned} title={pinned ? 'Unpin Domain' : 'Pin Domain'} className={`absolute bottom-3 right-3 z-10 flex h-8 w-8 items-center justify-center rounded-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${pinned ? 'text-[#477bea]' : 'text-[#aaa] hover:bg-white hover:text-[#477bea]'}`}><Pin className={`h-4 w-4 ${pinned ? 'fill-current' : ''}`} /></button>
     </div>
@@ -1135,7 +1059,7 @@ function ProjectPagesGrid({ project, onBack, onAddPage, onOpenPage, onEdit, onDe
     <main className="min-h-0 flex-1 overflow-y-auto rounded-2xl bg-white px-6 py-12 shadow-2xl sm:px-12 lg:px-20">
       {project.description && <p className="mx-auto mb-12 max-w-4xl text-center text-sm leading-relaxed text-[#888]">{project.description}</p>}
       <div className="mx-auto grid max-w-[1350px] grid-cols-1 gap-8 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-        {project.pages.map((page) => <button key={page.id} type="button" onClick={() => onOpenPage(page)} className="relative h-[300px] overflow-hidden rounded-lg border border-[#e1e1e1] bg-white px-6 pb-12 pt-6 text-left shadow-[0_2px_9px_rgba(0,0,0,0.14)] transition hover:-translate-y-0.5 hover:border-[#7ca2ff]"><strong className="line-clamp-2 text-base leading-snug">{page.title}</strong><span className="mt-4 block line-clamp-[9] overflow-hidden whitespace-pre-wrap text-sm leading-relaxed text-[#777]">{page.content || 'Start writing on this page.'}</span><span className="absolute inset-x-6 bottom-4 flex justify-between text-xs text-[#aaa]"><span>Page</span><span>{formatDate(page.updatedAt)}</span></span></button>)}
+        {project.pages.map((page) => <button key={page.id} type="button" onClick={() => onOpenPage(page)} className="relative h-[300px] overflow-hidden rounded-lg border border-[#e1e1e1] bg-[#f7f7f9] p-2 text-left shadow-[0_2px_9px_rgba(0,0,0,0.14)] transition hover:-translate-y-0.5 hover:border-[#7ca2ff]"><span className="block h-[244px] overflow-hidden rounded bg-white p-5"><strong className="block text-base">{page.title}</strong><span className="mt-4 block line-clamp-[9] whitespace-pre-wrap text-sm leading-relaxed text-[#777]">{page.content || 'Start writing on this page.'}</span></span><span className="absolute inset-x-4 bottom-3 flex justify-between text-xs text-[#aaa]"><span>Page</span><span>{formatDate(page.updatedAt)}</span></span></button>)}
         <button type="button" onClick={onAddPage} className="flex h-[300px] items-center justify-center rounded-lg border border-dashed border-[#c9d7fa] text-[#477bea] hover:bg-[#f8faff]"><FolderPlus className="h-9 w-9 stroke-[1.6]" /></button>
       </div>
       {!project.pages.length && <p className="mt-8 text-center text-sm text-[#999]">This project is ready for its first page.</p>}
@@ -1219,7 +1143,7 @@ function ProjectPageWorkspace({ project, page, notes, muses, projects, saving, o
         {contextOpen && <aside className="min-h-[420px] overflow-y-auto border-l border-[#dedede] bg-white p-4 lg:min-h-0">
           <h2 className="mb-4 text-center text-sm font-normal text-[#999]">Retrieved for this page</h2>
           <div className="space-y-4">
-            {surfacedNotes.map((note) => { const noteContent = splitNote(note); return <button key={note.id} type="button" onMouseEnter={() => setSelectedNoteId(note.id)} onFocus={() => setSelectedNoteId(note.id)} onClick={() => onOpenNote(note)} className={`relative block h-[190px] w-full overflow-hidden rounded-md border bg-white px-5 pb-11 pt-5 text-left shadow-sm transition hover:border-[#8fb1ff] ${selectedNoteId === note.id ? 'border-[#7ca2ff] ring-1 ring-[#7ca2ff]/30' : 'border-[#e0e0e0]'}`}><span className="float-right text-[11px] text-[#477bea]">note</span>{noteContent.hasTitle && <strong className="block max-w-[80%] line-clamp-2 text-sm leading-snug">{noteContent.title}</strong>}<span className="mt-3 block line-clamp-5 text-xs leading-relaxed text-[#777]">{notePreview(note)}</span><span className="absolute inset-x-5 bottom-4 flex items-center justify-between gap-3 text-[11px] text-[#aaa]"><span className="min-w-0 truncate">Domain: {cleanCategory(note.category) || 'Instant retrieval'}</span><span className="shrink-0">{formatDate(note.created_at)}</span></span></button>; })}
+            {surfacedNotes.map((note) => { const noteContent = splitNote(note); return <button key={note.id} type="button" onMouseEnter={() => setSelectedNoteId(note.id)} onFocus={() => setSelectedNoteId(note.id)} onClick={() => onOpenNote(note)} className={`block h-[190px] w-full overflow-hidden rounded-md border bg-[#f7f7f9] p-2 text-left shadow-sm transition hover:border-[#8fb1ff] ${selectedNoteId === note.id ? 'border-[#7ca2ff] ring-1 ring-[#7ca2ff]/30' : 'border-[#e0e0e0]'}`}><span className="block h-[142px] overflow-hidden rounded bg-white p-4"><span className="float-right text-[11px] text-[#477bea]">note</span>{noteContent.hasTitle && <strong className="block max-w-[80%] truncate text-sm">{noteContent.title}</strong>}<span className="mt-3 block line-clamp-4 text-xs leading-relaxed text-[#777]">{noteContent.body || notePreview(note)}</span></span><span className="mt-2 flex items-center justify-between px-2 text-[11px] text-[#aaa]"><span className="truncate">Domain: {cleanCategory(note.category) || 'Instant retrieval'}</span><span>{formatDate(note.created_at)}</span></span></button>; })}
             {!surfacedNotes.length && <p className="px-4 py-12 text-center text-sm leading-relaxed text-[#999]">Related notes will appear here as your knowledge base grows.</p>}
           </div>
         </aside>}
@@ -1328,7 +1252,7 @@ function LibraryNoteCard({ note, query, layout, onClick }: { note: Note; query: 
   const content = splitNote(note);
   const isGrid = layout === 'grid';
   const isLarge = layout === 'large';
-  return <button type="button" onClick={onClick} className={`relative overflow-hidden rounded-lg border border-[#e1e1e3] bg-white px-7 pb-14 pt-7 text-left shadow-[0_3px_12px_rgba(0,0,0,0.15)] transition hover:-translate-y-0.5 hover:border-[#7ca2ff] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${isGrid ? 'h-[360px]' : isLarge ? 'h-[440px]' : 'h-[360px]'}`}>{content.hasTitle && <strong className={`line-clamp-2 text-base leading-snug text-[#151515] ${isLarge ? 'text-lg' : ''}`}><HighlightedText text={content.title} query={query} /></strong>}<span className={`mt-4 block overflow-hidden whitespace-pre-wrap text-[15px] leading-[1.55] text-[#777] ${isGrid ? 'line-clamp-[9]' : isLarge ? 'line-clamp-[14]' : 'line-clamp-[9]'}`}><HighlightedText text={notePreview(note)} query={query} /></span><span className="absolute inset-x-7 bottom-4 flex items-center justify-between gap-3 text-xs text-[#aaa]"><span className="min-w-0 truncate">{cleanCategory(note.category) || 'Instant retrieval'}</span><span className="shrink-0">{formatDate(note.created_at)}</span></span><span className="sr-only">{isLarge ? 'large card' : layout} layout</span></button>;
+  return <button type="button" onClick={onClick} className={`relative overflow-hidden rounded-lg border border-[#e1e1e3] bg-[#f7f7f9] p-2 text-left shadow-[0_3px_12px_rgba(0,0,0,0.15)] transition hover:-translate-y-0.5 hover:border-[#7ca2ff] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${isGrid ? 'h-[360px]' : isLarge ? 'h-[440px]' : 'h-[360px]'}`}><span className={`block overflow-hidden rounded-md bg-white ${isGrid ? 'h-[280px] px-7 py-7' : isLarge ? 'h-[360px] px-8 py-8' : 'h-[280px] px-7 py-7'}`}>{content.hasTitle && <strong className={`block text-base leading-snug text-[#151515] ${isLarge ? 'line-clamp-4 text-lg' : 'line-clamp-3'}`}><HighlightedText text={content.title} query={query} /></strong>}<span className={`mt-4 block whitespace-pre-wrap text-[15px] leading-[1.55] text-[#777] ${isGrid ? 'line-clamp-[8]' : isLarge ? 'line-clamp-[12]' : 'line-clamp-[8]'}`}><HighlightedText text={content.body || notePreview(note)} query={query} /></span></span><span className="absolute inset-x-5 bottom-4 flex items-center justify-between gap-3 text-xs text-[#aaa]"><span className="min-w-0 truncate">{cleanCategory(note.category) || 'Instant retrieval'}</span><span className="shrink-0">{formatDate(note.created_at)}</span></span><span className="sr-only">{isLarge ? 'large card' : layout} layout</span></button>;
 }
 
 function MuseSelector({ muses, notesByMuse, selected, busy, onClose, onSave, onCreate, onEdit, onDelete }: {
@@ -1377,7 +1301,7 @@ function MuseDetail({ title, notes, isUnsorted, busy, onClose, onAddNote, onOpen
       {searchOpen && <label className="mx-auto mt-6 flex h-11 w-full max-w-md items-center rounded-xl bg-[#f7f7f9] px-4 shadow-sm"><Search className="mr-3 h-4 w-4 text-[#aaa]" /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${title}`} className="min-w-0 flex-1 bg-transparent text-sm text-[#222] outline-none placeholder:text-[#aaa]" /></label>}
       {!isUnsorted && <div className="absolute right-5 top-4 sm:right-8"><button type="button" onClick={() => setMenuOpen((value) => !value)} aria-label="Domain options" aria-expanded={menuOpen} className="flex h-10 w-10 items-center justify-center rounded-md text-[#222] hover:bg-[#f4f4f4]"><MoreHorizontal className="h-5 w-5" /></button>{menuOpen && <div className="absolute right-0 top-11 z-10 w-40 overflow-hidden rounded-lg border border-[#ddd] bg-white py-1 text-sm shadow-xl"><button type="button" onClick={() => { setMenuOpen(false); onEdit(); }} className="block w-full px-4 py-2.5 text-left hover:bg-[#f5f5f5]">Edit Domain</button><button type="button" disabled={busy} onClick={() => { setMenuOpen(false); onDelete(); }} className="block w-full px-4 py-2.5 text-left text-red-600 hover:bg-red-50">Delete Domain</button></div>}</div>}
       <div className={`mx-auto mt-14 grid max-w-[1510px] grid-cols-1 gap-8 sm:grid-cols-2 lg:gap-x-12 lg:gap-y-10 ${compact ? 'xl:grid-cols-4' : 'xl:grid-cols-3'}`}>
-        {visibleNotes.map((note) => { const content = splitNote(note); return <button key={note.id} type="button" onClick={() => onOpenNote(note)} className="relative h-[360px] min-w-0 overflow-hidden rounded-lg border border-[#e1e1e3] bg-white px-7 pb-14 pt-7 text-left shadow-[0_3px_12px_rgba(0,0,0,0.15)] transition hover:-translate-y-0.5 hover:border-[#7ca2ff] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">{content.hasTitle && <strong className="line-clamp-2 text-base leading-snug text-[#151515]">{content.title}</strong>}<span className="mt-4 block line-clamp-[9] overflow-hidden whitespace-pre-wrap text-[15px] leading-[1.55] text-[#777]">{notePreview(note)}</span><span className="absolute bottom-4 right-7 text-xs text-[#aaa]">{formatDate(note.created_at)}</span></button>; })}
+        {visibleNotes.map((note) => { const content = splitNote(note); return <button key={note.id} type="button" onClick={() => onOpenNote(note)} className="relative h-[360px] min-w-0 overflow-hidden rounded-lg border border-[#e1e1e3] bg-[#f7f7f9] p-2 text-left shadow-[0_3px_12px_rgba(0,0,0,0.15)] transition hover:-translate-y-0.5 hover:border-[#7ca2ff] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]"><span className="block h-[280px] overflow-hidden rounded-md bg-white px-7 py-7">{content.hasTitle && <strong className="block line-clamp-3 text-base leading-snug text-[#151515]">{content.title}</strong>}<span className="mt-4 block whitespace-pre-wrap text-[15px] leading-[1.55] text-[#777] line-clamp-[8]">{content.body || notePreview(note)}</span></span><span className="absolute bottom-4 right-5 text-xs text-[#aaa]">{formatDate(note.created_at)}</span></button>; })}
         <button type="button" onClick={onAddNote} aria-label={`Add a note to ${title}`} className="relative flex h-[360px] items-start rounded-lg border border-[#e1e1e3] bg-white p-8 text-[#477bea] shadow-[0_3px_12px_rgba(0,0,0,0.15)] transition hover:-translate-y-0.5 hover:border-[#a9c0f5] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]"><span className="flex items-center gap-2"><Plus className="h-5 w-5" /> Add</span><span className="absolute inset-x-5 bottom-6 text-center text-sm italic text-[#b4b4b8]">You can always add more</span></button>
       </div>
       {!visibleNotes.length && query.trim() && <p className="mt-8 text-center text-sm text-[#999]">No notes contain “{query.trim()}”.</p>}
@@ -1513,14 +1437,6 @@ function RelatedNotePanel({ note, relevance, focusText = '', onClose, onOpenFull
   onClose: () => void;
   onOpenFull: () => void;
 }) {
-  const [previouslyResolved, setPreviouslyResolved] = useState(false);
-  useEffect(() => {
-    let active = true;
-    loadCardDecisions(note.id).then((loaded) => {
-      if (active) setPreviouslyResolved(loaded.incoming.some((decision) => decision.choice === 'solved' || decision.choice === 'helped'));
-    }).catch(() => undefined);
-    return () => { active = false; };
-  }, [note.id]);
   const content = splitNote(note);
   const reason = relevance?.explanation.trim() ?? '';
   // A quote can come from the title, which the body below does not show.
@@ -1544,7 +1460,7 @@ function RelatedNotePanel({ note, relevance, focusText = '', onClose, onOpenFull
       <article className="mx-auto max-w-2xl">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <h2 className="min-w-0 flex-1 break-words text-2xl font-semibold text-[#171717]">{content.title || 'Untitled note'}</h2>
-          <div className="flex shrink-0 items-center gap-2">{previouslyResolved && <span className="rounded bg-[#e6f4ea] px-2 py-1 text-[10px] font-medium text-[#1e7b3c]">Previously solved</span>}{relation && <span className={`rounded px-2 py-1 text-[10px] font-medium ${relation.className}`}>{relation.label}</span>}</div>
+          {relation && <span className={`shrink-0 rounded px-2 py-1 text-[10px] font-medium ${relation.className}`}>{relation.label}</span>}
         </div>
         {content.body && <div className="mt-8 text-base leading-[1.7] text-[#2d2d2d]"><RetrievalMatchedBody text={content.body} matchedText={matchedText} label={focusInBody ? 'Quoted in your card' : 'Used for retrieval'} /></div>}
       </article>
@@ -1597,11 +1513,10 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
   const [selectedInsightIndex, setSelectedInsightIndex] = useState(0);
   const [selectedSectionId, setSelectedSectionId] = useState<string | null>(null);
   const aiMode = useAiMode();
-  const bodyRef = useRef<HTMLDivElement>(null);
+  const bodyRef = useRef<HTMLTextAreaElement>(null);
   const latestSaveRef = useRef(onUpdate);
   latestSaveRef.current = onUpdate;
   const muse = cleanCategory(note.category) || 'Instant retrieval';
-  const isOrphan = muse.toLowerCase() === ORPHANS_MUSE.toLowerCase();
   const rawText = title.trim() && body.trim() ? `${title.trim()}\n\n${body.trim()}` : title.trim() || body.trim();
 
   useEffect(() => {
@@ -1662,10 +1577,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
       setRetrievalLoading(false);
       return;
     }
-    if (!searchRequested || isSampleGuide(requestNote) || isOrphan) {
-      if (isSampleGuide(requestNote) || isOrphan) setRetrievalLoading(false);
-      return;
-    }
+    if (!searchRequested || isSampleGuide(requestNote)) return;
     setRetrievalError(''); setRetrievalProgress(null);
     // Empty retrievals and caches whose notes no longer exist are not useful
     // completed searches. Retry instead of leaving the panel blank forever.
@@ -1706,10 +1618,10 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
       active = false;
       if (!agentsFinished) cancel.abort();
     };
-  }, [isOrphan, note.id, retrievalAttempt, retrievalMode, searchRequested, userId]);
+  }, [note.id, retrievalAttempt, retrievalMode, searchRequested, userId]);
 
   const requestReretrieval = (mode: 'similar' | 'relevant' = retrievalMode) => {
-    if (isGuide || isOrphan) return;
+    if (isGuide) return;
     setRetrievalMode(mode);
     setSearchRequested(true);
     setRetrievalAttempt((attempt) => attempt + 1);
@@ -1730,7 +1642,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
     const saved = readSavedRetrieval(userId, item);
     return Boolean(saved?.search.results.some((result) => result.note_id === note.id)
       || saved?.search.insights?.some((itemInsight) => itemInsight.note_ids.includes(note.id)));
-  }), [allNotes, note.id, userId]);
+  }), [allNotes, note.id, retrieval, userId]);
   const panelNote = panelNoteId ? allNotes.find((item) => item.id === panelNoteId) ?? null : null;
   const displayedBody = body || note.raw_text;
   const noteSections = useMemo(() => noteSectionsFor(displayedBody, retrieval?.sections), [displayedBody, retrieval]);
@@ -1792,24 +1704,9 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
       const view: CardView = { id: `from:${decision.fromNoteId}:${decision.cardId}`, item: decision.insight, index: -1, decision, kind: 'solution', span, section: sectionAtOffset(span.start), fromNoteId: decision.fromNoteId };
       return [view];
     });
-    const sectionResolutionKey = (section: NoteSection | null) => {
-      const normalized = section?.text.replace(/\s+/g, ' ').trim().toLowerCase() ?? '';
-      return normalized ? `${stableHash(normalized)}:${normalized.length}` : null;
-    };
-    const resolvedSectionKeys = new Set([
-      ...views.map((view) => view.decision),
-      ...incomingDecisions,
-    ].filter((decision): decision is CardDecision => Boolean(decision && (decision.choice === 'solved' || decision.choice === 'helped')))
-      .map((decision) => decision.targetSectionKey).filter((key): key is string => Boolean(key)));
     const actedSpans = [...views.filter((view) => isActedCard(view.decision) && view.span), ...incoming].map((view) => view.span!);
     const overlapsActed = (span: { start: number; end: number }) => actedSpans.some((taken) => span.start < taken.end && taken.start < span.end);
-    const shown = views.filter((view) => {
-      if (view.decision?.choice === 'rejected') return false;
-      if (isPendingCard(view.decision) && view.span && overlapsActed(view.span)) return false;
-      const key = sectionResolutionKey(view.section);
-      if (isPendingCard(view.decision) && (view.kind === 'solution' || view.kind === 'helps') && key && resolvedSectionKeys.has(key)) return false;
-      return true;
-    });
+    const shown = views.filter((view) => view.decision?.choice !== 'rejected' && !(isPendingCard(view.decision) && view.span && overlapsActed(view.span)));
 
     const highlights: { start: number; end: number; index: number }[] = [];
     const overlays: { type: 'chip' | 'block'; at: number; view: (typeof views)[number] }[] = [];
@@ -1856,23 +1753,8 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
    */
   const decide = (view: (typeof cardLayout.views)[number], choice: CardChoice | null, text?: string) => {
     const previous = decisions[view.id];
-    const acceptsAnswer = choice === 'solved' || choice === 'helped';
-    // Outbound lessons resolve a cited situation; inbound answers resolve the
-    // current section. The text fingerprint stays stable across searches even
-    // when a model-generated section id changes.
-    const outbound = view.item.direction === 'outbound';
-    const target = acceptsAnswer ? (outbound ? view.item.problem?.note_id ?? view.item.note_ids[0] : note.id) : undefined;
-    const targetPassage = outbound ? view.item.problem?.text ?? view.item.anchor ?? view.item.action : view.section?.text ?? view.item.anchor;
-    const normalizedTarget = targetPassage?.replace(/\s+/g, ' ').trim().toLowerCase() ?? '';
-    const targetSectionKey = target && normalizedTarget ? `${stableHash(normalizedTarget)}:${normalizedTarget.length}` : undefined;
-    const alreadyResolved = targetSectionKey && [
-      ...Object.entries(decisions).filter(([id]) => id !== view.id).map(([, decision]) => decision),
-      ...incomingDecisions,
-    ].some((decision) => decision.targetNoteId === target && decision.targetSectionKey === targetSectionKey && (decision.choice === 'solved' || decision.choice === 'helped'));
-    if (acceptsAnswer && alreadyResolved) {
-      setSaveState('error');
-      return;
-    }
+    // Solving an earlier note's problem also marks that earlier note.
+    const target = choice === 'solved' && view.item.direction === 'outbound' ? view.item.problem?.note_id : undefined;
     const next: CardDecision | null = choice
       ? {
         choice,
@@ -1881,7 +1763,6 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
         insight: view.item,
         ...(text !== undefined ? { text } : {}),
         ...(target ? { targetNoteId: target } : {}),
-        ...(targetSectionKey ? { targetSectionKey } : {}),
       }
       : null;
     const apply = (decision: CardDecision | null | undefined) => setDecisions((current) => {
@@ -2002,8 +1883,19 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
   });
 
   const applyReadingFormat = (kind: 'bold' | 'italic' | 'h1' | 'h2' | 'h3' | 'body' | 'bullet' | 'number') => {
-    const field = bodyRef.current;
-    if (field) applyRichTextFormat(field, kind, setBody);
+    const field = bodyRef.current; if (!field) return;
+    const start = field.selectionStart; const end = field.selectionEnd; const selection = body.slice(start, end);
+    let replacement = selection;
+    if (kind === 'bold') replacement = `**${selection || 'bold text'}**`;
+    if (kind === 'italic') replacement = `*${selection || 'italic text'}*`;
+    if (kind === 'h1') replacement = `# ${selection || 'Heading'}`;
+    if (kind === 'h2') replacement = `## ${selection || 'Heading'}`;
+    if (kind === 'h3') replacement = `### ${selection || 'Heading'}`;
+    if (kind === 'body') replacement = selection.replace(/^#{1,3}\s+/gm, '');
+    if (kind === 'bullet') replacement = (selection || 'List item').split('\n').map((line) => `• ${line.replace(/^[-•]\s*/, '')}`).join('\n');
+    if (kind === 'number') replacement = (selection || 'List item').split('\n').map((line, index) => `${index + 1}. ${line.replace(/^\d+\.\s*/, '')}`).join('\n');
+    setBody(`${body.slice(0, start)}${replacement}${body.slice(end)}`);
+    requestAnimationFrame(() => { field.focus(); field.setSelectionRange(start, start + replacement.length); });
   };
 
   const openDate = () => setSearchRequest({ query: '', filter: { kind: 'date', value: localDateKey(note.created_at), label: fullNoteDate(note.created_at) } });
@@ -2072,16 +1964,11 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
       ...inserts.map((overlay) => ({ at: overlay.at, overlay })),
     ].sort((x, y) => x.at - y.at || ('mark' in x ? -1 : 1));
     const nodes: React.ReactNode[] = [];
-    const formattedFragment = (text: string, absoluteStart: number, key: string) => {
-      const atLineStart = absoluteStart === 0 || displayedBody[absoluteStart - 1] === '\n';
-      const visible = atLineStart ? text.replace(/^(?:#{1,3}\s+|[-+*•]\s+|\d+\.\s+)/, '') : text;
-      return <InlineNoteFormatting key={key} text={visible} />;
-    };
     let cursor = section.start;
     events.forEach((event, position) => {
       // Anything placed inside a passage already drawn goes just after it.
       const at = Math.max(event.at, cursor);
-      if (at > cursor) nodes.push(formattedFragment(displayedBody.slice(cursor, at), cursor, `${section.id}-t${position}`));
+      if (at > cursor) nodes.push(displayedBody.slice(cursor, at));
       cursor = at;
       if ('overlay' in event && event.overlay) {
         nodes.push(renderOverlay(event.overlay, `${section.id}-o${position}`));
@@ -2105,10 +1992,10 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
         aria-pressed={active}
         title="See what your notes say about this"
         className={`cursor-pointer rounded-sm px-0.5 text-inherit underline decoration-2 underline-offset-4 [box-decoration-break:clone] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${active ? highlightStyle.active : `${highlightStyle.idle} hover:brightness-[0.98]`}`}
-      ><InlineNoteFormatting text={displayedBody.slice(mark.start, mark.end).replace(/\*\*/g, '').replace(/(^|\n)#{1,3}\s+/g, '$1')} /><span className={`ml-1 inline-block rounded px-1 align-[1px] text-[10px] font-medium leading-4 ${style.badge}`}>{style.label}</span></mark>);
+      >{displayedBody.slice(mark.start, mark.end)}<span className={`ml-1 inline-block rounded px-1 align-[1px] text-[10px] font-medium leading-4 ${style.badge}`}>{style.label}</span></mark>);
       cursor = mark.end;
     });
-    if (cursor < section.end) nodes.push(formattedFragment(displayedBody.slice(cursor, section.end), cursor, `${section.id}-tail`));
+    if (cursor < section.end) nodes.push(displayedBody.slice(cursor, section.end));
     return <span className="whitespace-pre-wrap break-words">{nodes}</span>;
   };
 
@@ -2130,7 +2017,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
               {usedInNotes.map((item) => <button key={item.id} role="menuitem" type="button" onClick={() => { setUsedInMenuOpen(false); void leaveWorkspace(item, false); }} className="block w-full truncate px-4 py-2.5 text-left text-sm text-[#333] hover:bg-[#edf3ff] hover:text-[#315fc5]">{noteLabel(item)}</button>)}
             </div>}
           </div>}
-          <button type="button" disabled={retrievalLoading || isGuide || isOrphan} onClick={() => requestReretrieval()} aria-label="Reload related notes" title={isOrphan ? 'Choose a Domain before retrieving notes' : isGuide ? 'Sample guides are not searched' : 'Reload related notes'} className="flex h-10 w-10 items-center justify-center rounded-md border border-[#dedede] bg-white shadow-sm hover:border-[#adc3ff] hover:text-[#477bea] disabled:cursor-wait disabled:opacity-50 sm:h-9 sm:w-9"><RefreshCw className={`h-4 w-4 ${retrievalLoading ? 'animate-spin' : ''}`} /></button>
+          <button type="button" disabled={retrievalLoading || isGuide} onClick={() => requestReretrieval()} aria-label="Reload related notes" title="Reload related notes" className="flex h-10 w-10 items-center justify-center rounded-md border border-[#dedede] bg-white shadow-sm hover:border-[#adc3ff] hover:text-[#477bea] disabled:cursor-wait disabled:opacity-50 sm:h-9 sm:w-9"><RefreshCw className={`h-4 w-4 ${retrievalLoading ? 'animate-spin' : ''}`} /></button>
           <button type="button" disabled={!newerNote} onClick={() => newerNote && void leaveWorkspace(newerNote, false)} aria-label="Newer note" title="Newer note" className="hidden h-9 w-9 items-center justify-center rounded-md hover:bg-[#f4f4f4] disabled:opacity-25 sm:flex"><ChevronLeft className="h-4 w-4" /></button>
           <button type="button" disabled={!olderNote} onClick={() => olderNote && void leaveWorkspace(olderNote, false)} aria-label="Older note" title="Older note" className="hidden h-9 w-9 items-center justify-center rounded-md hover:bg-[#f4f4f4] disabled:opacity-25 sm:flex"><ChevronRight className="h-4 w-4" /></button>
           <button type="button" onClick={() => setMenuOpen((open) => !open)} aria-label="Note options" aria-expanded={menuOpen} className="flex h-10 w-10 items-center justify-center rounded-md hover:bg-[#f4f4f4] sm:h-9 sm:w-9"><MoreHorizontal className="h-5 w-5" /></button>
@@ -2146,8 +2033,11 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
             {!summaryOpen && <button type="button" onClick={() => setSummaryOpen(true)} aria-controls="note-suggestions-panel" className="rounded-md border border-[#dedede] bg-white px-3 py-1.5 text-xs text-[#555] shadow-sm hover:border-[#adc3ff] hover:text-[#477bea] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">Show suggestions</button>}
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-24 pt-14 sm:px-12 sm:pt-12 xl:px-[8%]">
-            {editing ? <div className="mx-auto max-w-3xl"><input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} aria-label="Note title" placeholder="Title (optional)" className="w-full bg-transparent text-2xl font-semibold outline-none placeholder:font-normal placeholder:text-[#c4c4c6]" /><RichTextBodyEditor editorRef={bodyRef} value={body} onChange={setBody} placeholder="Start writing…" className="mt-10 min-h-[520px] w-full bg-transparent text-base leading-[1.7] outline-none [&_h1]:my-3 [&_h1]:text-2xl [&_h1]:font-semibold [&_h2]:my-3 [&_h2]:text-xl [&_h2]:font-semibold [&_h3]:my-2 [&_h3]:text-lg [&_h3]:font-semibold [&_ol]:my-2 [&_ol]:list-decimal [&_ol]:pl-6 [&_p]:min-h-[1.7em] [&_ul]:my-2 [&_ul]:list-disc [&_ul]:pl-6" /></div> : <article className="relative mx-auto max-w-3xl" onDoubleClick={() => { setEditing(true); requestAnimationFrame(() => bodyRef.current?.focus()); }} title="Double-click to edit">{title.trim() && <h1 className="break-words px-2 py-1 text-2xl font-semibold">{title}</h1>}<div className="mt-2 flex flex-wrap gap-x-3 px-2 text-xs text-[#999]" onDoubleClick={(event) => event.stopPropagation()}><NoteDomainPicker category={note.category} muses={muses} saving={saving} onChange={onChangeDomain} showPrefix /><button type="button" onClick={openDate} className="hover:text-[#477bea]">{fullNoteDate(note.created_at)}</button></div>
+            {editing ? <div className="mx-auto max-w-3xl"><input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} aria-label="Note title" placeholder="Title (optional)" className="w-full bg-transparent text-2xl font-semibold outline-none placeholder:font-normal placeholder:text-[#c4c4c6]" /><textarea ref={bodyRef} value={body} onChange={(event) => setBody(event.target.value)} aria-label="Note text" className="mt-10 min-h-[520px] w-full resize-none bg-transparent text-base leading-[1.7] outline-none" /></div> : <article className="relative mx-auto max-w-3xl" onDoubleClick={() => { setEditing(true); requestAnimationFrame(() => bodyRef.current?.focus()); }} title="Double-click to edit">{title.trim() && <h1 className="break-words px-2 py-1 text-2xl font-semibold">{title}</h1>}<div className="mt-2 flex flex-wrap gap-x-3 px-2 text-xs text-[#999]" onDoubleClick={(event) => event.stopPropagation()}><NoteDomainPicker category={note.category} muses={muses} saving={saving} onChange={onChangeDomain} showPrefix /><button type="button" onClick={openDate} className="hover:text-[#477bea]">{fullNoteDate(note.created_at)}</button></div>
               <div className="mt-9 flex w-full gap-4 rounded-md px-2 py-2 text-left text-base leading-[1.7]">
+                {noteSections.length > 1 && <nav aria-label="Note sections" onClick={(event) => event.stopPropagation()} className="sticky top-2 flex h-fit w-5 shrink-0 flex-col gap-2 py-1">
+                  {noteSections.map((section) => <button key={section.id} type="button" onClick={() => { selectSection(section.id); document.getElementById(`note-${section.id}`)?.scrollIntoView({ block: 'center', behavior: 'smooth' }); }} aria-label={`Select section ${section.index + 1}${section.label ? `: ${section.label}` : ''}`} title={section.label || undefined} aria-pressed={selectedSectionId === section.id} className={`h-8 rounded-full transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${selectedSectionId === section.id ? 'w-2.5 bg-[#666]' : 'w-1.5 bg-[#d2d2d5] hover:w-2.5 hover:bg-[#888]'}`} />)}
+                </nav>}
                 <div className="min-w-0 flex-1 space-y-7">
                   {noteSections.length ? noteSections.map((section) => <section key={section.id} id={`note-${section.id}`} tabIndex={0} aria-label={`Section ${section.index + 1}`} aria-current={selectedSectionId === section.id ? 'true' : undefined} onClick={() => selectSection(section.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectSection(section.id); } }} className={`cursor-text scroll-mt-20 border-l-[3px] pl-4 outline-none transition hover:border-[#888] focus-visible:ring-2 focus-visible:ring-[#477bea]/30 ${selectedSectionId === section.id ? 'border-[#666]' : 'border-[#d2d2d5]'}`}>{renderSectionContent(section)}</section>) : <span className="text-left text-[#999]">Double-click to start writing.</span>}
                 </div>
@@ -2174,8 +2064,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
           </header>
 
           <div className="min-h-0 flex-1 overflow-y-auto px-4 py-5 sm:px-6">
-            {isOrphan ? <div className="flex min-h-[360px] items-center justify-center text-center"><div className="max-w-sm rounded-xl border border-[#f0d9a8] bg-[#fff8e8] p-6"><h2 className="font-semibold text-[#6f5100]">Choose a Domain first</h2><p className="mt-2 text-sm leading-relaxed text-[#806b35]">Notes in Orphans must be placed in a Domain before Ocreda can retrieve connections for them.</p><div className="mt-5"><NoteDomainPicker category={note.category} muses={muses.filter((item) => item.title.toLowerCase() !== ORPHANS_MUSE.toLowerCase())} saving={saving} onChange={onChangeDomain} /></div></div></div>
-              : retrievalLoading ? <div className="flex min-h-[360px] items-center justify-center gap-3 text-sm text-[#777]" role="status"><Loader2 className="h-5 w-5 animate-spin text-[#477bea]" /> Finding related notes{retrievalProgress?.agents_total ? ` · ${retrievalProgress.agents_done}/${retrievalProgress.agents_total}` : '…'}</div>
+            {retrievalLoading ? <div className="flex min-h-[360px] items-center justify-center gap-3 text-sm text-[#777]" role="status"><Loader2 className="h-5 w-5 animate-spin text-[#477bea]" /> Finding related notes{retrievalProgress?.agents_total ? ` · ${retrievalProgress.agents_done}/${retrievalProgress.agents_total}` : '…'}</div>
               : retrievalError ? <div className="flex min-h-[360px] items-center justify-center text-center" role="alert"><div><h2 className="text-lg font-semibold">Could not retrieve notes</h2><p className="mt-3 max-w-sm text-sm leading-relaxed text-[#777]">{retrievalError}</p><button type="button" onClick={() => requestReretrieval('relevant')} className="mt-5 rounded-md bg-[#477bea] px-4 py-2 text-sm text-white hover:bg-[#3d6ed7]">Try again</button></div></div>
               : <div className="mx-auto max-w-2xl">
                 <section aria-labelledby="suggestions-heading">
@@ -2225,7 +2114,7 @@ function RetrievedNoteOverlay({ note, muses, saving, onClose, onAddNote, onImpor
   const [editing, setEditing] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
-  const bodyRef = useRef<HTMLDivElement>(null);
+  const bodyRef = useRef<HTMLTextAreaElement>(null);
   const rawText = title.trim() && body.trim() ? `${title.trim()}\n\n${body.trim()}` : title.trim() || body.trim();
   const muse = cleanCategory(note.category) || 'Instant retrieval';
   const usedMuses = useMemo(() => {
@@ -2244,8 +2133,19 @@ function RetrievedNoteOverlay({ note, muses, saving, onClose, onAddNote, onImpor
 
   const applyFormat = (kind: 'bold' | 'italic' | 'h1' | 'h2' | 'h3' | 'body' | 'bullet' | 'number') => {
     setEditing(true);
-    const field = bodyRef.current;
-    if (field) applyRichTextFormat(field, kind, setBody);
+    const field = bodyRef.current; if (!field) return;
+    const start = field.selectionStart; const end = field.selectionEnd; const selection = body.slice(start, end);
+    let replacement = selection;
+    if (kind === 'bold') replacement = `**${selection || 'bold text'}**`;
+    if (kind === 'italic') replacement = `*${selection || 'italic text'}*`;
+    if (kind === 'h1') replacement = `# ${selection || 'Heading'}`;
+    if (kind === 'h2') replacement = `## ${selection || 'Heading'}`;
+    if (kind === 'h3') replacement = `### ${selection || 'Heading'}`;
+    if (kind === 'body') replacement = selection.replace(/^#{1,3}\s+/gm, '');
+    if (kind === 'bullet') replacement = (selection || 'List item').split('\n').map((line) => `• ${line.replace(/^[-•]\s*/, '')}`).join('\n');
+    if (kind === 'number') replacement = (selection || 'List item').split('\n').map((line, index) => `${index + 1}. ${line.replace(/^\d+\.\s*/, '')}`).join('\n');
+    setBody(`${body.slice(0, start)}${replacement}${body.slice(end)}`);
+    requestAnimationFrame(() => { field.focus(); field.setSelectionRange(start, start + replacement.length); });
   };
 
   const openDate = () => onSearch({ query: '', filter: { kind: 'date', value: localDateKey(note.created_at), label: fullNoteDate(note.created_at) } });
@@ -2266,9 +2166,7 @@ function RetrievedNoteOverlay({ note, muses, saving, onClose, onAddNote, onImpor
           <section className="relative flex min-h-0 flex-col overflow-hidden bg-white shadow-[4px_0_14px_rgba(0,0,0,0.14)]">
             <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-28 pt-12 sm:px-16 lg:px-[11%] lg:pt-20">
               <input value={title} readOnly={!editing} onClick={() => setEditing(true)} onChange={(event) => setTitle(event.target.value)} aria-label="Retrieved note title" placeholder={editing ? 'Title (optional)' : ''} className={`w-full bg-transparent text-2xl font-semibold outline-none placeholder:font-normal placeholder:text-[#c4c4c6] ${editing ? 'cursor-text' : 'cursor-pointer'}`} />
-              {editing
-                ? <RichTextBodyEditor editorRef={bodyRef} value={body} onChange={setBody} placeholder="Start writing…" className="mt-8 min-h-[540px] w-full bg-transparent text-base leading-[1.7] outline-none [&_h1]:my-3 [&_h1]:text-2xl [&_h1]:font-semibold [&_h2]:my-3 [&_h2]:text-xl [&_h2]:font-semibold [&_h3]:my-2 [&_h3]:text-lg [&_h3]:font-semibold [&_ol]:my-2 [&_ol]:list-decimal [&_ol]:pl-6 [&_p]:min-h-[1.7em] [&_ul]:my-2 [&_ul]:list-disc [&_ul]:pl-6" />
-                : <div role="button" tabIndex={0} onClick={() => setEditing(true)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') setEditing(true); }} className="mt-8 min-h-[540px] w-full cursor-text text-base leading-[1.7] outline-none"><FormattedNoteBody text={body} /></div>}
+              <textarea ref={bodyRef} value={body} readOnly={!editing} onClick={() => setEditing(true)} onChange={(event) => setBody(event.target.value)} aria-label="Retrieved note text" className={`mt-8 min-h-[540px] w-full resize-none bg-transparent text-base leading-[1.7] outline-none ${editing ? 'cursor-text' : 'cursor-pointer'}`} />
             </div>
             <ReadingFormatBar onFormat={applyFormat} onDone={() => setEditing(false)} editing={editing} />
             <span className="absolute bottom-3 right-5 text-[11px] text-[#999]">{saving || saveState === 'saving' ? 'Saving…' : saveState === 'saved' ? 'Saved' : saveState === 'error' ? 'Save failed' : ''}</span>
@@ -2276,7 +2174,7 @@ function RetrievedNoteOverlay({ note, muses, saving, onClose, onAddNote, onImpor
           <aside className="relative min-h-0 overflow-y-auto bg-[#f7f7f9] px-6 pb-8 pt-16">
             <div className="absolute right-4 top-3">
               <button type="button" onClick={() => setMenuOpen((open) => !open)} aria-label="Retrieved note options" aria-expanded={menuOpen} className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-white"><MoreHorizontal className="h-5 w-5" /></button>
-              {menuOpen && <div className="absolute right-0 top-10 z-10 w-40 overflow-hidden rounded-lg border border-[#ddd] bg-white py-1 text-sm shadow-xl"><button type="button" onClick={() => { setMenuOpen(false); setEditing(true); requestAnimationFrame(() => bodyRef.current?.focus()); }} className="block w-full px-4 py-2.5 text-left hover:bg-[#f5f5f5]">Edit note</button><button type="button" disabled={saving} onClick={() => { setMenuOpen(false); void onDelete(note); }} className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-red-600 hover:bg-red-50"><Trash2 className="h-4 w-4" /> Delete note</button></div>}
+              {menuOpen && <div className="absolute right-0 top-10 z-10 w-40 overflow-hidden rounded-lg border border-[#ddd] bg-white py-1 text-sm shadow-xl"><button type="button" onClick={() => { setMenuOpen(false); setEditing(true); bodyRef.current?.focus(); }} className="block w-full px-4 py-2.5 text-left hover:bg-[#f5f5f5]">Edit note</button><button type="button" disabled={saving} onClick={() => { setMenuOpen(false); void onDelete(note); }} className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-red-600 hover:bg-red-50"><Trash2 className="h-4 w-4" /> Delete note</button></div>}
             </div>
             <button type="button" onClick={openDate} className="block rounded px-1 py-1 text-left text-sm text-[#777] hover:bg-white hover:text-[#477bea]">{fullNoteDate(note.created_at)}</button>
             <button type="button" onClick={openMuse} className="mt-5 block rounded px-1 py-1 text-left text-sm hover:bg-white"><span className="font-medium">Domain:</span> <span className="text-[#777]">{muse}</span></button>
@@ -2300,7 +2198,7 @@ function InstantRetrievalCard({ onClick, tall = false }: { onClick: () => void; 
 }
 
 function KnowledgeSearchOverlay({ request, notes, muses, projects, hideProjectColumn = false, onClose, onOpenPage, onOpenNote, onInstantRetrieval }: {
-  request: KnowledgeSearchRequest; notes: Note[]; muses: MuseMeta[]; projects: CortexProject[]; hideProjectColumn?: boolean; onClose: () => void; onOpenPage: (project: CortexProject, page: ProjectPage) => void; onOpenNote: (note: Note) => void; onInstantRetrieval?: () => void;
+  request: KnowledgeSearchRequest; notes: Note[]; muses: MuseMeta[]; projects: CortexProject[]; hideProjectColumn?: boolean; onClose: () => void; onOpenPage: (project: CortexProject, page: ProjectPage) => void; onOpenNote: (note: Note) => void; onInstantRetrieval: () => void;
 }) {
   const [query, setQuery] = useState(request.query);
   const [filter, setFilter] = useState<KnowledgeFilter | undefined>(request.filter);
@@ -2331,8 +2229,8 @@ function KnowledgeSearchOverlay({ request, notes, muses, projects, hideProjectCo
       <div className="mx-auto mt-12 flex h-[calc(100%-3rem)] max-w-[1640px] flex-col overflow-hidden rounded-[20px] bg-white shadow-2xl sm:mt-16 sm:h-[calc(100%-4rem)]">
         <div className="flex h-20 shrink-0 items-center border-b border-[#ddd] px-7 sm:px-10"><Search className="mr-4 h-6 w-6 shrink-0 text-[#aaa]" /><input autoFocus value={query} onChange={(event) => changeQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'Escape') onClose(); }} placeholder="Search notes, pages, and Domains" className="h-full min-w-0 flex-1 bg-transparent text-xl outline-none placeholder:text-[#b3b3b3] sm:text-2xl" />{filter && <button type="button" onClick={() => { setFilter(undefined); setQuery(''); }} className="rounded-full bg-[#edf3ff] px-3 py-1.5 text-xs text-[#477bea]">Clear {filter.kind === 'muse' ? 'domain' : filter.kind}</button>}</div>
         {!query.trim() && !filter ? <div className="min-h-0 flex-1 overflow-y-auto px-10 py-12 sm:px-16"><p className="text-sm text-[#aaa]">Recent</p><div className="mt-5 max-w-2xl space-y-1">{recentTerms.map((term) => <button key={term} type="button" onClick={() => setQuery(term)} className="block w-full rounded-lg px-1 py-3 text-left text-base text-[#555] hover:bg-[#f6f6f6] hover:px-3">{term}</button>)}</div></div> : <div className={`grid min-h-0 flex-1 overflow-y-auto lg:overflow-hidden ${showProjectColumn ? 'lg:grid-cols-[450px_minmax(0,1fr)]' : 'lg:grid-cols-1'}`}>
-          {showProjectColumn && <aside className="border-b border-[#ddd] px-7 py-10 lg:overflow-y-auto lg:border-b-0 lg:border-r sm:px-10"><p className="mb-7 text-sm text-[#aaa]">Found in project pages</p><div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-1">{matchingPages.map(({ project, page }) => <button key={`${project.id}-${page.id}`} type="button" onClick={() => onOpenPage(project, page)} className="relative min-h-[300px] rounded-lg border border-[#e3e3e3] bg-white p-7 text-left shadow-[0_2px_8px_rgba(0,0,0,0.14)] transition hover:-translate-y-0.5 hover:border-[#8fb1ff]"><strong className="block text-base"><HighlightedText text={page.title} query={query} /></strong><p className="mt-5 line-clamp-[10] whitespace-pre-wrap text-sm leading-relaxed text-[#777]"><HighlightedText text={page.content || 'Empty page'} query={query} /></p><div className="absolute inset-x-4 bottom-4 flex justify-between text-xs text-[#aaa]"><span>{project.title}</span><span>{formatDate(page.updatedAt)}</span></div></button>)}{!matchingPages.length && <p className="text-sm text-[#999] sm:col-span-2 lg:col-span-1">No project page contains this search.</p>}{onInstantRetrieval && <InstantRetrievalCard onClick={onInstantRetrieval} tall />}</div></aside>}
-          <section className="min-h-0 px-7 py-10 lg:overflow-y-auto sm:px-12"><p className="mb-7 text-sm text-[#aaa]">{heading}</p><div className={`grid gap-7 ${showProjectColumn ? 'xl:grid-cols-2' : 'lg:grid-cols-2 xl:grid-cols-3'}`}>{filteredNotes.map((item) => { const content = splitNote(item); const preview = notePreview(item); return <button key={item.id} type="button" onClick={() => onOpenNote(item)} className="relative min-h-[250px] rounded-lg border border-[#e3e3e3] bg-white px-7 pb-14 pt-7 text-left shadow-[0_2px_8px_rgba(0,0,0,0.14)] transition hover:-translate-y-0.5 hover:border-[#8fb1ff]">{content.hasTitle && <strong className="block line-clamp-2 text-base leading-snug"><HighlightedText text={content.title} query={filter ? '' : query} /></strong>}<p className="mt-4 line-clamp-7 overflow-hidden text-sm leading-relaxed text-[#777]"><HighlightedText text={preview} query={filter ? '' : query} /></p><div className="absolute inset-x-7 bottom-4 flex items-center justify-between gap-3 text-xs text-[#aaa]"><span className="min-w-0 truncate">{cleanCategory(item.category) || 'Instant retrieval'}</span><span className="shrink-0">{formatDate(item.created_at)}</span></div></button>; })}{!filteredNotes.length && <p className="text-sm text-[#999] xl:col-span-2">No notes match this search.</p>}{onInstantRetrieval && <InstantRetrievalCard onClick={onInstantRetrieval} />}</div></section>
+          {showProjectColumn && <aside className="border-b border-[#ddd] px-7 py-10 lg:overflow-y-auto lg:border-b-0 lg:border-r sm:px-10"><p className="mb-7 text-sm text-[#aaa]">Found in project pages</p><div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-1">{matchingPages.map(({ project, page }) => <button key={`${project.id}-${page.id}`} type="button" onClick={() => onOpenPage(project, page)} className="relative min-h-[300px] rounded-lg border border-[#e3e3e3] bg-white p-7 text-left shadow-[0_2px_8px_rgba(0,0,0,0.14)] transition hover:-translate-y-0.5 hover:border-[#8fb1ff]"><strong className="block text-base"><HighlightedText text={page.title} query={query} /></strong><p className="mt-5 line-clamp-[10] whitespace-pre-wrap text-sm leading-relaxed text-[#777]"><HighlightedText text={page.content || 'Empty page'} query={query} /></p><div className="absolute inset-x-4 bottom-4 flex justify-between text-xs text-[#aaa]"><span>{project.title}</span><span>{formatDate(page.updatedAt)}</span></div></button>)}{!matchingPages.length && <p className="text-sm text-[#999] sm:col-span-2 lg:col-span-1">No project page contains this search.</p>}<InstantRetrievalCard onClick={onInstantRetrieval} tall /></div></aside>}
+          <section className="min-h-0 px-7 py-10 lg:overflow-y-auto sm:px-12"><p className="mb-7 text-sm text-[#aaa]">{heading}</p><div className={`grid gap-7 ${showProjectColumn ? 'xl:grid-cols-2' : 'lg:grid-cols-2 xl:grid-cols-3'}`}>{filteredNotes.map((item) => { const content = splitNote(item); const preview = content.body || notePreview(item); return <button key={item.id} type="button" onClick={() => onOpenNote(item)} className="relative min-h-[250px] rounded-lg border border-[#e3e3e3] bg-[#f7f7f9] p-2 text-left shadow-[0_2px_8px_rgba(0,0,0,0.14)] transition hover:-translate-y-0.5 hover:border-[#8fb1ff]"><div className="h-[190px] rounded-md bg-white p-6">{content.hasTitle && <strong className="block text-base"><HighlightedText text={content.title} query={filter ? '' : query} /></strong>}<p className="mt-4 line-clamp-6 text-sm leading-relaxed text-[#777]"><HighlightedText text={preview} query={filter ? '' : query} /></p></div><div className="flex items-center justify-between px-3 py-3 text-xs text-[#aaa]"><span>{cleanCategory(item.category) || 'Instant retrieval'}</span><span>{formatDate(item.created_at)}</span></div></button>; })}{!filteredNotes.length && <p className="text-sm text-[#999] xl:col-span-2">No notes match this search.</p>}<InstantRetrievalCard onClick={onInstantRetrieval} /></div></section>
         </div>}
       </div>
     </div>
@@ -2423,7 +2321,7 @@ function InstantRetrievalOverlay({ notes, projects, initialQuery = '', saving, o
           <section className="relative min-h-[430px] overflow-y-auto bg-white px-8 py-16 sm:px-14 lg:min-h-0">
             {!query.trim() ? <p className="text-base text-[#aaa]">Start typing what you want to find.</p> : phase === 'clarify' ? <div><p className="text-lg leading-relaxed">{clarification}</p><div className="mt-8 flex gap-6"><button type="button" onClick={() => answerClarification(true)} aria-label="Yes" className="flex h-10 w-10 items-center justify-center rounded-full bg-[#477bea] text-white hover:bg-[#3d6ed7]"><Check className="h-5 w-5" /></button><button type="button" onClick={() => answerClarification(false)} aria-label="No" className="flex h-10 w-10 items-center justify-center rounded-full border-2 border-[#222] hover:bg-[#f5f5f5]"><X className="h-5 w-5" /></button></div></div> : <div><Check className="h-10 w-10 rounded-full bg-[#477bea] p-2 text-white" /><p className="mt-10 text-lg">I have found {results.length} {results.length === 1 ? 'note' : 'notes'} that are close to your request.</p>{results[0] && <div className="mt-12 border-t border-[#eee] pt-7"><strong className="text-base">Closest match: <HighlightedText text={splitNote(results[0]).title} query={query} /></strong><p className="mt-4 line-clamp-8 whitespace-pre-wrap text-sm leading-relaxed text-[#555]"><HighlightedText text={splitNote(results[0]).body || notePreview(results[0])} query={query} /></p></div>}</div>}
           </section>
-          {phase === 'results' && <aside className="min-h-[430px] overflow-y-auto border-l border-[#d6d6d6] bg-white p-5 lg:min-h-0"><div className="mb-4 flex items-center justify-between"><h2 className="text-sm text-[#999]">Retrieved notes</h2><span className="rounded border border-[#bbb] px-3 py-1 text-xs text-[#477bea]">See notes</span></div><div className="space-y-5">{results.map((item) => { const content = splitNote(item); return <button key={item.id} type="button" onMouseEnter={() => setSelectedId(item.id)} onFocus={() => setSelectedId(item.id)} onClick={() => onOpenNote(item)} className={`block min-h-[200px] w-full rounded-lg border bg-white p-5 text-left shadow-[0_2px_8px_rgba(0,0,0,0.13)] transition hover:-translate-y-0.5 ${selectedId === item.id ? 'border-[#6f9cff] ring-1 ring-[#6f9cff]/40' : 'border-[#e2e2e2]'}`}><span className="float-right text-xs text-[#477bea]">note</span>{content.hasTitle && <strong className="block max-w-[82%] text-base"><HighlightedText text={content.title} query={query} /></strong>}<p className="mt-4 line-clamp-6 whitespace-pre-wrap text-sm leading-relaxed text-[#777]"><HighlightedText text={notePreview(item)} query={query} /></p><div className="mt-7 flex justify-between text-xs text-[#aaa]"><span>{cleanCategory(item.category) || 'Instant retrieval'}</span><span>{formatDate(item.created_at)}</span></div></button>; })}{!results.length && <p className="text-sm text-[#999]">No close notes yet. Try a broader request.</p>}</div></aside>}
+          {phase === 'results' && <aside className="min-h-[430px] overflow-y-auto border-l border-[#d6d6d6] bg-white p-5 lg:min-h-0"><div className="mb-4 flex items-center justify-between"><h2 className="text-sm text-[#999]">Retrieved notes</h2><span className="rounded border border-[#bbb] px-3 py-1 text-xs text-[#477bea]">See notes</span></div><div className="space-y-5">{results.map((item) => { const content = splitNote(item); return <button key={item.id} type="button" onMouseEnter={() => setSelectedId(item.id)} onFocus={() => setSelectedId(item.id)} onClick={() => onOpenNote(item)} className={`block min-h-[200px] w-full rounded-lg border bg-white p-5 text-left shadow-[0_2px_8px_rgba(0,0,0,0.13)] transition hover:-translate-y-0.5 ${selectedId === item.id ? 'border-[#6f9cff] ring-1 ring-[#6f9cff]/40' : 'border-[#e2e2e2]'}`}><span className="float-right text-xs text-[#477bea]">note</span>{content.hasTitle && <strong className="block max-w-[82%] text-base"><HighlightedText text={content.title} query={query} /></strong>}<p className="mt-4 line-clamp-6 whitespace-pre-wrap text-sm leading-relaxed text-[#777]"><HighlightedText text={content.body || notePreview(item)} query={query} /></p><div className="mt-7 flex justify-between text-xs text-[#aaa]"><span>{cleanCategory(item.category) || 'Instant retrieval'}</span><span>{formatDate(item.created_at)}</span></div></button>; })}{!results.length && <p className="text-sm text-[#999]">No close notes yet. Try a broader request.</p>}</div></aside>}
         </div>
       </div>
     </div>
@@ -3162,108 +3060,12 @@ function RelevantNotesPanel({ notes, relevance, loading, progress, error, stale,
   );
 }
 
-function escapeEditorHtml(value: string): string {
-  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-function inlineMarkdownToHtml(value: string): string {
-  return escapeEditorHtml(value)
-    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/__([^_\n]+)__/g, '<strong>$1</strong>')
-    .replace(/\*([^*\n]+)\*/g, '<em>$1</em>')
-    .replace(/_([^_\n]+)_/g, '<em>$1</em>');
-}
-
-function markdownToEditorHtml(value: string): string {
-  const lines = value.replace(/\r\n?/g, '\n').split('\n');
-  const html: string[] = [];
-  let list: 'ul' | 'ol' | null = null;
-  const closeList = () => { if (list) html.push(`</${list}>`); list = null; };
-  lines.forEach((line) => {
-    const heading = line.match(/^(#{1,3})\s+(.*)$/);
-    const bullet = line.match(/^[-+*•]\s+(.*)$/);
-    const numbered = line.match(/^\d+\.\s+(.*)$/);
-    if (bullet || numbered) {
-      const nextList = bullet ? 'ul' : 'ol';
-      if (list !== nextList) { closeList(); list = nextList; html.push(`<${nextList}>`); }
-      html.push(`<li>${inlineMarkdownToHtml((bullet ?? numbered)![1])}</li>`);
-      return;
-    }
-    closeList();
-    if (heading) html.push(`<h${heading[1].length}>${inlineMarkdownToHtml(heading[2])}</h${heading[1].length}>`);
-    else html.push(line ? `<p>${inlineMarkdownToHtml(line)}</p>` : '<p><br></p>');
-  });
-  closeList();
-  return html.join('');
-}
-
-function editorHtmlToMarkdown(root: HTMLElement): string {
-  const inline = (node: Node): string => {
-    if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? '';
-    if (!(node instanceof HTMLElement)) return '';
-    const value = Array.from(node.childNodes).map(inline).join('');
-    if (node.tagName === 'STRONG' || node.tagName === 'B') return `**${value}**`;
-    if (node.tagName === 'EM' || node.tagName === 'I') return `*${value}*`;
-    if (node.tagName === 'BR') return '\n';
-    return value;
-  };
-  const blockTags = new Set(['P', 'DIV', 'H1', 'H2', 'H3', 'UL', 'OL']);
-  if (!Array.from(root.children).some((element) => blockTags.has(element.tagName))) {
-    return Array.from(root.childNodes).map(inline).join('').trimEnd();
-  }
-  const blocks = Array.from(root.childNodes).map((node) => {
-    if (!(node instanceof HTMLElement)) return inline(node);
-    const text = Array.from(node.childNodes).map(inline).join('').replace(/\n+$/, '');
-    if (/^H[1-3]$/.test(node.tagName)) return `${'#'.repeat(Number(node.tagName[1]))} ${text}`;
-    if (node.tagName === 'UL') return Array.from(node.children).map((item) => `• ${Array.from(item.childNodes).map(inline).join('')}`).join('\n');
-    if (node.tagName === 'OL') return Array.from(node.children).map((item, index) => `${index + 1}. ${Array.from(item.childNodes).map(inline).join('')}`).join('\n');
-    return text;
-  });
-  return blocks.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd();
-}
-
-function applyRichTextFormat(
-  editor: HTMLDivElement,
-  kind: 'bold' | 'italic' | 'h1' | 'h2' | 'h3' | 'body' | 'bullet' | 'number',
-  onChange: (value: string) => void
-): void {
-  editor.focus();
-  if (kind === 'bold' || kind === 'italic') document.execCommand(kind);
-  else if (kind === 'bullet') document.execCommand('insertUnorderedList');
-  else if (kind === 'number') document.execCommand('insertOrderedList');
-  else document.execCommand('formatBlock', false, kind === 'body' ? 'p' : kind);
-  onChange(editorHtmlToMarkdown(editor));
-}
-
-function RichTextBodyEditor({ value, onChange, editorRef, placeholder, className }: {
-  value: string; onChange: (value: string) => void; editorRef: React.RefObject<HTMLDivElement>;
-  placeholder: string; className: string;
-}) {
-  useEffect(() => {
-    const editor = editorRef.current;
-    if (!editor || document.activeElement === editor) return;
-    const html = markdownToEditorHtml(value);
-    if (editor.innerHTML !== html) editor.innerHTML = html;
-  }, [editorRef, value]);
-  return <div
-    ref={editorRef}
-    contentEditable
-    suppressContentEditableWarning
-    role="textbox"
-    aria-label="Note body"
-    aria-multiline="true"
-    data-placeholder={placeholder}
-    onInput={(event) => onChange(editorHtmlToMarkdown(event.currentTarget))}
-    className={`${className} empty:before:pointer-events-none empty:before:text-[#aaa] empty:before:content-[attr(data-placeholder)]`}
-  />;
-}
-
 function NoteEditor({ state, muses, notes, saving, error, onChange, onCreateMuse, onClose, onSave, onFindRelevantNotes, onImport, onDelete }: {
   state: NoteEditorState; muses: MuseMeta[]; notes: Note[]; saving: boolean; error: string;
   onChange: (state: NoteEditorState) => void; onCreateMuse: (title: string) => void;
   onClose: () => void; onSave: () => void; onFindRelevantNotes: () => void; onImport: () => void; onDelete?: () => void;
 }) {
-  const bodyRef = useRef<HTMLDivElement>(null);
+  const bodyRef = useRef<HTMLTextAreaElement>(null);
   const speechRef = useRef<SpeechRecognitionLike | null>(null);
   const museMenuRef = useRef<HTMLDivElement>(null);
   const [dictating, setDictating] = useState(false);
@@ -3292,7 +3094,6 @@ function NoteEditor({ state, muses, notes, saving, error, onChange, onCreateMuse
   }, [state.body, state.title]);
 
   const draftTooShort = draftText.length < MIN_RELEVANCE_DRAFT_CHARS;
-  const isOrphanDraft = state.muse.toLowerCase() === ORPHANS_MUSE.toLowerCase();
   const draftChangedSinceSearch = Boolean(relevance) && searchedDraft !== draftText;
   const domainCapture = state.context === 'domain';
 
@@ -3312,12 +3113,6 @@ function NoteEditor({ state, muses, notes, saving, error, onChange, onCreateMuse
 
   const runRelevanceSearch = async () => {
     if (draftTooShort || relevanceLoading) return;
-    if (isOrphanDraft) {
-      setPanelOpen(true);
-      setRelevance(null);
-      setRelevanceError('Choose a Domain before retrieving notes from an orphan note.');
-      return;
-    }
     setPanelOpen(true); setRelevanceError(''); setRelevancePage(0);
 
     const domain = domainGoalFor(state.muse, muses);
@@ -3344,7 +3139,19 @@ function NoteEditor({ state, muses, notes, saving, error, onChange, onCreateMuse
   const applyFormat = (kind: 'bold' | 'italic' | 'h1' | 'h2' | 'h3' | 'body' | 'bullet' | 'number') => {
     const field = bodyRef.current;
     if (!field) return;
-    applyRichTextFormat(field, kind, (body) => onChange({ ...state, body }));
+    const start = field.selectionStart; const end = field.selectionEnd;
+    const selection = state.body.slice(start, end);
+    let replacement = selection;
+    if (kind === 'bold') replacement = `**${selection || 'bold text'}**`;
+    if (kind === 'italic') replacement = `*${selection || 'italic text'}*`;
+    if (kind === 'h1') replacement = `# ${selection || 'Heading'}`;
+    if (kind === 'h2') replacement = `## ${selection || 'Heading'}`;
+    if (kind === 'h3') replacement = `### ${selection || 'Heading'}`;
+    if (kind === 'body') replacement = selection.replace(/^#{1,3}\s+/gm, '');
+    if (kind === 'bullet') replacement = (selection || 'List item').split('\n').map((line) => `• ${line.replace(/^[-•]\s*/, '')}`).join('\n');
+    if (kind === 'number') replacement = (selection || 'List item').split('\n').map((line, index) => `${index + 1}. ${line.replace(/^\d+\.\s*/, '')}`).join('\n');
+    onChange({ ...state, body: `${state.body.slice(0, start)}${replacement}${state.body.slice(end)}` });
+    requestAnimationFrame(() => { field.focus(); field.setSelectionRange(start, start + replacement.length); });
   };
 
   const toggleDictation = () => {
@@ -3372,7 +3179,7 @@ function NoteEditor({ state, muses, notes, saving, error, onChange, onCreateMuse
             <button type="button" onClick={onClose} aria-label="Close note editor" title="Close note editor" className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-[#f5f5f6] hover:text-[#555]"><ArrowLeft className="h-5 w-5" /></button>
             <span aria-hidden="true" className="flex h-8 w-8 items-center justify-center rounded-md bg-[#477bea] text-white"><Plus className="h-4 w-4" /></span>
             <button type="button" onClick={onImport} aria-label="Import notes" title="Import notes" className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-[#f5f5f6] hover:text-[#555]"><Upload className="h-5 w-5" /></button>
-            <button type="button" onClick={onFindRelevantNotes} disabled={draftTooShort || saving || isOrphanDraft} aria-label="Find relevant notes" title={isOrphanDraft ? 'Choose a Domain before retrieving notes' : draftTooShort ? `Write at least ${MIN_RELEVANCE_DRAFT_CHARS} characters to search your notes` : 'Find relevant notes'} className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-[#f5f5f6] hover:text-[#477bea] disabled:opacity-35">{saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-5 w-5" />}</button>
+            <button type="button" onClick={onFindRelevantNotes} disabled={draftTooShort || saving} aria-label="Find relevant notes" title={draftTooShort ? `Write at least ${MIN_RELEVANCE_DRAFT_CHARS} characters to search your notes` : 'Find relevant notes'} className="flex h-9 w-9 items-center justify-center rounded-md hover:bg-[#f5f5f6] hover:text-[#477bea] disabled:opacity-35">{saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-5 w-5" />}</button>
           </div>
           <div ref={museMenuRef} className="relative col-span-2 row-start-2 z-40 max-w-full justify-self-center sm:absolute sm:left-1/2 sm:-translate-x-1/2">
             <button type="button" onClick={() => setMuseOpen((value) => !value)} aria-expanded={museOpen} className="flex max-w-[calc(100vw-3rem)] items-center rounded px-2 py-1 text-xs text-[#555] hover:bg-[#f5f5f6] sm:max-w-[40vw]"><span className="shrink-0">Domain:&nbsp;</span><span className="truncate border-b border-[#999]">{museLabel}</span><ChevronDown className="ml-1 h-3.5 w-3.5 shrink-0" /></button>
@@ -3389,7 +3196,7 @@ function NoteEditor({ state, muses, notes, saving, error, onChange, onCreateMuse
         <div className="relative flex min-h-0 flex-1">
           <div className={`flex min-h-0 min-w-0 flex-1 flex-col ${domainCapture ? 'items-center px-8 pb-8 pt-[10vh]' : 'px-8 pb-5 pt-10 sm:px-16 sm:pt-12'}`}>
             <input value={state.title} onFocus={() => setEditingStarted(true)} onChange={(event) => onChange({ ...state, title: event.target.value })} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); setEditingStarted(true); bodyRef.current?.focus(); } }} placeholder={domainCapture ? 'Title' : 'What’s on your mind?'} aria-label="Note title" className={`w-full shrink-0 bg-transparent outline-none placeholder:text-[#555] ${domainCapture ? 'max-w-2xl text-xl font-semibold sm:text-2xl' : 'text-xl font-medium italic sm:text-2xl'}`} />
-            <RichTextBodyEditor editorRef={bodyRef} value={state.body} onChange={(body) => { setEditingStarted(true); onChange({ ...state, body }); }} placeholder={editingStarted ? '' : domainCapture ? 'Knowledge is what makes people special, and special people do special things, so make this one count.' : "For example: Someone made the point that we mostly don't choose our beliefs, we absorb them and backfill reasons after. Uncomfortable but I can't argue with it. Makes me wonder how much of what I think is actually mine."} className={`mt-5 min-h-0 w-full flex-1 overflow-y-auto bg-transparent text-base leading-relaxed outline-none ${domainCapture ? 'max-w-2xl sm:text-lg sm:leading-[1.65]' : ''} [&_h1]:my-3 [&_h1]:text-2xl [&_h1]:font-semibold [&_h2]:my-3 [&_h2]:text-xl [&_h2]:font-semibold [&_h3]:my-2 [&_h3]:text-lg [&_h3]:font-semibold [&_ol]:my-2 [&_ol]:list-decimal [&_ol]:pl-6 [&_p]:min-h-[1.5em] [&_ul]:my-2 [&_ul]:list-disc [&_ul]:pl-6`} />
+            <textarea ref={bodyRef} value={state.body} onFocus={() => setEditingStarted(true)} onChange={(event) => onChange({ ...state, body: event.target.value })} placeholder={editingStarted ? '' : domainCapture ? 'Knowledge is what makes people special, and special people do special things, so make this one count.' : "For example: Someone made the point that we mostly don't choose our beliefs, we absorb them and backfill reasons after. Uncomfortable but I can't argue with it. Makes me wonder how much of what I think is actually mine."} aria-label="Note body" className={`mt-5 min-h-0 w-full flex-1 resize-none bg-transparent text-base leading-relaxed outline-none placeholder:text-[#aaa] ${domainCapture ? 'max-w-2xl sm:text-lg sm:leading-[1.65]' : ''}`} />
           </div>
           {panelOpen && <RelevantNotesPanel notes={notes} relevance={relevance} loading={relevanceLoading} progress={relevanceProgress} error={relevanceError} stale={draftChangedSinceSearch} page={relevancePage} onPageChange={setRelevancePage} onRetry={() => void runRelevanceSearch()} onClose={() => setPanelOpen(false)} />}
         </div>
@@ -3403,7 +3210,7 @@ function NoteEditor({ state, muses, notes, saving, error, onChange, onCreateMuse
             <span className="mx-2 h-7 w-px bg-[#ddd]" />
           </div>
           <div className={`${domainCapture ? 'flex w-full items-center gap-2 lg:w-auto lg:gap-1' : 'contents'}`}>
-            <button type="button" onClick={onFindRelevantNotes} disabled={draftTooShort || saving || isOrphanDraft} title={isOrphanDraft ? 'Choose a Domain before retrieving notes' : draftTooShort ? `Write at least ${MIN_RELEVANCE_DRAFT_CHARS} characters to search your notes` : 'Find relevant notes'} className="flex items-center gap-1.5 rounded px-2 py-1.5 font-medium text-[#477bea] hover:bg-white disabled:opacity-40">
+            <button type="button" onClick={onFindRelevantNotes} disabled={draftTooShort || saving} title={draftTooShort ? `Write at least ${MIN_RELEVANCE_DRAFT_CHARS} characters to search your notes` : 'Find relevant notes'} className="flex items-center gap-1.5 rounded px-2 py-1.5 font-medium text-[#477bea] hover:bg-white disabled:opacity-40">
               {saving ? <Loader2 className="h-4 w-4 animate-spin" /> : <ScanSearch className="h-4 w-4" />}
               <span className="hidden lg:inline">Find relevant notes</span>
             </button>

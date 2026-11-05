@@ -180,8 +180,6 @@ export interface CardDecision {
   text?: string;
   /** Another note this choice also marks, such as the earlier note an answer solved. */
   targetNoteId?: string;
-  /** Fingerprint of the situation section; only one solved/helped choice may claim it. */
-  targetSectionKey?: string;
 }
 
 /** A choice made on another note's card that marks this note. */

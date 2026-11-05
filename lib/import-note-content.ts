@@ -7,10 +7,28 @@ function withoutLeadingMarkup(value: string): string {
     .trim();
 }
 
-export function firstFiveWordTitle(value: string): string {
-  const readable = withoutLeadingMarkup(value).replace(/[*_`~]/g, '').replace(/\s+/g, ' ').trim();
+function trimToTitleLength(value: string): string {
+  if (value.length <= MAX_IMPORTED_TITLE_CHARS) return value;
+
+  const shortened = value.slice(0, MAX_IMPORTED_TITLE_CHARS - 1).trimEnd();
+  const lastSpace = shortened.lastIndexOf(' ');
+  const atWordBoundary = lastSpace >= Math.floor(MAX_IMPORTED_TITLE_CHARS * 0.65)
+    ? shortened.slice(0, lastSpace)
+    : shortened;
+  return `${atWordBoundary.trimEnd()}…`;
+}
+
+function firstSentence(value: string): string {
+  const readable = withoutLeadingMarkup(value).replace(/\s+/g, ' ').trim();
   if (!readable) return '';
-  return readable.split(' ').slice(0, 5).join(' ');
+
+  // Keep sentence-ending punctuation in the generated title. Requiring the
+  // punctuation to be followed by whitespace/end avoids splitting decimals.
+  const ending = readable.match(/[.!?](?:["'”’)]*)?(?=\s|$)/);
+  const sentence = ending?.index === undefined
+    ? readable
+    : readable.slice(0, ending.index + ending[0].length);
+  return trimToTitleLength(sentence.trim());
 }
 
 function hasExplicitTitle(value: string): boolean {
@@ -38,6 +56,6 @@ export function prepareImportedNoteText(rawText: string): string {
   const text = rawText.replace(/\r\n?/g, '\n').trim();
   if (!text || hasExplicitTitle(text)) return text;
 
-  const title = firstFiveWordTitle(text);
+  const title = firstSentence(text);
   return title ? `${title}\n\n${text}` : text;
 }
