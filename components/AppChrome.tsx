@@ -4,7 +4,8 @@ import { useEffect } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import { useAuth } from '@/lib/auth-context';
 
-const PUBLIC_PATHS = ['/auth'];
+// '/s/' is a shared link, which opens without an account ('/sharing' does not match it).
+const PUBLIC_PATHS = ['/auth', '/s/'];
 
 export default function AppChrome({ children }: { children: React.ReactNode }) {
   const { user, loading } = useAuth();

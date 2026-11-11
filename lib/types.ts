@@ -54,6 +54,9 @@ export type NoteDirection = 'inbound' | 'outbound';
 
 export interface RelevanceResult {
   note_id: string;
+  /** The AI search's level, 1 to 5. Missing from similarity-only results and older saved searches. */
+  level?: number;
+  /** AI search: the level as a 0-1 ranking value. Similarity search: the cosine similarity. */
   relevance_score: number;
   /** Null when semantic retrieval has not classified the relationship. */
   relation_type: NoteRelationType | null;

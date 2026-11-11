@@ -2,22 +2,24 @@
 
 import Link from 'next/link';
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, ArrowUp, Bold, Check, ChevronDown, ChevronLeft, ChevronRight, Filter, FolderPlus, Grid2X2, Italic, Layers3, List, ListOrdered, Loader as Loader2, Mic, MoreHorizontal, PanelRightOpen, Pin, Plus, RefreshCw, Rows3, ScanSearch, Search, Trash2, Upload, X } from 'lucide-react';
+import { ArrowLeft, ArrowUp, Bold, Check, ChevronDown, ChevronLeft, ChevronRight, Filter, FolderPlus, Grid2X2, Italic, Layers3, List, ListOrdered, Loader as Loader2, Mic, MoreHorizontal, PanelRightOpen, Pin, Plus, RefreshCw, Rows3, ScanSearch, Search, Share2, Trash2, Upload, X } from 'lucide-react';
 import type { RelevanceProgress } from '@/lib/types';
 import NoteImporter, { ImportDomainDraft, ImportNoteDraft } from '@/components/NoteImporter';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { useAuth } from '@/lib/auth-context';
-import { createNote, deleteNote, findRelevantNotes, findSimilarNotes, getNotes, importNotes, MIN_RELEVANCE_DRAFT_CHARS, moveNotesToCategory, processNote, updateNote } from '@/lib/notes-api';
+import { createNote, deleteNote, findRelevantNotes, findSimilarNotes, getNotes, importNotes, MIN_RELEVANCE_DRAFT_CHARS, processNote, updateNote } from '@/lib/notes-api';
+import { addMissingDomains, assignNotesToDomain, deleteDomain, DomainState, loadDomains, saveDomain, setDomainPinned, uploadBrowserDomains } from '@/lib/domains-api';
 import { supabase } from '@/lib/supabase';
 import { prepareImportedNoteText } from '@/lib/import-note-content';
 import { IS_LOCAL_MODE } from '@/dev/local-mode';  // DEV-LOCAL-MODE
 import { CardChoice, CardDecision, CardKind, DomainGoal, IncomingCardDecision, InsightIntent, Note, NoteInsight, NoteRelationType, RelevanceCoverage, RelevanceResult, RelevanceSection, SuggestionKind } from '@/lib/types';
 import { loadCardDecisions, saveCardDecision } from '@/lib/card-decisions';
-import { findAnchor, splitIntoParagraphs } from '@/supabase/functions/_shared/relevance';
+import { findAnchor, RELATED_NOTES_PAGE_SIZE, splitIntoParagraphs } from '@/supabase/functions/_shared/relevance';
 import { getAiMode, useAiMode } from '@/lib/ai-mode';
 import { setSampleMode, useSampleMode, workspaceScope } from '@/lib/sample-mode';
 import { isSampleGuide, loadSampleVault, SampleVault } from '@/lib/sample-vault';
+import { copyNotesToPublic } from '@/lib/sharing-api';
 
 type MuseMeta = { title: string; description: string; createdAt: string };
 type ProjectPage = { id: string; title: string; content: string; sourceNoteIds: string[]; createdAt: string; updatedAt: string };
@@ -175,45 +177,40 @@ function safeErrorMessage(error: unknown, fallback: string): string {
   return fallback;
 }
 
-function readMuseAssignments(userId: string): Record<string, string> {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(`ocreda-note-muses:${userId}`) ?? '{}') as Record<string, unknown>;
-    return Object.fromEntries(Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === 'string'));
-  } catch {
-    return {};
-  }
-}
-
 /**
- * Files the sample vault's Domains in its own workspace and gives each sample
- * note its Domain: the first time the vault is opened in this browser, and
- * again whenever it has just been copied in. Notes the person wrote while
- * exploring keep the Domain they chose, and so do any they moved.
+ * The Domains of one workspace (the person's own, or the sample vault's).
+ * First uploads what this browser stored before Domains moved to the
+ * database; a failed upload is reported and tried again on the next load.
+ * With the sample vault, also files its Domains when it was just copied in,
+ * or has none yet. Notes the person wrote or moved keep their Domain.
  */
-function seedSampleWorkspace(scope: string, vault: SampleVault): void {
-  const seededKey = `ocreda-sample-workspace:${scope}`;
+async function loadDomainState(userId: string, sample: boolean, vault?: SampleVault): Promise<{ state: DomainState; uploadFailed: boolean }> {
+  let uploadFailed = false;
   try {
-    if (localStorage.getItem(seededKey) === 'v1' && !vault.copied) return;
-    const museKey = `ocreda-muses:${scope}`;
-    if (!readStoredList<MuseMeta>(museKey).length) {
-      // One millisecond apart, so the Domains keep the vault's order.
-      const start = Date.now() - vault.domains.length;
-      localStorage.setItem(museKey, JSON.stringify(vault.domains.map((domain, index) => ({
-        title: domain.title, description: domain.description, createdAt: new Date(start + index).toISOString(),
-      }))));
-      localStorage.setItem(`ocreda-pinned-muses:${scope}`, JSON.stringify([vault.pinnedDomain]));
-    }
-    const assignments = readMuseAssignments(scope);
+    await uploadBrowserDomains(userId, sample);
+  } catch {
+    uploadFailed = true;
+  }
+  let state = await loadDomains(userId, sample);
+  if (vault && (vault.copied || (!state.domains.length && !Object.keys(state.assignments).length))) {
+    // One millisecond apart, so the Domains keep the vault's order.
+    const start = Date.now() - vault.domains.length;
+    const assignments: Record<string, string> = {};
     vault.notes.forEach((note) => {
       const domain = vault.domainOf(note);
-      if (domain && !assignments[note.id]) assignments[note.id] = domain;
+      if (domain) assignments[note.id] = domain;
     });
-    localStorage.setItem(`ocreda-note-muses:${scope}`, JSON.stringify(assignments));
-    localStorage.setItem(seededKey, 'v1');
-  } catch {
-    // Without storage the vault still opens, just without its Domains.
+    await addMissingDomains(userId, sample, {
+      domains: vault.domains.map((domain, index) => ({ title: domain.title, description: domain.description, createdAt: new Date(start + index).toISOString() })),
+      pinned: [vault.pinnedDomain],
+      assignments,
+    });
+    state = await loadDomains(userId, sample);
   }
+  return { state, uploadFailed };
 }
+
+const DOMAIN_UPLOAD_ERROR = 'Your Domains from this browser could not be saved to your account yet. They will be tried again the next time you open Ocreda.';
 
 function readStoredList<T>(key: string): T[] {
   try {
@@ -277,6 +274,7 @@ export default function OcredaHome() {
   // Which workspace the notes in state belong to, while a switch is loading.
   const [notesScope, setNotesScope] = useState<string | null>(null);
   const [notice, setNotice] = useState('');
+  const [shareNotice, setShareNotice] = useState('');
   const loadRequestRef = useRef(0);
   const [museMeta, setMuseMeta] = useState<MuseMeta[]>([]);
   const [pinnedMuseTitles, setPinnedMuseTitles] = useState<string[]>([]);
@@ -306,7 +304,10 @@ export default function OcredaHome() {
   const [importProgress, setImportProgress] = useState<{ completed: number; total: number } | null>(null);
   const [importOpen, setImportOpen] = useState(false);
   const orphanMigrationStartedRef = useRef(false);
+  // While this browser's Domains are not uploaded, its notes may look unsorted.
+  const domainUploadFailedRef = useRef(false);
   const historySurfaceActiveRef = useRef(false);
+  const userId = user?.id ?? null;
 
   const resetToDashboard = useCallback(() => {
     setNoteEditor(null);
@@ -362,24 +363,27 @@ export default function OcredaHome() {
     // A switch between the two sets can overtake a load still on its way.
     const request = ++loadRequestRef.current;
     try {
+      if (!userId) return;
       let loaded: Note[];
-      if (sampleMode && scope) {
+      let domains: Awaited<ReturnType<typeof loadDomainState>>;
+      if (sampleMode) {
         const vault = await loadSampleVault();
         if (request !== loadRequestRef.current) return;
-        seedSampleWorkspace(scope, vault);
+        domains = await loadDomainState(userId, true, vault);
         loaded = vault.notes;
       } else {
-        loaded = await getNotes();
+        [loaded, domains] = await Promise.all([getNotes(), loadDomainState(userId, false)]);
       }
       if (request !== loadRequestRef.current) return;
-      if (scope) {
-        // The latest load decides which Domains show, so a switch always
-        // ends with the Domains of the notes it loaded.
-        setMuseMeta(readStoredList<MuseMeta>(`ocreda-muses:${scope}`).filter((item) => item && typeof item.title === 'string'));
-        setPinnedMuseTitles([...new Set(readStoredList<string>(`ocreda-pinned-muses:${scope}`).filter((title): title is string => typeof title === 'string'))].slice(0, 3));
-      }
-      const localMuses = scope ? readMuseAssignments(scope) : {};
-      setNotes(loaded.map((note) => localMuses[note.id] ? { ...note, category: localMuses[note.id] } : note));
+      // The latest load decides which Domains show, so a switch always ends
+      // with the Domains of the notes it loaded.
+      const { state, uploadFailed } = domains;
+      domainUploadFailedRef.current = uploadFailed;
+      if (uploadFailed) setError(DOMAIN_UPLOAD_ERROR);
+      setMuseMeta(state.domains);
+      setPinnedMuseTitles(state.pinned);
+      // A note's Domain comes only from the Domain records.
+      setNotes(loaded.map((note) => ({ ...note, category: state.assignments[note.id] ?? null })));
       setNotesScope(scope);
     }
     catch (err) {
@@ -388,7 +392,7 @@ export default function OcredaHome() {
       }
     }
     finally { if (request === loadRequestRef.current) setLoading(false); }
-  }, [sampleMode, scope]);
+  }, [sampleMode, scope, userId]);
   useEffect(() => { void load(); }, [load]);
 
   // Switching between the sample notes and your own starts from the dashboard.
@@ -425,14 +429,9 @@ export default function OcredaHome() {
 
   useEffect(() => {
     if (!user || !scope) return;
-    const museKey = `ocreda-muses:${scope}`;
+    // Domains load with the notes, from the database.
     const projectKey = `ocreda-projects:${scope}`;
     const legacy = readStoredList<MuseMeta>(`ocreda-cortexes:${scope}`).filter((item) => item && typeof item.title === 'string');
-    const storedMuses = readStoredList<MuseMeta>(museKey).filter((item) => item && typeof item.title === 'string');
-    const nextMuses = storedMuses.length ? storedMuses : legacy;
-    setMuseMeta(nextMuses);
-    setPinnedMuseTitles([...new Set(readStoredList<string>(`ocreda-pinned-muses:${scope}`).filter((title): title is string => typeof title === 'string'))].slice(0, 3));
-    if (!storedMuses.length && legacy.length) localStorage.setItem(museKey, JSON.stringify(legacy));
 
     const storedProjects = readStoredList<CortexProject>(projectKey).filter((item) => item && typeof item.id === 'string' && typeof item.title === 'string').map(normalizeProject);
     if (storedProjects.length) {
@@ -462,25 +461,24 @@ export default function OcredaHome() {
     }
   }, [scope, user]);
 
-  const persistMuseMeta = useCallback((next: MuseMeta[]) => {
-    setMuseMeta(next);
-    if (scope) localStorage.setItem(`ocreda-muses:${scope}`, JSON.stringify(next));
-  }, [scope]);
+  /** The signed-in account, for saving Domains. */
+  const requireUserId = (): string => {
+    if (!userId) throw new Error('Your session has expired. Sign in again to continue.');
+    return userId;
+  };
 
-  const persistPinnedMuses = useCallback((next: string[]) => {
-    setPinnedMuseTitles(next);
-    if (scope) localStorage.setItem(`ocreda-pinned-muses:${scope}`, JSON.stringify(next));
-  }, [scope]);
-
-  const togglePinnedMuse = (title: string) => {
+  const togglePinnedMuse = async (title: string) => {
     const validPinned = pinnedMuseTitles.filter((pinned) => muses.some((muse) => muse.title.toLowerCase() === pinned.toLowerCase()));
     const exists = validPinned.some((pinned) => pinned.toLowerCase() === title.toLowerCase());
     if (!exists && validPinned.length >= 3) {
       setError('You can pin up to 3 Domains. Unpin one before adding another.');
       return;
     }
-    persistPinnedMuses(exists ? validPinned.filter((pinned) => pinned.toLowerCase() !== title.toLowerCase()) : [...validPinned, title]);
-    setError('');
+    try {
+      await setDomainPinned(requireUserId(), sampleMode, title, !exists);
+      setPinnedMuseTitles(exists ? validPinned.filter((pinned) => pinned.toLowerCase() !== title.toLowerCase()) : [...validPinned, title]);
+      setError('');
+    } catch (err) { setError(safeErrorMessage(err, exists ? 'Unable to unpin this Domain.' : 'Unable to pin this Domain.')); }
   };
 
   const persistProjects = useCallback((next: CortexProject[]) => {
@@ -488,20 +486,16 @@ export default function OcredaHome() {
     if (scope) localStorage.setItem(`ocreda-projects:${scope}`, JSON.stringify(next));
   }, [scope]);
 
-  const persistMuseAssignments = useCallback((noteIds: string[], category: string | null) => {
-    if (!scope || !noteIds.length) return;
-    const assignments = readMuseAssignments(scope);
-    noteIds.forEach((noteId) => {
-      if (category) assignments[noteId] = category;
-      else delete assignments[noteId];
-    });
-    localStorage.setItem(`ocreda-note-muses:${scope}`, JSON.stringify(assignments));
-    setNotes((current) => current.map((note) => noteIds.includes(note.id) ? { ...note, category, category_updated_at: new Date().toISOString() } : note));
-  }, [scope]);
+  /** Shows notes in a Domain once it is saved. */
+  const showMuseAssignments = useCallback((noteIds: string[], category: string | null) => {
+    if (!noteIds.length) return;
+    const ids = new Set(noteIds);
+    setNotes((current) => current.map((note) => ids.has(note.id) ? { ...note, category, category_updated_at: new Date().toISOString() } : note));
+  }, []);
 
   useEffect(() => {
     // The sample vault arrives sorted, so this is for your own notes only.
-    if (!user || loading || sampleMode || notesScope !== scope || orphanMigrationStartedRef.current) return;
+    if (!user || loading || sampleMode || notesScope !== scope || orphanMigrationStartedRef.current || domainUploadFailedRef.current) return;
     const migrationKey = `ocreda-orphans-migration:${ORPHANS_MIGRATION_VERSION}:${user.id}`;
     if (localStorage.getItem(migrationKey) === 'complete') return;
 
@@ -513,19 +507,15 @@ export default function OcredaHome() {
       return;
     }
     const existingOrphans = museMeta.find((muse) => muse.title.toLowerCase() === ORPHANS_MUSE.toLowerCase());
-    if (!existingOrphans) {
-      persistMuseMeta([
-        ...museMeta,
-        { title: ORPHANS_MUSE, description: ORPHANS_DESCRIPTION, createdAt: new Date().toISOString() },
-      ]);
-    }
 
     const migrate = async () => {
       try {
-        if (uncategorizedIds.length) {
-          await moveNotesToCategory(uncategorizedIds, ORPHANS_MUSE);
-          persistMuseAssignments(uncategorizedIds, ORPHANS_MUSE);
+        if (!existingOrphans) {
+          await saveDomain(user.id, false, ORPHANS_MUSE, ORPHANS_DESCRIPTION);
+          setMuseMeta((current) => [...current, { title: ORPHANS_MUSE, description: ORPHANS_DESCRIPTION, createdAt: new Date().toISOString() }]);
         }
+        await assignNotesToDomain(user.id, false, uncategorizedIds, ORPHANS_MUSE);
+        showMuseAssignments(uncategorizedIds, ORPHANS_MUSE);
         localStorage.setItem(migrationKey, 'complete');
       } catch (err) {
         orphanMigrationStartedRef.current = false;
@@ -533,7 +523,7 @@ export default function OcredaHome() {
       }
     };
     void migrate();
-  }, [loading, museMeta, notes, notesScope, persistMuseAssignments, persistMuseMeta, sampleMode, scope, user]);
+  }, [loading, museMeta, notes, notesScope, sampleMode, scope, showMuseAssignments, user]);
 
   const muses = useMemo(() => {
     const map = new Map<string, MuseMeta>();
@@ -546,10 +536,12 @@ export default function OcredaHome() {
   }, [museMeta, notes]);
 
   /** Saves a goal picked from the one-tap suggestions as the Domain's description. */
-  const setDomainGoal = (domainTitle: string, goal: string) => {
+  const setDomainGoal = async (domainTitle: string, goal: string) => {
     const key = domainTitle.toLowerCase();
     const existing = museMeta.find((item) => item.title.toLowerCase() === key);
-    persistMuseMeta(existing
+    try { await saveDomain(requireUserId(), sampleMode, existing?.title ?? domainTitle, goal); }
+    catch (err) { setError(safeErrorMessage(err, 'Unable to save this Domain’s goal.')); return; }
+    setMuseMeta(existing
       ? museMeta.map((item) => item.title.toLowerCase() === key ? { ...item, description: goal } : item)
       // A Domain that exists only through its notes' category gets its metadata now.
       : [...museMeta, { title: domainTitle, description: goal, createdAt: muses.find((item) => item.title.toLowerCase() === key)?.createdAt ?? new Date().toISOString() }]);
@@ -606,20 +598,27 @@ export default function OcredaHome() {
     setSaving(true); setError('');
     try {
       let savedNoteId: string;
+      let domainError = '';
       if (noteEditor.note) {
         const updated = await updateNote(noteEditor.note.id, rawText, category);
+        if (cleanCategory(noteEditor.note.category) !== category) await assignNotesToDomain(requireUserId(), sampleMode, [updated.id], category);
         setNotes((current) => current.map((note) => note.id === updated.id ? { ...updated, category } : note));
-        persistMuseAssignments([updated.id], category);
         savedNoteId = updated.id;
       } else {
         const created = await createNote(rawText, category);
-        setNotes((current) => [{ ...created, category }, ...current]);
-        persistMuseAssignments([created.id], category);
+        // The note exists now, so a failure to file it must not invite saving it twice.
+        let savedCategory = category;
+        if (category) {
+          try { await assignNotesToDomain(requireUserId(), sampleMode, [created.id], category); }
+          catch (err) { savedCategory = null; domainError = safeErrorMessage(err, 'The note was saved, but not its Domain.'); }
+        }
+        setNotes((current) => [{ ...created, category: savedCategory }, ...current]);
         processNote(created.id).catch(() => {});
         savedNoteId = created.id;
       }
       setNoteEditor(null); setActiveNoteRetrievalMode('relevant'); setActiveNoteAutoSearch(true); setPreviousNoteId(null); setActiveNoteId(savedNoteId);
-      if (!findRelevant) flashSaved();
+      if (domainError) setError(domainError);
+      else if (!findRelevant) flashSaved();
     } catch (err) { setError(safeErrorMessage(err, 'Unable to save this note.')); }
     finally { setSaving(false); }
   };
@@ -627,7 +626,7 @@ export default function OcredaHome() {
   const removeNote = async () => {
     if (!noteEditor?.note || !confirm('Delete this note? This cannot be undone.')) return;
     setSaving(true);
-    try { const noteId = noteEditor.note.id; await deleteNote(noteId); persistMuseAssignments([noteId], null); setNotes((current) => current.filter((note) => note.id !== noteId)); setNoteEditor(null); }
+    try { const noteId = noteEditor.note.id; await deleteNote(noteId); setNotes((current) => current.filter((note) => note.id !== noteId)); setNoteEditor(null); }
     catch (err) { setError(safeErrorMessage(err, 'Unable to delete this note.')); }
     finally { setSaving(false); }
   };
@@ -650,10 +649,8 @@ export default function OcredaHome() {
     if (!current || cleanCategory(current.category) === nextCategory) return;
     setSaving(true); setError('');
     try {
-      const [updated] = await moveNotesToCategory([noteId], nextCategory);
-      if (!updated) throw new Error('Note not found.');
-      setNotes((items) => items.map((note) => note.id === noteId ? { ...note, category: nextCategory, category_updated_at: updated.category_updated_at } : note));
-      persistMuseAssignments([noteId], nextCategory);
+      await assignNotesToDomain(requireUserId(), sampleMode, [noteId], nextCategory);
+      showMuseAssignments([noteId], nextCategory);
     } catch (err) { setError(safeErrorMessage(err, 'Unable to change this note’s Domain.')); }
     finally { setSaving(false); }
   };
@@ -662,14 +659,27 @@ export default function OcredaHome() {
     if (!confirm('Delete this page? This cannot be undone.')) return;
     setSaving(true); setError('');
     try {
+      // Its Domain assignment is deleted with it.
       await deleteNote(note.id);
-      persistMuseAssignments([note.id], null);
       setNotes((items) => items.filter((item) => item.id !== note.id));
       if (activeNoteId === note.id) setActiveNoteId(null);
       if (previousNoteId === note.id) setPreviousNoteId(null);
     } catch (err) { setError(safeErrorMessage(err, 'Unable to delete this page.')); }
     finally { setSaving(false); }
   };
+
+  /** Copies a note's text into the public notes; a link is made from there. */
+  const shareNotes = async (shared: Note[]) => {
+    if (!shared.length) return;
+    setError('');
+    try {
+      await copyNotesToPublic(shared);
+      setShareNotice(shared.length === 1
+        ? `“${splitNote(shared[0]).title || 'This note'}” is in your public notes.`
+        : `${shared.length} notes are in your public notes.`);
+    } catch (err) { setError(safeErrorMessage(err, 'Unable to copy to your public notes.')); }
+  };
+  const shareNote = (note: Note) => shareNotes([note]);
 
   const saveInstantRetrieval = async (queryText: string, resultNotes: Note[], projectId: string, newProjectTitle?: string) => {
     setSaving(true); setError('');
@@ -713,19 +723,17 @@ export default function OcredaHome() {
     if (muses.some((item) => item.title.toLowerCase() === title.toLowerCase() && item.title !== museEditor.originalTitle)) { setError('A Domain with this title already exists.'); return; }
     setSaving(true); setError('');
     try {
+      // A rename takes the Domain's notes and pin with it.
+      await saveDomain(requireUserId(), sampleMode, title, description, museEditor.originalTitle);
       if (museEditor.originalTitle && museEditor.originalTitle !== title) {
-        const affected = notesByMuse.get(museEditor.originalTitle) ?? [];
-        const updated = await moveNotesToCategory(affected.map((note) => note.id), title);
-        const updates = new Map(updated.map((note) => [note.id, note]));
-        setNotes((current) => current.map((note) => updates.get(note.id) ?? note));
-        persistMuseAssignments(affected.map((note) => note.id), title);
+        showMuseAssignments((notesByMuse.get(museEditor.originalTitle) ?? []).map((note) => note.id), title);
       }
       const originalKey = museEditor.originalTitle?.toLowerCase();
       const next = museMeta.filter((item) => item.title.toLowerCase() !== originalKey && item.title.toLowerCase() !== title.toLowerCase());
       next.push({ title, description, createdAt: museMeta.find((item) => item.title.toLowerCase() === originalKey)?.createdAt ?? new Date().toISOString() });
-      persistMuseMeta(next);
+      setMuseMeta(next);
       if (museEditor.originalTitle && museEditor.originalTitle !== title) {
-        persistPinnedMuses(pinnedMuseTitles.map((pinned) => pinned.toLowerCase() === museEditor.originalTitle?.toLowerCase() ? title : pinned));
+        setPinnedMuseTitles(pinnedMuseTitles.map((pinned) => pinned.toLowerCase() === museEditor.originalTitle?.toLowerCase() ? title : pinned));
       }
       if (activeMuse === museEditor.originalTitle) setActiveMuse(title);
       if (!museEditor.originalTitle) setNoteEditor((current) => current ? { ...current, muse: title } : current);
@@ -738,12 +746,11 @@ export default function OcredaHome() {
     if (!confirm(`Delete “${title}”? Its notes will return to Instant retrieval.`)) return;
     setSaving(true);
     try {
-      const updated = await moveNotesToCategory((notesByMuse.get(title) ?? []).map((note) => note.id), null);
-      const updates = new Map(updated.map((note) => [note.id, note]));
-      setNotes((current) => current.map((note) => updates.get(note.id) ?? note));
-      persistMuseAssignments((notesByMuse.get(title) ?? []).map((note) => note.id), null);
-      persistMuseMeta(museMeta.filter((item) => item.title.toLowerCase() !== title.toLowerCase()));
-      persistPinnedMuses(pinnedMuseTitles.filter((pinned) => pinned.toLowerCase() !== title.toLowerCase()));
+      // Its notes are left without a Domain.
+      await deleteDomain(requireUserId(), sampleMode, title);
+      showMuseAssignments((notesByMuse.get(title) ?? []).map((note) => note.id), null);
+      setMuseMeta(museMeta.filter((item) => item.title.toLowerCase() !== title.toLowerCase()));
+      setPinnedMuseTitles(pinnedMuseTitles.filter((pinned) => pinned.toLowerCase() !== title.toLowerCase()));
       setActiveMuse(null);
     } catch (err) { setError(safeErrorMessage(err, 'Unable to delete this Domain.')); }
     finally { setSaving(false); }
@@ -834,19 +841,28 @@ export default function OcredaHome() {
         (completed, total) => setImportProgress({ completed, total })
       );
 
-      const nextMeta = new Map(museMeta.map((muse) => [muse.title.toLowerCase(), muse]));
-      importDomains.forEach((domain) => {
-        if (!nextMeta.has(domain.title.toLowerCase())) nextMeta.set(domain.title.toLowerCase(), domain);
-      });
-      persistMuseMeta(Array.from(nextMeta.values()));
-
       const categorized = imported.map((note, index) => ({ ...note, category: inputs[index].category }));
-      setNotes((current) => [...categorized, ...current]);
-      const idsByDomain = new Map<string, string[]>();
-      categorized.forEach((note) => idsByDomain.set(note.category!, [...(idsByDomain.get(note.category!) ?? []), note.id]));
-      idsByDomain.forEach((noteIds, category) => persistMuseAssignments(noteIds, category));
       categorized.forEach((note) => processNote(note.id).catch(() => {}));
-      setImportProgress(null); setImportOpen(false); flashSaved();
+      try {
+        const owner = requireUserId();
+        const nextMeta = new Map(museMeta.map((muse) => [muse.title.toLowerCase(), muse]));
+        const newDomains = importDomains.filter((domain) => !nextMeta.has(domain.title.toLowerCase()));
+        // Domains first, so their goals are saved before notes are filed in them.
+        for (const domain of newDomains) await saveDomain(owner, sampleMode, domain.title, domain.description);
+        newDomains.forEach((domain) => nextMeta.set(domain.title.toLowerCase(), domain));
+        setMuseMeta(Array.from(nextMeta.values()));
+
+        const idsByDomain = new Map<string, string[]>();
+        categorized.forEach((note) => idsByDomain.set(note.category!, [...(idsByDomain.get(note.category!) ?? []), note.id]));
+        for (const [category, noteIds] of Array.from(idsByDomain)) await assignNotesToDomain(owner, sampleMode, noteIds, category);
+        setNotes((current) => [...categorized, ...current]);
+        setImportProgress(null); setImportOpen(false); flashSaved();
+      } catch (err) {
+        // The notes are saved, so importing again would copy them twice. Show what was saved.
+        setImportProgress(null); setImportOpen(false);
+        await load();
+        setError(`Your notes were imported, but not all of them could be filed in their Domains. ${safeErrorMessage(err, '')}`.trim());
+      }
     } catch (err) { setImportProgress(null); setImportError(safeErrorMessage(err, 'Your notes could not be imported.')); throw err; }
   };
 
@@ -864,13 +880,14 @@ export default function OcredaHome() {
         {activeProject && activePage ? <ProjectPageWorkspace key={activePage.id} project={activeProject} page={activePage} notes={notes} muses={muses} projects={projects} saving={saving} onBack={() => setActivePageId(null)} onChange={(page) => updateProjectPage(activeProject.id, page)} onAddNote={() => openNewNote()} onOpenNote={openExistingNote} onOpenPage={(project, page) => { setActiveProjectId(project.id); setActivePageId(page.id); }} onDelete={() => removeProjectPage(activeProject.id, activePage.id)} onSaveRetrieval={saveInstantRetrieval} />
           : activeProject ? <ProjectPagesGrid project={activeProject} onBack={() => { setActiveProjectId(null); setActivePageId(null); }} onAddPage={() => createProjectPage(activeProject.id)} onOpenPage={(page) => setActivePageId(page.id)} onEdit={() => setProjectEditor({ project: activeProject, title: activeProject.title, description: activeProject.description })} onDelete={() => removeProject(activeProject.id)} />
           : isEmpty ? <EmptyWorkspace displayName={displayName} userEmail={user?.email ?? ''} existingDomains={muses} onAddNote={() => openNewNote()} onImport={handleImport} onOpenImport={() => setImportOpen(true)} onTrySamples={user && !sampleMode ? () => setSampleMode(user.id, true) : undefined} importError={importError} progress={importProgress} />
-          : activeMuse || showUnsorted ? <MuseDetail title={showUnsorted ? 'Instant retrieval' : activeMuse ?? ''} notes={showUnsorted ? unsortedNotes : notesByMuse.get(activeMuse ?? '') ?? []} isUnsorted={showUnsorted} busy={saving} onClose={closeLibrary} onAddNote={() => openNewNote(showUnsorted ? AUTOMATIC_MUSE : activeMuse ?? AUTOMATIC_MUSE)} onOpenNote={openExistingNote} onEdit={() => { const meta = muses.find((item) => item.title === activeMuse); if (meta) setMuseEditor({ originalTitle: meta.title, title: meta.title, description: meta.description }); }} onDelete={() => { if (activeMuse) void removeMuse(activeMuse); }} />
+          : activeMuse || showUnsorted ? <MuseDetail title={showUnsorted ? 'Instant retrieval' : activeMuse ?? ''} notes={showUnsorted ? unsortedNotes : notesByMuse.get(activeMuse ?? '') ?? []} isUnsorted={showUnsorted} busy={saving} onClose={closeLibrary} onAddNote={() => openNewNote(showUnsorted ? AUTOMATIC_MUSE : activeMuse ?? AUTOMATIC_MUSE)} onOpenNote={openExistingNote} onEdit={() => { const meta = muses.find((item) => item.title === activeMuse); if (meta) setMuseEditor({ originalTitle: meta.title, title: meta.title, description: meta.description }); }} onDelete={() => { if (activeMuse) void removeMuse(activeMuse); }} onShare={sampleMode || showUnsorted ? undefined : () => void shareNotes(notesByMuse.get(activeMuse ?? '') ?? [])} />
           : view === 'muses' ? <MuseGrid muses={muses} projects={projects} notes={notes} notesByMuse={notesByMuse} busy={saving} onClose={closeLibrary} onAddNote={(muse) => openNewNote(muse ?? AUTOMATIC_MUSE)} onAddMuse={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onEditMuse={(muse) => setMuseEditor({ originalTitle: muse.title, title: muse.title, description: muse.description })} onDeleteMuse={(title) => void removeMuse(title)} onOpenNote={openExistingNote} onSaveRetrieval={saveInstantRetrieval} />
           : <CortexHome projects={projects} muses={muses} pinnedMuseTitles={pinnedMuseTitles} notes={notes} notesByMuse={notesByMuse} userEmail={user?.email ?? ''} busy={saving} onOpenMuses={() => setView('muses')} onOpenMuse={openMuse} onTogglePin={togglePinnedMuse} onAddMuse={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onAddNote={() => openNewNote()} onOpenImport={() => setImportOpen(true)} onOpenPage={(project, page) => { setActiveProjectId(project.id); setActivePageId(page.id); }} onOpenNote={openExistingNote} onSaveRetrieval={saveInstantRetrieval} />}
         {notice && !error && <div role="status" aria-live="polite" className="fixed bottom-5 left-1/2 z-40 max-w-[90vw] -translate-x-1/2 rounded-lg bg-[#202020] px-4 py-3 text-sm text-white shadow-xl">{notice}<button type="button" onClick={() => setNotice('')} aria-label="Dismiss" className="ml-4"><X className="inline h-4 w-4" /></button></div>}
         {error && !noteEditor && !museEditor && !projectEditor && <div role="alert" className="fixed bottom-5 left-1/2 z-40 max-w-[90vw] -translate-x-1/2 rounded-lg bg-[#202020] px-4 py-3 text-sm text-white shadow-xl">{error}<button type="button" onClick={() => setError('')} aria-label="Dismiss error" className="ml-4"><X className="inline h-4 w-4" /></button></div>}
       </section>
-      {activeNote && <NoteReadingWorkspace key={activeNote.id} note={activeNote} previousNote={previousNote} allNotes={notes} muses={muses} projects={projects} saving={saving} userId={scope ?? 'local'} initialRetrievalMode={activeNoteRetrievalMode} autoSearch={activeNoteAutoSearch} onClose={() => { setActiveNoteId(null); setPreviousNoteId(null); }} onReturnToPrevious={() => { if (previousNote) { setActiveNoteAutoSearch(false); setActiveNoteId(previousNote.id); setPreviousNoteId(null); } }} onAddNote={() => { setActiveNoteId(null); setPreviousNoteId(null); openNewNote(cleanCategory(activeNote.category) ?? AUTOMATIC_MUSE); }} onOpenNote={(note, autoSearch) => openExistingNote(note, autoSearch, activeNote.id)} onOpenPage={(project, page) => { setActiveNoteId(null); setPreviousNoteId(null); setActiveProjectId(project.id); setActivePageId(page.id); }} onUpdate={updateReadingNote} onChangeDomain={(category) => void changeReadingNoteDomain(activeNote.id, category)} onDelete={removeReadingNote} onSaveRetrieval={saveInstantRetrieval} onSetDomainGoal={setDomainGoal} />}
+      {activeNote && <NoteReadingWorkspace key={activeNote.id} note={activeNote} previousNote={previousNote} allNotes={notes} muses={muses} projects={projects} saving={saving} userId={scope ?? 'local'} initialRetrievalMode={activeNoteRetrievalMode} autoSearch={activeNoteAutoSearch} onClose={() => { setActiveNoteId(null); setPreviousNoteId(null); }} onReturnToPrevious={() => { if (previousNote) { setActiveNoteAutoSearch(false); setActiveNoteId(previousNote.id); setPreviousNoteId(null); } }} onAddNote={() => { setActiveNoteId(null); setPreviousNoteId(null); openNewNote(cleanCategory(activeNote.category) ?? AUTOMATIC_MUSE); }} onOpenNote={(note, autoSearch) => openExistingNote(note, autoSearch, activeNote.id)} onOpenPage={(project, page) => { setActiveNoteId(null); setPreviousNoteId(null); setActiveProjectId(project.id); setActivePageId(page.id); }} onUpdate={updateReadingNote} onChangeDomain={(category) => void changeReadingNoteDomain(activeNote.id, category)} onDelete={removeReadingNote} onShare={shareNote} onSaveRetrieval={saveInstantRetrieval} onSetDomainGoal={setDomainGoal} />}
+      {shareNotice && <div role="status" aria-live="polite" className="fixed bottom-5 left-1/2 z-[95] flex max-w-[90vw] -translate-x-1/2 items-center gap-3 rounded-lg bg-[#202020] px-4 py-3 text-sm text-white shadow-xl"><span>{shareNotice}</span><Link href="/sharing" className="shrink-0 font-medium text-[#a8c4ff] hover:underline">Make a link</Link><button type="button" onClick={() => setShareNotice('')} aria-label="Dismiss"><X className="h-4 w-4" /></button></div>}
       {noteEditor && <NoteEditor state={noteEditor} muses={muses} notes={notes} saving={saving} error={error} onChange={setNoteEditor} onCreateMuse={createMuseFromEditor} onClose={() => { setNoteEditor(null); setError(''); }} onSave={() => void saveNote()} onFindRelevantNotes={() => void saveNote(true)} onImport={() => { setImportError(''); setImportOpen(true); }} onDelete={noteEditor.note ? () => void removeNote() : undefined} />}
       {museEditor && <MuseEditor state={museEditor} saving={saving} error={error} onChange={setMuseEditor} onClose={() => { setMuseEditor(null); setError(''); }} onSave={() => void saveMuse()} />}
       {projectEditor && <ProjectEditor state={projectEditor} error={error} onChange={setProjectEditor} onClose={() => { setProjectEditor(null); setError(''); }} onSave={saveProject} />}
@@ -900,6 +917,9 @@ function Avatar({ email, onOpenImport }: { email: string; onOpenImport: () => vo
       <DropdownMenuContent align="end" sideOffset={10} className="w-48 rounded-xl border-[#e6e7eb] bg-white p-1.5 text-[#252525] shadow-lg">
         <DropdownMenuItem asChild className={menuItemClassName}>
           <Link href="/profile">Profile</Link>
+        </DropdownMenuItem>
+        <DropdownMenuItem asChild className={menuItemClassName}>
+          <Link href="/sharing">Sharing</Link>
         </DropdownMenuItem>
         <DropdownMenuItem asChild className={menuItemClassName}>
           <a href="/terms">Terms of use</a>
@@ -1266,9 +1286,11 @@ function MuseSelector({ muses, notesByMuse, selected, busy, onClose, onSave, onC
   return <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/30 p-5 backdrop-blur-[6px]" role="dialog" aria-modal="true" aria-label="Choose Domains" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><div className="relative flex h-[min(78vh,720px)] w-[min(92vw,1220px)] flex-col rounded-xl bg-white shadow-2xl"><button type="button" onClick={onClose} aria-label="Close Domain selector" className="absolute right-2 top-2 z-10 text-[#777] sm:-right-10 sm:-top-10 sm:text-white"><X className="h-7 w-7" /></button><button type="button" onClick={onCreate} aria-label="Create Domain" className="absolute left-3 top-3 flex h-7 w-7 items-center justify-center rounded-md bg-[#477bea] text-white"><Plus className="h-4 w-4" /></button><h2 className="pt-12 text-center text-sm text-[#aaa]">Domains</h2><div className="grid flex-1 grid-cols-1 gap-8 overflow-y-auto px-12 pb-10 pt-14 sm:grid-cols-2 lg:grid-cols-4">{muses.map((muse) => <div key={muse.title} className="relative"><button type="button" onClick={() => toggle(muse.title)} className={`flex h-32 w-full flex-col justify-between rounded-lg p-5 pr-12 text-left shadow-[0_2px_8px_rgba(0,0,0,0.16)] ${draft.has(muse.title) ? 'bg-[#202020] text-white' : 'bg-[#f6f6f8] text-[#777]'}`}><span>{muse.title}</span><span className="text-xs opacity-60">{notesByMuse.get(muse.title)?.length ?? 0} notes</span></button><button type="button" onClick={() => setMenu(menu === muse.title ? null : muse.title)} aria-label={`${muse.title} options`} aria-expanded={menu === muse.title} className={`absolute right-2 top-2 z-10 flex h-8 w-8 items-center justify-center rounded-md ${draft.has(muse.title) ? 'text-white hover:bg-white/15' : 'text-[#555] hover:bg-black/10'}`}><MoreHorizontal className="h-5 w-5" /></button>{menu === muse.title && <div className="absolute right-2 top-11 z-30 w-32 overflow-hidden rounded-md border border-[#ddd] bg-white py-1 text-xs text-[#222] shadow-xl"><button type="button" onClick={() => { setMenu(null); onEdit(muse); }} className="block w-full px-3 py-2 text-left hover:bg-[#f5f5f5]">Edit Domain</button><button type="button" disabled={busy} onClick={() => { setMenu(null); setDraft((current) => { const next = new Set(current); next.delete(muse.title); return next; }); onDelete(muse.title); }} className="block w-full px-3 py-2 text-left text-red-600 hover:bg-red-50">Delete Domain</button></div>}</div>)}<button type="button" onClick={onCreate} aria-label="Add another Domain" className="flex h-32 items-center justify-center rounded-lg text-[#477bea] hover:bg-[#fafafa]"><Plus className="h-7 w-7" /></button></div><button type="button" onClick={() => onSave(draft)} className="absolute bottom-2 right-2 h-8 w-28 rounded-md bg-[#202020] text-sm text-white hover:bg-black">Save</button></div></div>;
 }
 
-function MuseDetail({ title, notes, isUnsorted, busy, onClose, onAddNote, onOpenNote, onEdit, onDelete }: {
+function MuseDetail({ title, notes, isUnsorted, busy, onClose, onAddNote, onOpenNote, onEdit, onDelete, onShare }: {
   title: string; notes: Note[]; isUnsorted: boolean; busy: boolean; onClose: () => void; onAddNote: () => void;
   onOpenNote: (note: Note) => void; onEdit: () => void; onDelete: () => void;
+  /** Copies every note here into the public notes. Left out where sharing does not apply. */
+  onShare?: () => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
@@ -1299,7 +1321,7 @@ function MuseDetail({ title, notes, isUnsorted, busy, onClose, onAddNote, onOpen
       <section className="relative min-h-0 flex-1 overflow-y-auto rounded-[28px] bg-white px-5 pb-16 pt-9 shadow-[0_14px_40px_rgba(0,0,0,0.12)] sm:px-10 lg:px-16">
       <p className="text-center text-sm font-normal text-[#b2b2b7]">{visibleNotes.length} {visibleNotes.length === 1 ? 'entry' : 'entries'}</p>
       {searchOpen && <label className="mx-auto mt-6 flex h-11 w-full max-w-md items-center rounded-xl bg-[#f7f7f9] px-4 shadow-sm"><Search className="mr-3 h-4 w-4 text-[#aaa]" /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${title}`} className="min-w-0 flex-1 bg-transparent text-sm text-[#222] outline-none placeholder:text-[#aaa]" /></label>}
-      {!isUnsorted && <div className="absolute right-5 top-4 sm:right-8"><button type="button" onClick={() => setMenuOpen((value) => !value)} aria-label="Domain options" aria-expanded={menuOpen} className="flex h-10 w-10 items-center justify-center rounded-md text-[#222] hover:bg-[#f4f4f4]"><MoreHorizontal className="h-5 w-5" /></button>{menuOpen && <div className="absolute right-0 top-11 z-10 w-40 overflow-hidden rounded-lg border border-[#ddd] bg-white py-1 text-sm shadow-xl"><button type="button" onClick={() => { setMenuOpen(false); onEdit(); }} className="block w-full px-4 py-2.5 text-left hover:bg-[#f5f5f5]">Edit Domain</button><button type="button" disabled={busy} onClick={() => { setMenuOpen(false); onDelete(); }} className="block w-full px-4 py-2.5 text-left text-red-600 hover:bg-red-50">Delete Domain</button></div>}</div>}
+      {!isUnsorted && <div className="absolute right-5 top-4 sm:right-8"><button type="button" onClick={() => setMenuOpen((value) => !value)} aria-label="Domain options" aria-expanded={menuOpen} className="flex h-10 w-10 items-center justify-center rounded-md text-[#222] hover:bg-[#f4f4f4]"><MoreHorizontal className="h-5 w-5" /></button>{menuOpen && <div className="absolute right-0 top-11 z-10 w-60 overflow-hidden rounded-lg border border-[#ddd] bg-white py-1 text-sm shadow-xl"><button type="button" onClick={() => { setMenuOpen(false); onEdit(); }} className="block w-full px-4 py-2.5 text-left hover:bg-[#f5f5f5]">Edit Domain</button>{onShare && notes.length > 0 && <button type="button" disabled={busy} onClick={() => { setMenuOpen(false); onShare(); }} className="block w-full px-4 py-2.5 text-left hover:bg-[#f5f5f5]">Copy all {notes.length} to public notes</button>}<button type="button" disabled={busy} onClick={() => { setMenuOpen(false); onDelete(); }} className="block w-full px-4 py-2.5 text-left text-red-600 hover:bg-red-50">Delete Domain</button></div>}</div>}
       <div className={`mx-auto mt-14 grid max-w-[1510px] grid-cols-1 gap-8 sm:grid-cols-2 lg:gap-x-12 lg:gap-y-10 ${compact ? 'xl:grid-cols-4' : 'xl:grid-cols-3'}`}>
         {visibleNotes.map((note) => { const content = splitNote(note); return <button key={note.id} type="button" onClick={() => onOpenNote(note)} className="relative h-[360px] min-w-0 overflow-hidden rounded-lg border border-[#e1e1e3] bg-[#f7f7f9] p-2 text-left shadow-[0_3px_12px_rgba(0,0,0,0.15)] transition hover:-translate-y-0.5 hover:border-[#7ca2ff] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]"><span className="block h-[280px] overflow-hidden rounded-md bg-white px-7 py-7">{content.hasTitle && <strong className="block line-clamp-3 text-base leading-snug text-[#151515]">{content.title}</strong>}<span className="mt-4 block whitespace-pre-wrap text-[15px] leading-[1.55] text-[#777] line-clamp-[8]">{content.body || notePreview(note)}</span></span><span className="absolute bottom-4 right-5 text-xs text-[#aaa]">{formatDate(note.created_at)}</span></button>; })}
         <button type="button" onClick={onAddNote} aria-label={`Add a note to ${title}`} className="relative flex h-[360px] items-start rounded-lg border border-[#e1e1e3] bg-white p-8 text-[#477bea] shadow-[0_3px_12px_rgba(0,0,0,0.15)] transition hover:-translate-y-0.5 hover:border-[#a9c0f5] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]"><span className="flex items-center gap-2"><Plus className="h-5 w-5" /> Add</span><span className="absolute inset-x-5 bottom-6 text-center text-sm italic text-[#b4b4b8]">You can always add more</span></button>
@@ -1471,12 +1493,14 @@ function RelatedNotePanel({ note, relevance, focusText = '', onClose, onOpenFull
   </div>;
 }
 
-function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, saving, userId, initialRetrievalMode, autoSearch, onClose, onReturnToPrevious, onAddNote, onOpenNote, onOpenPage, onUpdate, onChangeDomain, onDelete, onSaveRetrieval, onSetDomainGoal }: {
+function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, saving, userId, initialRetrievalMode, autoSearch, onClose, onReturnToPrevious, onAddNote, onOpenNote, onOpenPage, onUpdate, onChangeDomain, onDelete, onShare, onSaveRetrieval, onSetDomainGoal }: {
   note: Note; previousNote: Note | null; allNotes: Note[]; muses: MuseMeta[]; projects: CortexProject[]; saving: boolean; userId: string; initialRetrievalMode: 'similar' | 'relevant'; autoSearch: boolean;
   onClose: () => void; onReturnToPrevious: () => void; onAddNote: () => void; onOpenNote: (note: Note, autoSearch?: boolean) => void; onOpenPage: (project: CortexProject, page: ProjectPage) => void;
   onUpdate: (noteId: string, rawText: string) => Promise<void>; onChangeDomain: (category: string | null) => void; onDelete: (note: Note) => Promise<void>;
   onSaveRetrieval: (queryText: string, resultNotes: Note[], projectId: string, newProjectTitle?: string) => Promise<void>;
   onSetDomainGoal: (domainTitle: string, goal: string) => void;
+  /** Copies the note into the person's public notes, to share by link. */
+  onShare: (note: Note) => Promise<void>;
 }) {
   const initial = splitNote(note);
   const [title, setTitle] = useState(initial.title);
@@ -1979,7 +2003,6 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
       const mark = 'mark' in event ? event.mark : null;
       if (!mark || mark.start < cursor) return;
       const view = cardLayout.views[mark.index];
-      const style = SUGGESTION_STYLES[view.kind];
       const highlightStyle = HIGHLIGHT_STYLES[view.kind];
       const active = view.item === insight;
       const openInsight = () => selectInsight(mark.index);
@@ -1992,7 +2015,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
         aria-pressed={active}
         title="See what your notes say about this"
         className={`cursor-pointer rounded-sm px-0.5 text-inherit underline decoration-2 underline-offset-4 [box-decoration-break:clone] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${active ? highlightStyle.active : `${highlightStyle.idle} hover:brightness-[0.98]`}`}
-      >{displayedBody.slice(mark.start, mark.end)}<span className={`ml-1 inline-block rounded px-1 align-[1px] text-[10px] font-medium leading-4 ${style.badge}`}>{style.label}</span></mark>);
+      >{displayedBody.slice(mark.start, mark.end)}</mark>);
       cursor = mark.end;
     });
     if (cursor < section.end) nodes.push(displayedBody.slice(cursor, section.end));
@@ -2021,7 +2044,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
           <button type="button" disabled={!newerNote} onClick={() => newerNote && void leaveWorkspace(newerNote, false)} aria-label="Newer note" title="Newer note" className="hidden h-9 w-9 items-center justify-center rounded-md hover:bg-[#f4f4f4] disabled:opacity-25 sm:flex"><ChevronLeft className="h-4 w-4" /></button>
           <button type="button" disabled={!olderNote} onClick={() => olderNote && void leaveWorkspace(olderNote, false)} aria-label="Older note" title="Older note" className="hidden h-9 w-9 items-center justify-center rounded-md hover:bg-[#f4f4f4] disabled:opacity-25 sm:flex"><ChevronRight className="h-4 w-4" /></button>
           <button type="button" onClick={() => setMenuOpen((open) => !open)} aria-label="Note options" aria-expanded={menuOpen} className="flex h-10 w-10 items-center justify-center rounded-md hover:bg-[#f4f4f4] sm:h-9 sm:w-9"><MoreHorizontal className="h-5 w-5" /></button>
-          {menuOpen && <div className="absolute right-0 top-11 z-30 w-40 overflow-hidden rounded-lg border border-[#ddd] bg-white py-1 text-sm shadow-xl"><button type="button" disabled={saving} onClick={() => { setMenuOpen(false); void onDelete(note); }} className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-red-600 hover:bg-red-50"><Trash2 className="h-4 w-4" /> Delete note</button></div>}
+          {menuOpen && <div className="absolute right-0 top-11 z-30 w-56 overflow-hidden rounded-lg border border-[#ddd] bg-white py-1 text-sm shadow-xl">{!note.is_sample && <button type="button" disabled={saving} onClick={() => { setMenuOpen(false); void onShare(note); }} className="flex w-full items-center gap-2 px-4 py-2.5 text-left hover:bg-[#f5f5f5]"><Share2 className="h-4 w-4" /> Copy to public notes</button>}<button type="button" disabled={saving} onClick={() => { setMenuOpen(false); void onDelete(note); }} className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-red-600 hover:bg-red-50"><Trash2 className="h-4 w-4" /> Delete note</button></div>}
         </div>
       </header>
 
@@ -2083,7 +2106,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
                     {retrieval?.insight_failed && !insights.length && surfacedNotes.length > 0 && <div className="rounded-xl border border-[#f0d9a8] bg-[#fff8e8] p-5"><h3 className="text-sm font-medium text-[#6f5100]">Suggestions did not finish</h3><p className="mt-2 text-xs leading-relaxed text-[#806b35]">The related notes are still available below.</p></div>}
                     {retrieval && !retrieval.insight_failed && !insights.length && !retrieval.summary && <div className="rounded-xl border border-[#e2e2e2] bg-white p-5 text-sm leading-relaxed text-[#777]">{relatedHere.length || relatedNotes.forWholeNote.length ? 'No suggestions to act on yet, but these notes relate to it.' : 'No suggestion changes your next step yet.'}</div>}
                     {!retrieval && (noteTooShortForRetrieval || !hasOtherNotes) && <div className="rounded-xl border border-[#e2e2e2] bg-white p-5 text-sm leading-relaxed text-[#777]">{noteTooShortForRetrieval ? `Write at least ${MIN_RELEVANCE_DRAFT_CHARS} characters, then choose Find related notes.` : 'Once you have another note, Ocreda can look for connections.'}</div>}
-                    {relatedHere.length > 0 && <RelatedNotesList heading={noteSections.length > 1 ? 'Also related to this part' : 'Also related'} results={relatedHere} notesById={noteById} onOpen={showCitedNote} />}
+                    {relatedHere.length > 0 && <RelatedNotesList key={`part-${selectedSectionId}`} heading={noteSections.length > 1 ? 'Also related to this part' : 'Also related'} results={relatedHere} notesById={noteById} onOpen={showCitedNote} />}
                     {relatedNotes.forWholeNote.length > 0 && <RelatedNotesList heading={noteSections.length > 1 ? 'Also related to the whole note' : 'Also related'} results={relatedNotes.forWholeNote} notesById={noteById} onOpen={showCitedNote} />}
                     {goalPrompt}
                   </div>
@@ -2516,13 +2539,23 @@ function InsightSentence({ insight, kind, onOpenSource }: { insight: NoteInsight
   return <>{insight.text.split(/(\{\d+\})/).map((part, index) => {
     const quote = /^\{\d+\}$/.test(part) ? quotes[Number(part.slice(1, -1)) - 1] : undefined;
     if (!quote) return <Fragment key={index}>{part}</Fragment>;
-    return <button
+    const open = () => onOpenSource(quote.note_id, quote.text);
+    // A span, not a button: browsers lay a button out as one block, so a long
+    // quote filled the line and pushed the punctuation after it onto its own.
+    return <span
       key={index}
-      type="button"
-      onClick={(event) => { event.stopPropagation(); onOpenSource(quote.note_id, quote.text); }}
+      role="button"
+      tabIndex={0}
+      onClick={(event) => { event.stopPropagation(); open(); }}
+      onKeyDown={(event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        event.stopPropagation();
+        open();
+      }}
       title="Open the note this came from"
-      className={`inline rounded-sm text-left font-semibold underline decoration-2 underline-offset-4 hover:bg-black/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${SUGGESTION_STYLES[kind].quote}`}
-    >‘{quote.text}’</button>;
+      className={`cursor-pointer rounded-sm font-semibold underline decoration-2 underline-offset-4 [box-decoration-break:clone] hover:bg-black/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${SUGGESTION_STYLES[kind].quote}`}
+    >‘{quote.text}’</span>;
   })}</>;
 }
 
@@ -2691,9 +2724,9 @@ function CardAction({ insight, kind, decision, sourceTitle, sourceDate, onChoose
 }
 
 /**
- * Notes the search matched without a card: each with its name, date, and the
- * one-line summary of what it says. Opening one shows it beside the note at
- * the passage the match rested on.
+ * Notes the search matched without a card: each with its name, date, the
+ * one-line summary of what it says, and why it was picked. Opening one shows
+ * it beside the note at the passage the match rested on.
  */
 function RelatedNotesList({ heading, results, notesById, onOpen }: {
   heading: string;
@@ -2701,14 +2734,18 @@ function RelatedNotesList({ heading, results, notesById, onOpen }: {
   notesById: Map<string, Note>;
   onOpen: (noteId: string, focus?: string) => void;
 }) {
+  // Every match that cleared its bar arrives; the strongest few show first.
+  const [shown, setShown] = useState(RELATED_NOTES_PAGE_SIZE);
+  const remaining = results.length - shown;
   return <section aria-label={heading} className="pt-2">
     <h3 className="mb-2 text-[11px] font-medium uppercase tracking-[0.08em] text-[#999]">{heading}</h3>
     <ul className="space-y-2">
-      {results.map((result) => {
+      {results.slice(0, shown).map((result) => {
         const relatedNote = notesById.get(result.note_id);
         if (!relatedNote) return null;
         const badge = result.relation_type ? RELATION_BADGES[result.relation_type] : null;
         const summary = result.gist.trim() || notePreview(relatedNote);
+        const reason = result.explanation.trim();
         return <li key={result.note_id}>
           <button
             type="button"
@@ -2724,20 +2761,18 @@ function RelatedNotesList({ heading, results, notesById, onOpen }: {
               </span>
             </span>
             <span className="mt-1 line-clamp-2 block text-[13px] leading-relaxed text-[#666]">{summary}</span>
+            {/* Shown up front so the reader sees why the note is here without opening it. */}
+            {reason && <span className="mt-2 block rounded-md bg-[#e4f2e8] px-2.5 py-2">
+              <span className="block text-[9px] font-semibold uppercase tracking-[0.09em] text-[#6aa37c]">Why it’s relevant</span>
+              <span className="mt-1 block text-[12px] leading-relaxed text-[#4a6b55]">{reason}</span>
+            </span>}
           </button>
         </li>;
       })}
     </ul>
+    {remaining > 0 && <button type="button" onClick={() => setShown((count) => count + RELATED_NOTES_PAGE_SIZE)} className="mt-2 w-full rounded-lg border border-dashed border-[#d5d9e3] px-4 py-2 text-[13px] text-[#477bea] hover:border-[#8fb1ff] hover:bg-[#f8f9fc] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">Show {Math.min(RELATED_NOTES_PAGE_SIZE, remaining)} more <span className="text-[#999]">({remaining} left)</span></button>}
   </section>;
 }
-
-const CARD_SUBTITLES: Record<SuggestionKind, string> = {
-  solution: 'You answered this before',
-  helps: 'This might help',
-  extension: 'There’s more on this',
-  contradiction: 'This goes against an earlier note',
-  insight: 'You’ve seen this before',
-};
 
 /**
  * One suggestion: the sentence of the note it is about, their own past words
@@ -2763,22 +2798,18 @@ function SuggestionCard({ insight, kind, decision, notesById, trigger, outbound 
   const source = sourceId ? notesById.get(sourceId) : undefined;
   const sourceTitle = source ? noteLabel(source) : 'Earlier note';
   const sourceDate = source ? formatDate(source.created_at) : '';
-  const answersEarlierNote = kind === 'solution' && insight.direction === 'outbound' && Boolean(insight.problem);
-  const subtitle = answersEarlierNote ? 'This answers an earlier note'
-    : kind === 'solution' && source ? `You answered this on ${sourceDate}`
-      : outbound && kind === 'helps' ? 'Your lesson applies here' : CARD_SUBTITLES[kind];
   const cited = insight.note_ids.map((id) => notesById.get(id)).filter((note): note is Note => note !== undefined);
   return (
     <section aria-label={`${style.label} suggestion`} className={`rounded-xl border bg-white shadow-sm ${style.border} ${compact ? 'p-4' : 'p-6'}`}>
       <div className="flex items-center justify-between gap-2">
-        <p className="flex min-w-0 items-center gap-2"><span className={`shrink-0 rounded-md px-2 py-1 text-xs font-medium ${style.badge}`}>{style.label}</span><span className="truncate text-[11px] text-[#888]">{subtitle}</span></p>
+        <p className="flex min-w-0 items-center gap-2"><span className={`shrink-0 rounded-md px-2 py-1 text-xs font-medium ${style.badge}`}>{style.label}</span></p>
         {kind === 'contradiction' && onChoose && !decision && <button type="button" onClick={(event) => { event.stopPropagation(); onChoose('rejected'); }} aria-label="Dismiss" title="Dismiss" className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[#999] hover:bg-[#f5f5f5] hover:text-[#555]"><X className="h-4 w-4" /></button>}
       </div>
       {(trigger || insight.anchor) && <blockquote className="mt-3 border-l-2 border-[#ddd] pl-3 text-[13px] italic leading-relaxed text-[#777]">“{trigger
         ? <>{trigger.before}<span className={`rounded-sm px-0.5 not-italic text-[#444] ${HIGHLIGHT_STYLES[kind].idle}`}>{trigger.key}</span>{trigger.after}</>
         : insight.anchor}”</blockquote>}
-      {source && <p className="mt-4 text-[10px] font-medium uppercase tracking-[0.08em] text-[#999]">From “{sourceTitle}” · {sourceDate}</p>}
-      <p className={`mt-1.5 leading-relaxed text-[#222] ${compact ? 'text-[14px]' : 'text-[16px]'}`}><InsightSentence insight={insight} kind={kind} onOpenSource={onOpenSource} /></p>
+      <p className={`mt-4 leading-relaxed text-[#222] ${compact ? 'text-[14px]' : 'text-[16px]'}`}><InsightSentence insight={insight} kind={kind} onOpenSource={onOpenSource} /></p>
+      {source && <p className="mt-2 text-[11px] text-[#999]">From your notes: “{sourceTitle}” · {sourceDate}</p>}
       {onChoose
         ? <CardAction insight={insight} kind={kind} decision={decision} sourceTitle={sourceTitle} sourceDate={sourceDate} onChoose={onChoose} onOpenSource={onOpenSource} />
         : <p className="mt-3 text-[11px] text-[#999]">Save the note to act on this.</p>}
@@ -3035,7 +3066,7 @@ function RelevantNotesPanel({ notes, relevance, loading, progress, error, stale,
                     </div>
                   ) : null}
                   <div className="mt-2.5 flex items-center justify-between text-[11px] text-[#aaa]">
-                    <span>{Math.round(result.relevance_score * 100)}% {result.explanation ? 'match' : 'similarity'}</span>
+                    <span>{result.level ? `Level ${result.level} of 5` : `${Math.round(result.relevance_score * 100)}% ${result.explanation ? 'match' : 'similarity'}`}</span>
                     <span>{formatDate(note.created_at)}</span>
                   </div>
                 </div>

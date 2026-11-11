@@ -5,7 +5,7 @@ export const corsHeaders = {
 };
 
 /** "Best" mode, and the default everywhere: the production model. */
-export const BEST_MODEL = "google/gemini-3.7-flash";
+export const BEST_MODEL = "openai/gpt-6-luna";
 /** "Basic" mode: cheaper, for testing. Weaker on subtle relations. */
 export const BASIC_MODEL = "deepseek/deepseek-v4.1-flash";
 const DEFAULT_MODEL = BEST_MODEL;
@@ -21,6 +21,12 @@ const PROVIDERS_FOR_MODEL: Record<string, string[]> = {
   // Morph first, Inference.net as the backup; both serve it at fp8.
   [BASIC_MODEL]: ["morph", "inference-net"],
 };
+
+/**
+ * Models that take no temperature setting. Sending one anyway risks the request
+ * being rejected, so it is left out for them and they use their own default.
+ */
+const MODELS_WITHOUT_TEMPERATURE = new Set([BEST_MODEL]);
 
 /** The AI mode a person picks in the app. */
 export type ModelTier = "basic" | "best";
@@ -195,7 +201,9 @@ export async function generateWithGeminiResult(
         { role: "system", content: systemPrompt },
         ...messages.map((m) => ({ role: m.role === "model" ? "assistant" : m.role, content: m.content })),
       ],
-      ...(generationConfig?.temperature !== undefined ? { temperature: generationConfig.temperature } : {}),
+      ...(generationConfig?.temperature !== undefined && !MODELS_WITHOUT_TEMPERATURE.has(model)
+        ? { temperature: generationConfig.temperature }
+        : {}),
       ...(generationConfig?.maxOutputTokens !== undefined ? { max_tokens: generationConfig.maxOutputTokens } : {}),
       ...(generationConfig?.responseMimeType === "application/json"
         ? { response_format: { type: "json_object" } }

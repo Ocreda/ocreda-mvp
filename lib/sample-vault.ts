@@ -129,6 +129,8 @@ export async function removeSampleNotes(userId: string): Promise<void> {
   } else {
     const { error } = await supabase.from('notes').delete().eq('user_id', userId).eq('is_sample', true);
     if (error) throw error;
+    const { error: domainError } = await supabase.from('domains').delete().eq('user_id', userId).eq('is_sample', true);
+    if (domainError) throw domainError;
   }
   clearSampleWorkspace(userId);
   setSampleMode(userId, false);

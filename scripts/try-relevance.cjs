@@ -18,12 +18,18 @@
  *   --goal <text>      what the person is working toward, as a Domain description
  *                      would supply it; compare runs with and without it
  *   --basic            use the cheaper "Basic" model instead of "Best"
+ *   --cap <n>          matches kept per idea; like the app, the default keeps
+ *                      everything that cleared its bar
+ *
+ * Every run ends with the funnel: how many matches each step dropped, and the
+ * near-misses by name, so the bars and the cap can be tuned from real runs.
  */
 
 const fs = require('fs');
 const path = require('path');
 const {
-  findDraftSections, findInsight, mergeAgentResults, runRelevanceAgents,
+  findDraftSections, findInsight, mergeAgentResults, runRelevanceAgents, searchFunnel,
+  RELATION_MIN_LEVEL,
   DEFAULT_AGENT_COUNT: AGENT_COUNT,
   DEFAULT_AGENT_CONCURRENCY: AGENT_CONCURRENCY,
 } = require('../.relevance-build/relevance.js');
@@ -93,6 +99,7 @@ function parseArgs(argv) {
     else if (argv[i] === '--sample') args.sample = true;
     else if (argv[i] === '--goal') args.goal = argv[++i];
     else if (argv[i] === '--basic') args.basic = true;
+    else if (argv[i] === '--cap') args.cap = Number(argv[++i]);
   }
   return args;
 }
@@ -200,8 +207,9 @@ async function main() {
     });
     truthLabel = 'built-in labels';
   } else {
-    const truthFile = args.expected ? path.resolve(args.expected) : DEFAULT_TRUTH;
-    if (fs.existsSync(truthFile)) {
+    // The default picks belong to the default corpus; another corpus has no picks unless given.
+    const truthFile = args.expected ? path.resolve(args.expected) : args.notes ? null : DEFAULT_TRUTH;
+    if (truthFile && fs.existsSync(truthFile)) {
       const truth = JSON.parse(fs.readFileSync(truthFile, 'utf8'));
       for (const note of truth.notes ?? []) {
         picks.set(note.id, { order: note.order, title: note.title, why: note.explanation ?? '' });
@@ -257,7 +265,8 @@ async function main() {
   });
 
   const createdAtById = new Map(notes.map((n) => [n.id, n.created_at]));
-  const { results, notesSearched } = mergeAgentResults(outcomes, createdAtById, MAX_RESULTS);
+  const cap = Number.isInteger(args.cap) && args.cap > 0 ? args.cap : MAX_RESULTS;
+  const { results, notesSearched, cutByCap } = mergeAgentResults(outcomes, createdAtById, cap);
   const elapsed = ((Date.now() - started) / 1000).toFixed(1);
 
   console.log(`\nSearched ${notesSearched} of ${notes.length} notes in ${elapsed}s. ${results.length} scored relevant.`);
@@ -272,7 +281,7 @@ async function main() {
   results.forEach((result, index) => {
     const pick = picks.get(result.note_id);
     const tag = picks.size ? (pick ? `[#${String(pick.order).padStart(2)}]` : '[ --]') : '';
-    const pct = `${Math.round(result.relevance_score * 100)}%`;
+    const pct = `L${result.level}`;
     console.log(`\n${String(index + 1).padStart(2)}. ${tag} ${pct.padStart(4)}  ${RELATION_SHORT[result.relation_type]} ${result.direction === 'outbound' ? 'OUT' : 'in '} idea ${result.section_id.padEnd(5)} ${result.note_id} ${titleOf(textById.get(result.note_id))}`);
     if (result.gist) console.log(wrap(`Gist: ${result.gist}`, 72, '      '));
     console.log(wrap(`AI:  ${result.explanation}`, 72, '      '));
@@ -307,6 +316,30 @@ async function main() {
   if (!outcome.insights.length) console.log('  (none - nothing in the notes would change the next step)');
   if (outcome.goal_suggestions.length) console.log(`  goal chips: ${outcome.goal_suggestions.join(' | ')}`);
 
+  const funnel = searchFunnel(outcomes, results, cutByCap, outcome);
+  const belowCount = Object.values(funnel.below_bar).reduce((sum, scores) => sum + scores.length, 0);
+  console.log('\n' + '='.repeat(78));
+  console.log(`FUNNEL   (cap ${cap === MAX_RESULTS ? 'off' : cap} per idea)`);
+  console.log('='.repeat(78));
+  console.log(`  returned by agents  ${funnel.returned}`);
+  console.log(`  under their minimum -${belowCount}`);
+  console.log(`  cut by the cap      -${funnel.cut_by_cap.length}`);
+  console.log(`  shown               ${funnel.kept}`);
+  console.log(`  cards written       ${funnel.cards ?? 'insight failed'}`);
+  const misses = outcomes.flatMap((item) => item.belowBar ?? []).sort((a, b) => b.level - a.level);
+  if (misses.length) {
+    console.log('\n  UNDER THEIR MINIMUM (level / minimum):');
+    for (const miss of misses) {
+      console.log(`    L${miss.level} / L${RELATION_MIN_LEVEL[miss.relation_type]}  ${RELATION_SHORT[miss.relation_type]} ${miss.note_id} ${titleOf(textById.get(miss.note_id))}`);
+    }
+  }
+  if (cutByCap.length) {
+    console.log('\n  CUT BY THE CAP:');
+    for (const cut of cutByCap) {
+      console.log(`    L${cut.level}  ${RELATION_SHORT[cut.relation_type]} idea ${cut.section_id.padEnd(5)} ${cut.note_id} ${titleOf(textById.get(cut.note_id))}`);
+    }
+  }
+
   if (!picks.size) return;
 
   const returned = new Set(results.map((r) => r.note_id));
@@ -334,7 +367,7 @@ async function main() {
   if (extra.length) {
     console.log('\n  EXTRA — the AI surfaced these, you did not pick them:');
     for (const r of extra) {
-      console.log(`    ${r.note_id} (rank ${rankById.get(r.note_id)}, ${Math.round(r.relevance_score * 100)}%) ${titleOf(textById.get(r.note_id))}`);
+      console.log(`    ${r.note_id} (rank ${rankById.get(r.note_id)}, L${r.level}) ${titleOf(textById.get(r.note_id))}`);
       console.log(wrap(r.explanation, 66, '        '));
     }
   }

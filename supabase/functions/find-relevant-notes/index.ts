@@ -24,7 +24,7 @@ import {
   SearchCancelledError,
   DEFAULT_AGENT_CONCURRENCY,
   DEFAULT_AGENT_COUNT,
-  MAX_RESULTS_PER_SECTION,
+  type SearchFunnel,
   MIN_DRAFT_CHARS,
   type DraftSection,
   type GoalContext,
@@ -295,7 +295,8 @@ Deno.serve(async (req: Request) => {
       return sections;
     };
     const searchOptions = {
-      maxPerSection: MAX_RESULTS_PER_SECTION,
+      // Counts and levels only, no note text: where this search's matches went.
+      onFunnel: (funnel: SearchFunnel) => console.log("find-relevant-notes funnel", JSON.stringify({ tier, notes: notes.length, ...funnel })),
       findSections,
       summarize,
       findInsight: insightFor,

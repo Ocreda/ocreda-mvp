@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import Image from 'next/image';
 import { useAuth } from '@/lib/auth-context';
+import { readPendingShare } from '@/lib/sharing-api';
 import { Loader as Loader2 } from 'lucide-react';
 
 function friendlyError(msg: string): string {
@@ -41,7 +42,8 @@ export default function AuthPage() {
 
   useEffect(() => {
     if (!loading && user) {
-      router.replace('/');
+      const pendingShare = readPendingShare();
+      router.replace(pendingShare ? `/s/${pendingShare}` : '/');
     }
   }, [user, loading, router]);
 

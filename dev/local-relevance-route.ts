@@ -10,7 +10,7 @@ import {
   streamRelevanceSearch,
   DEFAULT_AGENT_CONCURRENCY,
   DEFAULT_AGENT_COUNT,
-  MAX_RESULTS_PER_SECTION,
+  type SearchFunnel,
   MIN_DRAFT_CHARS,
   type DraftSection,
   type NoteLike,
@@ -169,7 +169,7 @@ export async function POST(request: Request) {
       onError: (error) => { if (!signal?.aborted) console.error('[local] idea split unusable, searching by paragraph:', error instanceof Error ? error.message : error); },
     });
   const searchOptions = {
-    maxPerSection: MAX_RESULTS_PER_SECTION,
+    onFunnel: (funnel: SearchFunnel) => console.log('[local] find-relevant-notes funnel', JSON.stringify({ tier, notes: notes.length, ...funnel })),
     findSections,
     findInsight: insightFor,
     draft,

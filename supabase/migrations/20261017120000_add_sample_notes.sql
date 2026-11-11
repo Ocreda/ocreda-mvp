@@ -30,7 +30,8 @@ drop function if exists public.match_notes_semantic(
   double precision
 );
 
-create function public.match_notes_semantic(
+-- "or replace": production already had this version, created outside migrations.
+create or replace function public.match_notes_semantic(
   query_embedding extensions.vector(768),
   candidate_limit integer default 60,
   similarity_floor double precision default 0,

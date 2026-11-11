@@ -8,6 +8,7 @@ const {
   dealIntoChunks,
   parseAgentResponse,
   mergeAgentResults,
+  searchFunnel,
   runRelevanceAgents,
   streamRelevanceSearch,
   truncate,
@@ -18,6 +19,7 @@ const {
   searchRelevance,
   maxInsightsFor,
   buildPrompt,
+  RELATION_MIN_LEVEL,
   buildInsightPrompt,
   parseInsightResponse,
   findAnchor,
@@ -88,28 +90,32 @@ test('empty corpus yields no chunks', () => {
 // ------------------------------------------------------------- parsing
 
 const allowed = new Set(['keep-1', 'keep-2']);
-const row = (over) => JSON.stringify([{ note_id: 'keep-1', relevance_score: 0.8, relation_type: 'supports', explanation: 'because', ...over }]);
+const row = (over) => JSON.stringify([{ note_id: 'keep-1', level: 4, relation_type: 'supports', explanation: 'because', ...over }]);
 
 test('accepts a well-formed row', () => {
   const out = parseAgentResponse(row(), allowed);
   assert.strictEqual(out.length, 1);
   assert.strictEqual(out[0].relation_type, 'supports');
+  assert.strictEqual(out[0].level, 4);
+  assert.strictEqual(out[0].relevance_score, 0.8, 'ranked as level / 5');
 });
 
 test('drops a hallucinated id the agent was never shown', () => {
   assert.deepStrictEqual(parseAgentResponse(row({ note_id: 'not-in-chunk' }), allowed), []);
 });
 
-test('drops a score under the bar for its relation', () => {
-  assert.deepStrictEqual(parseAgentResponse(row({ relevance_score: 0.3 }), allowed), []);
+test('drops a level under the minimum for its relation', () => {
+  assert.deepStrictEqual(parseAgentResponse(row({ level: 3 }), allowed), []);
 });
 
-test('clamps a score above 1', () => {
-  assert.strictEqual(parseAgentResponse(row({ relevance_score: 4 }), allowed)[0].relevance_score, 1);
+test('clamps a level above 5, and rounds one that is not whole', () => {
+  assert.strictEqual(parseAgentResponse(row({ level: 9 }), allowed)[0].level, 5);
+  assert.strictEqual(parseAgentResponse(row({ level: '4.4' }), allowed)[0].level, 4);
 });
 
-test('drops a non-numeric score', () => {
-  assert.deepStrictEqual(parseAgentResponse(row({ relevance_score: 'very' }), allowed), []);
+test('drops a non-numeric level, and a row that sends only the old score', () => {
+  assert.deepStrictEqual(parseAgentResponse(row({ level: 'high' }), allowed), []);
+  assert.deepStrictEqual(parseAgentResponse(row({ level: undefined, relevance_score: 0.9 }), allowed), []);
 });
 
 test('falls back to "extends" for an unknown relation type', () => {
@@ -155,7 +161,7 @@ test('unparseable output yields nothing rather than throwing', () => {
   assert.deepStrictEqual(parseAgentResponse('{"note_id":"keep-1"}', allowed), []);
 });
 
-const result = (over = {}) => ({ note_id: 'keep-1', relevance_score: 0.8, relation_type: 'supports', explanation: 'because', ...over });
+const result = (over = {}) => ({ note_id: 'keep-1', level: 4, relation_type: 'supports', explanation: 'because', ...over });
 
 test('reads the {"results": [...]} object agents are asked for', () => {
   const out = parseAgentResponse(JSON.stringify({ results: [result(), result({ note_id: 'keep-2' })] }), allowed);
@@ -182,8 +188,8 @@ test('the agent prompt asks for an object, which JSON-object mode allows on ever
 
 test('keeps only the first of a repeated id', () => {
   const dupes = JSON.stringify([
-    { note_id: 'keep-1', relevance_score: 0.9, relation_type: 'supports', explanation: 'first' },
-    { note_id: 'keep-1', relevance_score: 0.6, relation_type: 'extends', explanation: 'second' },
+    { note_id: 'keep-1', level: 5, relation_type: 'supports', explanation: 'first' },
+    { note_id: 'keep-1', level: 3, relation_type: 'extends', explanation: 'second' },
   ]);
   const out = parseAgentResponse(dupes, allowed);
   assert.strictEqual(out.length, 1);
@@ -191,7 +197,7 @@ test('keeps only the first of a repeated id', () => {
 });
 
 test('skips null entries without dropping good ones', () => {
-  const mixed = JSON.stringify([null, { note_id: 'keep-2', relevance_score: 0.7, relation_type: 'question', explanation: 'ok' }]);
+  const mixed = JSON.stringify([null, { note_id: 'keep-2', level: 4, relation_type: 'question', explanation: 'ok' }]);
   assert.strictEqual(parseAgentResponse(mixed, allowed).length, 1);
 });
 
@@ -212,7 +218,7 @@ async function readEvents(stream) {
 // Every note in a chunk is scored relevant, so matches track what has finished.
 const matchEveryNote = (prompt) =>
   Promise.resolve(JSON.stringify([...prompt.matchAll(/^ID: (\S+)$/gm)].map((m) => ({
-    note_id: m[1], relevance_score: 0.8, relation_type: 'supports', gist: 'g', explanation: 'e',
+    note_id: m[1], level: 4, relation_type: 'supports', gist: 'g', explanation: 'e',
   }))));
 
 const streamOptions = (over) => ({
@@ -277,7 +283,7 @@ test('stream ends in an error event when every agent fails', async () => {
 
 // ------------------------------------------------------------- merging
 
-const res = (id, score) => ({ note_id: id, relevance_score: score, relation_type: 'extends', explanation: 'x' });
+const res = (id, score) => ({ note_id: id, level: Math.round(score * 5), relevance_score: score, relation_type: 'extends', explanation: 'x' });
 
 test('ranks by score across agents, highest first', () => {
   const { results } = mergeAgentResults(
@@ -334,7 +340,7 @@ test('every agent failing reports nothing searched', () => {
 
 // --------------------------------------------------------- orchestration
 
-const okResponse = (id) => JSON.stringify([{ note_id: id, relevance_score: 0.8, relation_type: 'supports', explanation: 'ok' }]);
+const okResponse = (id) => JSON.stringify([{ note_id: id, level: 4, relation_type: 'supports', explanation: 'ok' }]);
 const never = () => false;
 const always = () => true;
 
@@ -696,9 +702,14 @@ test('unparseable insight output is reported as a failure rather than throwing',
 
 const hit = (id, score, relation = 'supports') => ({ note_id: id, relevance_score: score, relation_type: relation, gist: '', explanation: 'why' });
 
-test('only strong matches feed the insight', () => {
-  const matches = selectInsightMatches([hit('a', 0.9), hit('b', 0.69), hit('c', 0.7)], [note('a'), note('b'), note('c')]);
-  assert.deepStrictEqual(matches.map((m) => m.note.id), ['a', 'c']);
+test('every match that cleared its bar feeds the insight, in rank order', () => {
+  const matches = selectInsightMatches([hit('a', 0.9), hit('b', 0.62, 'extends'), hit('gone', 0.8)], [note('a'), note('b')]);
+  assert.deepStrictEqual(matches.map((m) => m.note.id), ['a', 'b'], 'only notes that no longer exist are left out');
+});
+
+test('without a cap, every match that cleared its bar is kept', () => {
+  const many = Array.from({ length: 8 }, (_, i) => res(`n${i}`, 0.9 - i * 0.02));
+  assert.strictEqual(mergeAgentResults([{ chunkSize: 8, results: many }], new Map()).results.length, 8);
 });
 
 test('recent Domain notes are newest first, same Domain only, without the note itself', () => {
@@ -730,10 +741,10 @@ test('the insight prompt asks for their own words, connected, and never for text
   assert.ok(!prompt.includes('added to the note'));
 });
 
-test('no strong matches means no insight call at all', async () => {
+test('no matches means no insight call at all', async () => {
   let calls = 0;
   const out = await findInsight({
-    draft: 'd', context: { domain: null, goal: null }, notes: [note('a')], results: [hit('a', 0.6)], excludeNoteId: null,
+    draft: 'd', context: { domain: null, goal: null }, notes: [note('a')], results: [], excludeNoteId: null,
     generate: async () => { calls++; return '{}'; },
   });
   assert.strictEqual(calls, 0);
@@ -827,14 +838,21 @@ test('the insight prompt tells the model which way each note points', () => {
 
 // ------------------------------------------------------ relation bars, variety
 
-test('each relation is held to its own bar', () => {
-  const at = (relation, score) => parseAgentResponse(row({ relation_type: relation, relevance_score: score }), allowed).length;
-  assert.strictEqual(at('contradicts', 0.84), 0, 'a contradiction needs near-certainty');
-  assert.strictEqual(at('contradicts', 0.85), 1);
-  assert.strictEqual(at('extends', 0.6), 1, 'extends has the lowest bar');
-  assert.strictEqual(at('supports', 0.6), 0);
-  assert.strictEqual(at('solves', 0.7), 1);
-  assert.strictEqual(at('helps', 0.69), 0);
+test('the prompt states the same minimum levels the server enforces', () => {
+  const prompt = buildPrompt('a draft', [{ id: 'n1', raw_text: 'a note', summary: null, created_at: '2026-01-01' }]);
+  assert.ok(prompt.includes('"level": <integer 1-5>'), 'agents answer with a level, not a score');
+  assert.ok(prompt.includes('level 4 for solves, helps, supports, contradicts, question, and parallel; level 3 for extends'));
+  assert.deepStrictEqual(RELATION_MIN_LEVEL, { solves: 4, helps: 4, supports: 4, contradicts: 4, question: 4, parallel: 4, extends: 3 });
+});
+
+test('each relation is held to its own minimum level', () => {
+  const at = (relation, level) => parseAgentResponse(row({ relation_type: relation, level }), allowed).length;
+  for (const relation of ['solves', 'helps', 'supports', 'contradicts', 'question', 'parallel']) {
+    assert.strictEqual(at(relation, 3), 0, `${relation} needs level 4`);
+    assert.strictEqual(at(relation, 4), 1);
+  }
+  assert.strictEqual(at('extends', 3), 1, 'extends needs only level 3');
+  assert.strictEqual(at('extends', 2), 0);
 });
 
 test('helps and solves are recognised relations', () => {
@@ -1086,6 +1104,48 @@ test('the done event carries the sections', async () => {
   const done = events.at(-1);
   assert.strictEqual(done.type, 'done');
   assert.deepStrictEqual(done.sections.map((s) => s.id), ['1', '2', '3']);
+});
+
+// ------------------------------------------------------------- funnel
+
+test('a match under its bar is reported for measuring, never kept', () => {
+  const below = [];
+  const out = parseAgentResponse(row({ relation_type: 'parallel', level: 3 }), allowed, [], below);
+  assert.strictEqual(out.length, 0);
+  assert.deepStrictEqual(below, [{ note_id: 'keep-1', relation_type: 'parallel', level: 3 }]);
+});
+
+test('merging reports what the per-idea cap cut', () => {
+  const { results, cutByCap } = mergeAgentResults(
+    [{ chunkSize: 4, results: [res('a', 0.9), res('b', 0.8), res('c', 0.75), res('d', 0.62)] }],
+    new Map(),
+    3
+  );
+  assert.strictEqual(results.length, 3);
+  assert.deepStrictEqual(cutByCap.map((r) => r.note_id), ['d']);
+});
+
+test('the funnel counts each step, scores but no text', () => {
+  const funnel = searchFunnel(
+    [
+      { chunkSize: 5, results: [res('a', 1), res('b', 0.6)], belowBar: [{ note_id: 'x', relation_type: 'parallel', level: 3 }] },
+      { chunkSize: 5, results: null },
+    ],
+    [res('a', 1), res('b', 0.6)],
+    [res('c', 0.6)],
+    { insights: [{}], goal_suggestions: [], intent: null, failed: false }
+  );
+  assert.deepStrictEqual(funnel, {
+    returned: 3, below_bar: { parallel: [3] }, passed_bar: 2, cut_by_cap: [3], kept: 2, cards: 1,
+  });
+});
+
+test('a finished search reports its funnel', async () => {
+  let funnel = null;
+  await searchRelevance({ ...streamOptions(), onFunnel: (value) => { funnel = value; } });
+  assert.strictEqual(funnel.returned, 6);
+  assert.strictEqual(funnel.kept, 6);
+  assert.strictEqual(funnel.cards, null, 'no insight step was given');
 });
 
 run();

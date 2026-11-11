@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import Image from 'next/image';
 import { useAuth } from '@/lib/auth-context';
+import { shareToReturnTo } from '@/lib/sharing-api';
 import { TriangleAlert as AlertTriangle } from 'lucide-react';
 
 const AUTH_TIMEOUT_MS = 6000;
@@ -20,7 +21,9 @@ export default function AuthCallbackPage() {
 
   useEffect(() => {
     if (loading || !user) return;
-    router.replace('/');
+    // Someone who signed up from a shared link goes back to it, to add its notes.
+    const pendingShare = shareToReturnTo();
+    router.replace(pendingShare ? `/s/${pendingShare}` : '/');
   }, [loading, user, router]);
 
   if (!loading && !user && timedOut) {
