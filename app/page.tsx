@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, ArrowUp, Bold, Check, ChevronDown, ChevronLeft, ChevronRight, Filter, FolderPlus, Grid2X2, Italic, Layers3, List, ListOrdered, Loader as Loader2, Mic, MoreHorizontal, PanelRightOpen, Pin, Plus, RefreshCw, Rows3, ScanSearch, Search, Share2, Trash2, Upload, X } from 'lucide-react';
+import { ArrowLeft, Bold, Check, ChevronDown, ChevronLeft, ChevronRight, Filter, FolderPlus, Grid2X2, Italic, Layers3, List, ListOrdered, Loader as Loader2, Mic, MoreHorizontal, PanelRightOpen, Pin, Plus, RefreshCw, Rows3, ScanSearch, Search, Share2, Trash2, Upload, X } from 'lucide-react';
 import type { RelevanceProgress } from '@/lib/types';
 import NoteImporter, { ImportDomainDraft, ImportNoteDraft } from '@/components/NoteImporter';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
@@ -15,7 +15,8 @@ import { prepareImportedNoteText } from '@/lib/import-note-content';
 import { IS_LOCAL_MODE } from '@/dev/local-mode';  // DEV-LOCAL-MODE
 import { CardChoice, CardDecision, CardKind, DomainGoal, IncomingCardDecision, InsightIntent, Note, NoteInsight, NoteRelationType, RelevanceCoverage, RelevanceResult, RelevanceSection, SuggestionKind } from '@/lib/types';
 import { loadCardDecisions, saveCardDecision } from '@/lib/card-decisions';
-import { findAnchor, RELATED_NOTES_PAGE_SIZE, splitIntoParagraphs } from '@/supabase/functions/_shared/relevance';
+import { loadNotesUsing, loadSharedRetrieval, SharedRetrieval, storeSharedRetrieval } from '@/lib/saved-retrievals';
+import { defaultNoteTitle, findAnchor, readNoteTitle, RELATED_NOTES_PAGE_SIZE, splitIntoParagraphs } from '@/supabase/functions/_shared/relevance';
 import { getAiMode, useAiMode } from '@/lib/ai-mode';
 import { setSampleMode, useSampleMode, workspaceScope } from '@/lib/sample-mode';
 import { isSampleGuide, loadSampleVault, SampleVault } from '@/lib/sample-vault';
@@ -57,17 +58,33 @@ function domainGoalFor(category: string | null | undefined, muses: MuseMeta[]): 
 }
 
 /**
- * Existing notes keep the app's original storage convention: line one is the
- * title and all later lines are the body. Title generation for titleless files
- * happens only in the import path, before a new note is inserted.
+ * A note's title and body. Line one is the title, as notes are stored, unless
+ * the note was saved without one: then the title is its first five words and
+ * the body is all of its text. That reading also fixes notes saved before,
+ * whose whole text sat in the title. `written` is false for a made-up title.
  */
-function splitNote(note: Note): { title: string; body: string; hasTitle: boolean } {
-  const text = note.raw_text.trim();
-  if (!text) return { title: '', body: '', hasTitle: false };
-  const [first, ...rest] = text.split('\n');
-  const heading = first.trim();
-  const body = rest.join('\n').trim();
-  return { title: heading, body, hasTitle: Boolean(heading) };
+function splitNote(note: Note): { title: string; body: string; hasTitle: boolean; written: boolean } {
+  const { title, body, written } = readNoteTitle(note.raw_text);
+  return { title, body, hasTitle: Boolean(title), written };
+}
+
+/** What the title field starts with: empty when the person never wrote a title. */
+function editableTitle(note: Note): string {
+  const { title, written } = splitNote(note);
+  return written ? title : '';
+}
+
+/**
+ * The stored text for a title and body. With no title, a note longer than five
+ * words gets its first five words and "..." as one, so the text stays in the body.
+ */
+function composeNoteText(title: string, body: string): string {
+  const cleanBody = body.trim();
+  const cleanTitle = title.trim() || (cleanBody ? defaultNoteTitle(cleanBody) : '');
+  if (!cleanBody) return cleanTitle;
+  // A note of five words or fewer is its own title.
+  if (!title.trim() && !cleanTitle.endsWith('...')) return cleanBody;
+  return `${cleanTitle}\n\n${cleanBody}`;
 }
 
 const MAX_LABEL_CHARS = 60;
@@ -141,10 +158,21 @@ function noteSignature(note: Note, goal: string): string {
   return retrievalInputSignature(note.raw_text, goal, getAiMode());
 }
 
-function readSavedRetrieval(userId: string, note: Note): { mode: 'similar' | 'relevant'; search: RelevanceSearch; signature: string } | null {
+type SavedRetrieval = { mode: 'similar' | 'relevant'; search: RelevanceSearch; signature: string; savedAt: string };
+
+function readSavedRetrieval(userId: string, note: Note): SavedRetrieval | null {
   try {
-    const saved = JSON.parse(localStorage.getItem(savedRetrievalKey(userId, note.id)) ?? 'null') as {
-      signature?: string; mode?: string; search?: RelevanceSearch;
+    return checkSavedRetrieval(JSON.parse(localStorage.getItem(savedRetrievalKey(userId, note.id)) ?? 'null'));
+  } catch {
+    return null;
+  }
+}
+
+/** A saved retrieval, from this browser or the database, if it is complete enough to show. */
+function checkSavedRetrieval(value: unknown): SavedRetrieval | null {
+  try {
+    const saved = value as {
+      signature?: string; mode?: string; search?: RelevanceSearch; savedAt?: string;
     } | null;
     // Keep a valid older retrieval visible after the note or Domain changes.
     // Its signature is returned so the UI can mark it stale and offer an
@@ -156,18 +184,32 @@ function readSavedRetrieval(userId: string, note: Note): { mode: 'similar' | 're
     // Older similarity-only responses have empty explanations. Do not reuse
     // them in the annotated reading view, where every card needs a reason.
     if (saved.mode === 'relevant' && !saved.search.results.every((result) => typeof result.explanation === 'string' && result.explanation.trim())) return null;
-    return { mode: saved.mode, search: saved.search, signature: saved.signature };
+    // Copies saved before the database kept them have no date: any shared copy is newer.
+    const savedAt = typeof saved.savedAt === 'string' ? saved.savedAt : '';
+    return { mode: saved.mode, search: saved.search, signature: saved.signature, savedAt };
   } catch {
     return null;
   }
 }
 
-function persistSavedRetrieval(userId: string, note: Note, goal: string, mode: 'similar' | 'relevant', search: RelevanceSearch, signature = noteSignature(note, goal)): void {
+/** Keeps a retrieval in this browser, for showing it instantly next time. */
+function cacheSavedRetrieval(userId: string, noteId: string, saved: Omit<SavedRetrieval, 'search'> & { search: unknown }): void {
   try {
-    localStorage.setItem(savedRetrievalKey(userId, note.id), JSON.stringify({ signature, mode, search }));
+    localStorage.setItem(savedRetrievalKey(userId, noteId), JSON.stringify(saved));
   } catch {
     // A full or disabled browser store should not prevent the note itself from being saved.
   }
+}
+
+/** Saves a finished retrieval here and in the database, so every device shows it without searching again. */
+function persistSavedRetrieval(userId: string, note: Note, goal: string, mode: 'similar' | 'relevant', search: RelevanceSearch, signature = noteSignature(note, goal)): void {
+  cacheSavedRetrieval(userId, note.id, { signature, mode, search, savedAt: new Date().toISOString() });
+  storeSharedRetrieval(note.id, SAVED_RETRIEVAL_VERSION, { signature, mode, search });
+}
+
+/** A retrieval saved on another device, checked like a browser copy. */
+function fromShared(shared: SharedRetrieval | null): SavedRetrieval | null {
+  return shared ? checkSavedRetrieval(shared) : null;
 }
 
 function safeErrorMessage(error: unknown, fallback: string): string {
@@ -601,7 +643,7 @@ export default function OcredaHome() {
     if (!noteEditor) return;
     const title = noteEditor.title.trim(); const body = noteEditor.body.trim();
     if (!title && !body) { setError('Write something before saving.'); return; }
-    const rawText = title && body ? `${title}\n\n${body}` : title || body;
+    const rawText = composeNoteText(title, body);
     const category = cleanCategory(noteEditor.muse) ?? ORPHANS_MUSE;
     if (findRelevant && category.toLowerCase() === ORPHANS_MUSE.toLowerCase()) {
       setError('Choose a Domain before finding related notes.');
@@ -699,39 +741,6 @@ export default function OcredaHome() {
   };
   const shareNote = (note: Note) => shareNotes([note]);
 
-  const saveInstantRetrieval = async (queryText: string, resultNotes: Note[], projectId: string, newProjectTitle?: string) => {
-    setSaving(true); setError('');
-    try {
-      const now = new Date().toISOString();
-      let target = projects.find((project) => project.id === projectId);
-      let nextProjects = projects;
-      if (!target) {
-        const title = cleanCategory(newProjectTitle);
-        if (!title) throw new Error('Choose a project or create a new one first.');
-        target = { id: createProjectId(), title, description: `Pages saved from Instant Retrieval.`, content: '', pages: [], createdAt: now, updatedAt: now };
-        nextProjects = [...projects, target];
-      }
-      const closest = resultNotes[0];
-      const closestContent = closest ? splitNote(closest) : null;
-      const page: ProjectPage = {
-        id: createPageId(),
-        title: queryText.trim().replace(/[.!?]+$/, '').slice(0, 100) || 'Instant retrieval',
-        content: closestContent
-          ? `${closestContent.title}\n\n${closestContent.body || notePreview(closest)}`
-          : `Instant retrieval\n\n${queryText.trim()}`,
-        sourceNoteIds: resultNotes.slice(0, 6).map((note) => note.id),
-        createdAt: now,
-        updatedAt: now,
-      };
-      nextProjects = nextProjects.map((project) => project.id === target!.id ? { ...project, pages: [...project.pages, page], updatedAt: now } : project);
-      persistProjects(nextProjects);
-      setActiveProjectId(target.id);
-      setActivePageId(page.id);
-      flashSaved();
-    } catch (err) { setError(safeErrorMessage(err, 'Unable to save this retrieval.')); throw err; }
-    finally { setSaving(false); }
-  };
-
   const saveMuse = async () => {
     if (!museEditor) return;
     const title = cleanCategory(museEditor.title);
@@ -765,7 +774,7 @@ export default function OcredaHome() {
   };
 
   const removeMuse = async (title: string) => {
-    if (!confirm(`Delete “${title}”? Its notes will return to Instant retrieval.`)) return;
+    if (!confirm(`Delete “${title}”? Its notes will move to ${ORPHANS_MUSE}.`)) return;
     setSaving(true);
     try {
       // Its notes are left without a Domain.
@@ -897,16 +906,16 @@ export default function OcredaHome() {
     <main className={`light h-[100dvh] w-full overflow-hidden bg-white text-[#141414] ${sampleMode ? 'pt-[var(--sample-banner-height)]' : ''}`}>
       {sampleMode && <SampleBanner onExit={exitSampleMode} />}
       <section className="relative flex h-full w-full flex-col overflow-hidden bg-white">
-        {activeProject && activePage ? <ProjectPageWorkspace key={activePage.id} project={activeProject} page={activePage} notes={notes} muses={muses} projects={projects} saving={saving} onBack={() => setActivePageId(null)} onChange={(page) => updateProjectPage(activeProject.id, page)} onAddNote={() => openNewNote()} onOpenNote={openExistingNote} onOpenPage={(project, page) => { setActiveProjectId(project.id); setActivePageId(page.id); }} onDelete={() => removeProjectPage(activeProject.id, activePage.id)} onSaveRetrieval={saveInstantRetrieval} />
+        {activeProject && activePage ? <ProjectPageWorkspace key={activePage.id} project={activeProject} page={activePage} notes={notes} muses={muses} projects={projects} saving={saving} onBack={() => setActivePageId(null)} onChange={(page) => updateProjectPage(activeProject.id, page)} onAddNote={() => openNewNote()} onOpenNote={openExistingNote} onOpenPage={(project, page) => { setActiveProjectId(project.id); setActivePageId(page.id); }} onDelete={() => removeProjectPage(activeProject.id, activePage.id)} />
           : activeProject ? <ProjectPagesGrid project={activeProject} onBack={() => { setActiveProjectId(null); setActivePageId(null); }} onAddPage={() => createProjectPage(activeProject.id)} onOpenPage={(page) => setActivePageId(page.id)} onEdit={() => setProjectEditor({ project: activeProject, title: activeProject.title, description: activeProject.description })} onDelete={() => removeProject(activeProject.id)} />
           : isEmpty ? <EmptyWorkspace displayName={displayName} userEmail={user?.email ?? ''} existingDomains={muses} onAddNote={() => openNewNote()} onImport={handleImport} onOpenImport={() => setImportOpen(true)} onTrySamples={user && !sampleMode ? () => setSampleMode(user.id, true) : undefined} importError={importError} progress={importProgress} />
-          : activeMuse || showUnsorted ? <MuseDetail title={showUnsorted ? 'Instant retrieval' : activeMuse ?? ''} notes={showUnsorted ? unsortedNotes : notesByMuse.get(activeMuse ?? '') ?? []} isUnsorted={showUnsorted} busy={saving} onClose={closeLibrary} onAddNote={() => openNewNote(showUnsorted ? ORPHANS_MUSE : activeMuse ?? ORPHANS_MUSE)} onOpenNote={openExistingNote} onEdit={() => { const meta = muses.find((item) => item.title === activeMuse); if (meta) setMuseEditor({ originalTitle: meta.title, title: meta.title, description: meta.description }); }} onDelete={() => { if (activeMuse) void removeMuse(activeMuse); }} onShare={sampleMode || showUnsorted ? undefined : () => void shareNotes(notesByMuse.get(activeMuse ?? '') ?? [])} />
-          : view === 'muses' ? <MuseGrid muses={muses} projects={projects} notes={notes} notesByMuse={notesByMuse} busy={saving} onClose={closeLibrary} onAddNote={(muse) => openNewNote(muse ?? ORPHANS_MUSE)} onAddMuse={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onEditMuse={(muse) => setMuseEditor({ originalTitle: muse.title, title: muse.title, description: muse.description })} onDeleteMuse={(title) => void removeMuse(title)} onOpenNote={openExistingNote} onSaveRetrieval={saveInstantRetrieval} />
-          : <CortexHome projects={projects} muses={muses} pinnedMuseTitles={pinnedMuseTitles} notes={notes} notesByMuse={notesByMuse} userEmail={user?.email ?? ''} busy={saving} onOpenMuses={() => setView('muses')} onOpenMuse={openMuse} onTogglePin={togglePinnedMuse} onAddMuse={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onAddNote={() => openNewNote()} onOpenImport={() => setImportOpen(true)} onOpenPage={(project, page) => { setActiveProjectId(project.id); setActivePageId(page.id); }} onOpenNote={openExistingNote} onSaveRetrieval={saveInstantRetrieval} />}
+          : activeMuse || showUnsorted ? <MuseDetail title={showUnsorted ? ORPHANS_MUSE : activeMuse ?? ''} notes={showUnsorted ? unsortedNotes : notesByMuse.get(activeMuse ?? '') ?? []} isUnsorted={showUnsorted} busy={saving} onClose={closeLibrary} onAddNote={() => openNewNote(showUnsorted ? ORPHANS_MUSE : activeMuse ?? ORPHANS_MUSE)} onOpenNote={openExistingNote} onEdit={() => { const meta = muses.find((item) => item.title === activeMuse); if (meta) setMuseEditor({ originalTitle: meta.title, title: meta.title, description: meta.description }); }} onDelete={() => { if (activeMuse) void removeMuse(activeMuse); }} onShare={sampleMode || showUnsorted ? undefined : () => void shareNotes(notesByMuse.get(activeMuse ?? '') ?? [])} />
+          : view === 'muses' ? <MuseGrid muses={muses} projects={projects} notes={notes} notesByMuse={notesByMuse} busy={saving} onClose={closeLibrary} onAddNote={(muse) => openNewNote(muse ?? ORPHANS_MUSE)} onAddMuse={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onEditMuse={(muse) => setMuseEditor({ originalTitle: muse.title, title: muse.title, description: muse.description })} onDeleteMuse={(title) => void removeMuse(title)} onOpenNote={openExistingNote} />
+          : <CortexHome projects={projects} muses={muses} pinnedMuseTitles={pinnedMuseTitles} notes={notes} notesByMuse={notesByMuse} userEmail={user?.email ?? ''} busy={saving} onOpenMuses={() => setView('muses')} onOpenMuse={openMuse} onTogglePin={togglePinnedMuse} onAddMuse={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onAddNote={() => openNewNote()} onOpenImport={() => setImportOpen(true)} onOpenPage={(project, page) => { setActiveProjectId(project.id); setActivePageId(page.id); }} onOpenNote={openExistingNote} />}
         {notice && !error && <div role="status" aria-live="polite" className="fixed bottom-5 left-1/2 z-40 max-w-[90vw] -translate-x-1/2 rounded-lg bg-[#202020] px-4 py-3 text-sm text-white shadow-xl">{notice}<button type="button" onClick={() => setNotice('')} aria-label="Dismiss" className="ml-4"><X className="inline h-4 w-4" /></button></div>}
         {error && !noteEditor && !museEditor && !projectEditor && <div role="alert" className="fixed bottom-5 left-1/2 z-40 max-w-[90vw] -translate-x-1/2 rounded-lg bg-[#202020] px-4 py-3 text-sm text-white shadow-xl">{error}<button type="button" onClick={() => setError('')} aria-label="Dismiss error" className="ml-4"><X className="inline h-4 w-4" /></button></div>}
       </section>
-      {activeNote && <NoteReadingWorkspace key={activeNote.id} note={activeNote} previousNote={previousNote} allNotes={notes} muses={muses} projects={projects} saving={saving} userId={scope ?? 'local'} initialRetrievalMode={activeNoteRetrievalMode} autoSearch={activeNoteAutoSearch} onClose={() => { setActiveNoteId(null); setPreviousNoteId(null); }} onReturnToPrevious={() => { if (previousNote) { setActiveNoteAutoSearch(false); setActiveNoteId(previousNote.id); setPreviousNoteId(null); } }} onAddNote={() => { setActiveNoteId(null); setPreviousNoteId(null); openNewNote(cleanCategory(activeNote.category) ?? ORPHANS_MUSE); }} onOpenNote={(note, autoSearch) => openExistingNote(note, autoSearch, activeNote.id)} onOpenPage={(project, page) => { setActiveNoteId(null); setPreviousNoteId(null); setActiveProjectId(project.id); setActivePageId(page.id); }} onUpdate={updateReadingNote} onChangeDomain={(category) => void changeReadingNoteDomain(activeNote.id, category)} onCreateDomain={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onDelete={removeReadingNote} onShare={shareNote} onSaveRetrieval={saveInstantRetrieval} onSetDomainGoal={setDomainGoal} />}
+      {activeNote && <NoteReadingWorkspace key={activeNote.id} note={activeNote} previousNote={previousNote} allNotes={notes} muses={muses} projects={projects} saving={saving} userId={scope ?? 'local'} initialRetrievalMode={activeNoteRetrievalMode} autoSearch={activeNoteAutoSearch} onClose={() => { setActiveNoteId(null); setPreviousNoteId(null); }} onReturnToPrevious={() => { if (previousNote) { setActiveNoteAutoSearch(false); setActiveNoteId(previousNote.id); setPreviousNoteId(null); } }} onAddNote={() => { setActiveNoteId(null); setPreviousNoteId(null); openNewNote(cleanCategory(activeNote.category) ?? ORPHANS_MUSE); }} onOpenNote={(note, autoSearch) => openExistingNote(note, autoSearch, activeNote.id)} onOpenPage={(project, page) => { setActiveNoteId(null); setPreviousNoteId(null); setActiveProjectId(project.id); setActivePageId(page.id); }} onUpdate={updateReadingNote} onChangeDomain={(category) => void changeReadingNoteDomain(activeNote.id, category)} onCreateDomain={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onDelete={removeReadingNote} onShare={shareNote} onSetDomainGoal={setDomainGoal} />}
       {shareNotice && <div role="status" aria-live="polite" className="fixed bottom-5 left-1/2 z-[95] flex max-w-[90vw] -translate-x-1/2 items-center gap-3 rounded-lg bg-[#202020] px-4 py-3 text-sm text-white shadow-xl"><span>{shareNotice}</span><Link href="/sharing" className="shrink-0 font-medium text-[#a8c4ff] hover:underline">Make a link</Link><button type="button" onClick={() => setShareNotice('')} aria-label="Dismiss"><X className="h-4 w-4" /></button></div>}
       {noteEditor && <NoteEditor state={noteEditor} muses={muses} notes={notes} saving={saving} error={error} onChange={setNoteEditor} onCreateMuse={createMuseFromEditor} onClose={() => { setNoteEditor(null); setError(''); }} onSave={() => void saveNote()} onFindRelevantNotes={() => void saveNote(true)} onImport={() => { setImportError(''); setImportOpen(true); }} onDelete={noteEditor.note ? () => void removeNote() : undefined} />}
       {museEditor && <MuseEditor state={museEditor} saving={saving} error={error} onChange={setMuseEditor} onClose={() => { setMuseEditor(null); setError(''); }} onSave={() => void saveMuse()} />}
@@ -1018,14 +1027,12 @@ function EmptyWorkspace({ displayName, userEmail, existingDomains, onAddNote, on
   );
 }
 
-function CortexHome({ projects, muses, pinnedMuseTitles, notes, notesByMuse, userEmail, busy, onOpenMuses, onOpenMuse, onTogglePin, onAddMuse, onAddNote, onOpenImport, onOpenPage, onOpenNote, onSaveRetrieval }: {
+function CortexHome({ projects, muses, pinnedMuseTitles, notes, notesByMuse, userEmail, busy, onOpenMuses, onOpenMuse, onTogglePin, onAddMuse, onAddNote, onOpenImport, onOpenPage, onOpenNote }: {
   projects: CortexProject[]; muses: MuseMeta[]; pinnedMuseTitles: string[]; notes: Note[]; notesByMuse: Map<string, Note[]>; userEmail: string; busy: boolean;
   onOpenMuses: () => void; onOpenMuse: (title: string) => void; onTogglePin: (title: string) => void; onAddMuse: () => void; onAddNote: () => void; onOpenImport: () => void;
   onOpenPage: (project: CortexProject, page: ProjectPage) => void; onOpenNote: (note: Note) => void;
-  onSaveRetrieval: (queryText: string, resultNotes: Note[], projectId: string, newProjectTitle?: string) => Promise<void>;
 }) {
   const [searchOpen, setSearchOpen] = useState(false);
-  const [instantRetrievalOpen, setInstantRetrievalOpen] = useState(false);
   const pinnedMuses = pinnedMuseTitles.map((title) => muses.find((muse) => muse.title.toLowerCase() === title.toLowerCase())).filter((muse): muse is MuseMeta => Boolean(muse));
   const unpinnedMuses = muses.filter((muse) => !pinnedMuseTitles.some((title) => title.toLowerCase() === muse.title.toLowerCase()));
 
@@ -1035,7 +1042,6 @@ function CortexHome({ projects, muses, pinnedMuseTitles, notes, notesByMuse, use
         <div className="flex items-center gap-2 text-[#222]">
           <button type="button" onClick={onAddNote} className="flex h-10 items-center gap-2 rounded-md px-2 text-sm hover:bg-[#f5f5f6]" title="Add a note"><span className="flex h-7 w-16 items-center justify-center rounded-md bg-[#477bea] text-white"><Plus className="h-4 w-4" /></span><span className="hidden sm:inline">Add a note</span></button>
           <button type="button" onClick={() => setSearchOpen(true)} aria-label="Search notes, pages, and Domains" title="Search notes, pages, and Domains" className="flex h-10 w-10 items-center justify-center rounded-md hover:bg-[#f5f5f6]"><Search className="h-5 w-5" /></button>
-          <button type="button" onClick={() => setInstantRetrievalOpen(true)} aria-label="Open Instant Retrieval" title="Instant Retrieval" className="flex h-10 w-10 items-center justify-center rounded-md text-[#477bea] hover:bg-[#edf3ff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]"><ScanSearch className="h-5 w-5" /></button>
           <button type="button" onClick={onOpenImport} aria-label="Import notes" title="Import notes" className="flex h-10 w-10 items-center justify-center rounded-md hover:bg-[#f5f5f6]"><Upload className="h-5 w-5" /></button>
         </div>
         <h1 className="pointer-events-none absolute left-1/2 hidden -translate-x-1/2 text-sm font-normal text-[#b2b2b2] lg:block lg:text-base">Your knowledge</h1>
@@ -1066,8 +1072,7 @@ function CortexHome({ projects, muses, pinnedMuseTitles, notes, notesByMuse, use
         <span>{notes.length} {notes.length === 1 ? 'Note' : 'Notes'}</span>
       </button>
 
-      {searchOpen && <KnowledgeSearchOverlay request={{ query: '' }} notes={notes} muses={muses} projects={projects} hideProjectColumn onClose={() => setSearchOpen(false)} onOpenPage={(project, page) => { setSearchOpen(false); onOpenPage(project, page); }} onOpenNote={(note) => { setSearchOpen(false); onOpenNote(note); }} onInstantRetrieval={() => { setSearchOpen(false); setInstantRetrievalOpen(true); }} />}
-      {instantRetrievalOpen && <InstantRetrievalOverlay notes={notes} muses={muses} projects={projects} saving={busy} onClose={() => setInstantRetrievalOpen(false)} onOpenNote={(note) => { setInstantRetrievalOpen(false); onOpenNote(note); }} onSave={onSaveRetrieval} />}
+      {searchOpen && <KnowledgeSearchOverlay request={{ query: '' }} notes={notes} muses={muses} projects={projects} hideProjectColumn onClose={() => setSearchOpen(false)} onOpenPage={(project, page) => { setSearchOpen(false); onOpenPage(project, page); }} onOpenNote={(note) => { setSearchOpen(false); onOpenNote(note); }} />}
     </div>
   );
 }
@@ -1099,7 +1104,7 @@ function ProjectPagesGrid({ project, onBack, onAddPage, onOpenPage, onEdit, onDe
     <main className="min-h-0 flex-1 overflow-y-auto rounded-2xl bg-white px-6 py-12 shadow-2xl sm:px-12 lg:px-20">
       {project.description && <p className="mx-auto mb-12 max-w-4xl text-center text-sm leading-relaxed text-[#888]">{project.description}</p>}
       <div className="mx-auto grid max-w-[1350px] grid-cols-1 gap-8 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-        {project.pages.map((page) => <button key={page.id} type="button" onClick={() => onOpenPage(page)} className="relative h-[300px] overflow-hidden rounded-lg border border-[#e1e1e1] bg-[#f7f7f9] p-2 text-left shadow-[0_2px_9px_rgba(0,0,0,0.14)] transition hover:-translate-y-0.5 hover:border-[#7ca2ff]"><span className="block h-[244px] overflow-hidden rounded bg-white p-5"><strong className="block text-base">{page.title}</strong><span className="mt-4 block line-clamp-[9] whitespace-pre-wrap text-sm leading-relaxed text-[#777]">{page.content || 'Start writing on this page.'}</span></span><span className="absolute inset-x-4 bottom-3 flex justify-between text-xs text-[#aaa]"><span>Page</span><span>{formatDate(page.updatedAt)}</span></span></button>)}
+        {project.pages.map((page) => <button key={page.id} type="button" onClick={() => onOpenPage(page)} title={page.title || undefined} className="flex h-[300px] flex-col overflow-hidden rounded-lg border border-[#e3e3e5] bg-white p-6 text-left shadow-[0_2px_8px_rgba(0,0,0,0.1)] transition hover:-translate-y-0.5 hover:border-[#7ca2ff]"><strong className="line-clamp-2 shrink-0 text-base leading-snug">{page.title}</strong><span className="mt-4 block min-h-0 flex-1 overflow-hidden"><span className="line-clamp-[7] whitespace-pre-wrap text-sm leading-relaxed text-[#777]">{page.content || 'Start writing on this page.'}</span></span><span className="mt-4 flex shrink-0 justify-between text-xs text-[#aaa]"><span>Page</span><span>{formatDate(page.updatedAt)}</span></span></button>)}
         <button type="button" onClick={onAddPage} className="flex h-[300px] items-center justify-center rounded-lg border border-dashed border-[#c9d7fa] text-[#477bea] hover:bg-[#f8faff]"><FolderPlus className="h-9 w-9 stroke-[1.6]" /></button>
       </div>
       {!project.pages.length && <p className="mt-8 text-center text-sm text-[#999]">This project is ready for its first page.</p>}
@@ -1107,11 +1112,10 @@ function ProjectPagesGrid({ project, onBack, onAddPage, onOpenPage, onEdit, onDe
   </div>;
 }
 
-function ProjectPageWorkspace({ project, page, notes, muses, projects, saving, onBack, onChange, onAddNote, onOpenNote, onOpenPage, onDelete, onSaveRetrieval }: {
+function ProjectPageWorkspace({ project, page, notes, muses, projects, saving, onBack, onChange, onAddNote, onOpenNote, onOpenPage, onDelete }: {
   project: CortexProject; page: ProjectPage; notes: Note[]; muses: MuseMeta[]; projects: CortexProject[]; saving: boolean;
   onBack: () => void; onChange: (page: ProjectPage) => void;
   onAddNote: () => void; onOpenNote: (note: Note) => void; onOpenPage: (project: CortexProject, page: ProjectPage) => void; onDelete: () => void;
-  onSaveRetrieval: (queryText: string, resultNotes: Note[], projectId: string, newProjectTitle?: string) => Promise<void>;
 }) {
   const [title, setTitle] = useState(page.title);
   const [content, setContent] = useState(page.content);
@@ -1119,7 +1123,6 @@ function ProjectPageWorkspace({ project, page, notes, muses, projects, saving, o
   const [contextOpen, setContextOpen] = useState(true);
   const [selectedNoteId, setSelectedNoteId] = useState<string | null>(null);
   const [searchRequest, setSearchRequest] = useState<KnowledgeSearchRequest | null>(null);
-  const [instantRetrievalOpen, setInstantRetrievalOpen] = useState(false);
   const latestChangeRef = useRef(onChange);
   latestChangeRef.current = onChange;
 
@@ -1159,7 +1162,6 @@ function ProjectPageWorkspace({ project, page, notes, muses, projects, saving, o
         <button type="button" onClick={leave} aria-label="Back to project pages" title="Back to project pages" className="flex h-9 w-9 items-center justify-center rounded-md text-[#777] hover:bg-[#f4f4f4]"><ArrowLeft className="h-5 w-5" /></button>
         <span className="mx-3 h-7 w-px bg-[#e5e5e5]" />
         <button type="button" onClick={onAddNote} aria-label="Add a note" title="Add a note" className="flex h-8 w-8 items-center justify-center rounded-md bg-[#477bea] text-white hover:bg-[#3d6ed7]"><Plus className="h-5 w-5" /></button>
-        <button type="button" onClick={() => setInstantRetrievalOpen(true)} aria-label="Open Instant Retrieval" title="Open Instant Retrieval" className="ml-1 flex h-9 w-9 items-center justify-center rounded-md text-[#477bea] hover:bg-[#edf3ff]"><ScanSearch className="h-5 w-5" /></button>
         <button type="button" onClick={() => setSearchRequest({ query: '' })} aria-label="Search notes, pages, and Domains" title="Search notes, pages, and Domains" className="flex h-9 w-9 items-center justify-center rounded-md text-[#777] hover:bg-[#f4f4f4]"><Search className="h-5 w-5" /></button>
         <button type="button" onClick={() => setContextOpen((open) => !open)} aria-label={contextOpen ? 'Close retrieved knowledge panels' : 'Open retrieved knowledge panels'} title={contextOpen ? 'Close retrieved knowledge panels' : 'Open retrieved knowledge panels'} aria-expanded={contextOpen} className="ml-1 flex h-9 items-center gap-2 rounded-md px-2 text-xs text-[#777] hover:bg-[#f4f4f4]"><PanelRightOpen className={`h-5 w-5 transition-transform ${contextOpen ? '' : 'rotate-180'}`} /><span className="hidden lg:inline">{contextOpen ? 'Hide retrieval' : 'Show retrieval'}</span></button>
         <span className="pointer-events-none absolute left-1/2 hidden -translate-x-1/2 text-sm text-[#aaa] sm:block">{project.title}</span>
@@ -1178,18 +1180,17 @@ function ProjectPageWorkspace({ project, page, notes, muses, projects, saving, o
           </div>
         </section>
         {contextOpen && <section className="relative min-h-[420px] overflow-y-auto border-l border-[#dedede] bg-[#f7f7f9] px-8 pb-12 pt-14 sm:px-12 lg:min-h-0">
-          {selectedContent && selectedNote ? <article className="mx-auto max-w-xl">{selectedContent.hasTitle && <h2 className="text-lg font-semibold">{selectedContent.title}</h2>}<p className="mt-6 whitespace-pre-wrap text-sm leading-[1.6] text-[#333]">{selectedContent.body || selectedNote.raw_text}</p><div className="mt-8 border-t border-[#ddd] pt-4 text-xs text-[#999]">Domain: {cleanCategory(selectedNote.category) || 'Instant retrieval'} · {fullNoteDate(selectedNote.created_at)}</div></article> : <div className="flex h-full items-center justify-center text-center"><div><h2 className="text-lg font-semibold">Write to retrieve your knowledge.</h2><p className="mt-3 max-w-sm text-sm leading-relaxed text-[#777]">Related text will appear here as your page develops.</p></div></div>}
+          {selectedContent && selectedNote ? <article className="mx-auto max-w-xl">{selectedContent.hasTitle && <h2 className="text-lg font-semibold">{selectedContent.title}</h2>}<p className="mt-6 whitespace-pre-wrap text-sm leading-[1.6] text-[#333]">{selectedContent.body || selectedNote.raw_text}</p><div className="mt-8 border-t border-[#ddd] pt-4 text-xs text-[#999]">Domain: {cleanCategory(selectedNote.category) || ORPHANS_MUSE} · {fullNoteDate(selectedNote.created_at)}</div></article> : <div className="flex h-full items-center justify-center text-center"><div><h2 className="text-lg font-semibold">Write to retrieve your knowledge.</h2><p className="mt-3 max-w-sm text-sm leading-relaxed text-[#777]">Related text will appear here as your page develops.</p></div></div>}
         </section>}
         {contextOpen && <aside className="min-h-[420px] overflow-y-auto border-l border-[#dedede] bg-white p-4 lg:min-h-0">
           <h2 className="mb-4 text-center text-sm font-normal text-[#999]">Retrieved for this page</h2>
           <div className="space-y-4">
-            {surfacedNotes.map((note) => { const noteContent = splitNote(note); return <button key={note.id} type="button" onMouseEnter={() => setSelectedNoteId(note.id)} onFocus={() => setSelectedNoteId(note.id)} onClick={() => onOpenNote(note)} className={`block h-[190px] w-full overflow-hidden rounded-md border bg-[#f7f7f9] p-2 text-left shadow-sm transition hover:border-[#8fb1ff] ${selectedNoteId === note.id ? 'border-[#7ca2ff] ring-1 ring-[#7ca2ff]/30' : 'border-[#e0e0e0]'}`}><span className="block h-[142px] overflow-hidden rounded bg-white p-4"><span className="float-right text-[11px] text-[#477bea]">note</span>{noteContent.hasTitle && <strong className="block max-w-[80%] truncate text-sm">{noteContent.title}</strong>}<span className="mt-3 block line-clamp-4 text-xs leading-relaxed text-[#777]">{noteContent.body || notePreview(note)}</span></span><span className="mt-2 flex items-center justify-between px-2 text-[11px] text-[#aaa]"><span className="truncate">Domain: {cleanCategory(note.category) || 'Instant retrieval'}</span><span>{formatDate(note.created_at)}</span></span></button>; })}
+            {surfacedNotes.map((note) => { const noteContent = splitNote(note); return <button key={note.id} type="button" title={noteContent.title || undefined} onMouseEnter={() => setSelectedNoteId(note.id)} onFocus={() => setSelectedNoteId(note.id)} onClick={() => onOpenNote(note)} className={`flex h-[190px] w-full flex-col overflow-hidden rounded-md border bg-white p-4 text-left shadow-[0_2px_8px_rgba(0,0,0,0.08)] transition hover:border-[#8fb1ff] ${selectedNoteId === note.id ? 'border-[#7ca2ff] ring-1 ring-[#7ca2ff]/30' : 'border-[#e3e3e5]'}`}><span className="flex shrink-0 items-start gap-2">{noteContent.hasTitle && <strong className="line-clamp-2 min-w-0 flex-1 text-sm leading-snug">{defaultNoteTitle(noteContent.title)}</strong>}<span className="ml-auto shrink-0 text-[11px] text-[#477bea]">note</span></span><span className="mt-2 block min-h-0 flex-1 overflow-hidden"><span className="line-clamp-4 text-xs leading-relaxed text-[#777]">{noteContent.body || notePreview(note)}</span></span><span className="mt-2 flex shrink-0 items-center justify-between gap-2 text-[11px] text-[#aaa]"><span className="min-w-0 truncate">Domain: {cleanCategory(note.category) || ORPHANS_MUSE}</span><span className="shrink-0">{formatDate(note.created_at)}</span></span></button>; })}
             {!surfacedNotes.length && <p className="px-4 py-12 text-center text-sm leading-relaxed text-[#999]">Related notes will appear here as your knowledge base grows.</p>}
           </div>
         </aside>}
       </div>
-      {searchRequest && <KnowledgeSearchOverlay request={searchRequest} notes={notes} muses={muses} projects={projects} onClose={() => setSearchRequest(null)} onOpenPage={(nextProject, nextPage) => { setSearchRequest(null); onOpenPage(nextProject, nextPage); }} onOpenNote={(note) => { setSearchRequest(null); onOpenNote(note); }} onInstantRetrieval={() => { setSearchRequest(null); setInstantRetrievalOpen(true); }} />}
-      {instantRetrievalOpen && <InstantRetrievalOverlay notes={notes} muses={muses} projects={projects} saving={saving} onClose={() => setInstantRetrievalOpen(false)} onOpenNote={(note) => { setInstantRetrievalOpen(false); onOpenNote(note); }} onSave={onSaveRetrieval} />}
+      {searchRequest && <KnowledgeSearchOverlay request={searchRequest} notes={notes} muses={muses} projects={projects} onClose={() => setSearchRequest(null)} onOpenPage={(nextProject, nextPage) => { setSearchRequest(null); onOpenPage(nextProject, nextPage); }} onOpenNote={(note) => { setSearchRequest(null); onOpenNote(note); }} />}
     </div>
   );
 }
@@ -1197,12 +1198,11 @@ function ProjectPageWorkspace({ project, page, notes, muses, projects, saving, o
 type LibrarySort = 'newest' | 'oldest' | 'random' | 'date';
 type LibraryLayout = 'grid' | 'large';
 
-function MuseGrid({ muses, projects, notes, notesByMuse, busy, onClose, onAddNote, onAddMuse, onEditMuse, onDeleteMuse, onOpenNote, onSaveRetrieval }: {
+function MuseGrid({ muses, projects, notes, notesByMuse, busy, onClose, onAddNote, onAddMuse, onEditMuse, onDeleteMuse, onOpenNote }: {
   muses: MuseMeta[]; projects: CortexProject[]; notes: Note[]; notesByMuse: Map<string, Note[]>; busy: boolean;
   onClose: () => void;
   onAddNote: (muse?: string) => void; onAddMuse: () => void; onEditMuse: (muse: MuseMeta) => void;
   onDeleteMuse: (title: string) => void; onOpenNote: (note: Note) => void;
-  onSaveRetrieval: (queryText: string, resultNotes: Note[], projectId: string, newProjectTitle?: string) => Promise<void>;
 }) {
   const [selectedMuses, setSelectedMuses] = useState<Set<string>>(new Set());
   const [layout, setLayout] = useState<LibraryLayout>('grid');
@@ -1213,17 +1213,16 @@ function MuseGrid({ muses, projects, notes, notesByMuse, busy, onClose, onAddNot
   const [query, setQuery] = useState('');
   const [date, setDate] = useState('');
   const [musesOpen, setMusesOpen] = useState(false);
-  const [instantRetrievalOpen, setInstantRetrievalOpen] = useState(false);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== 'Escape' || searchOpen || sortOpen || musesOpen || instantRetrievalOpen) return;
+      if (event.key !== 'Escape' || searchOpen || sortOpen || musesOpen) return;
       if (document.querySelector('[aria-modal="true"], [role="status"]')) return;
       onClose();
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [instantRetrievalOpen, musesOpen, onClose, searchOpen, sortOpen]);
+  }, [musesOpen, onClose, searchOpen, sortOpen]);
 
   const visibleNotes = useMemo(() => {
     const cleanQuery = query.trim().toLowerCase();
@@ -1264,14 +1263,12 @@ function MuseGrid({ muses, projects, notes, notesByMuse, busy, onClose, onAddNot
           {sort === 'date' && <input type="date" value={date} onChange={(event) => setDate(event.target.value)} aria-label="Filter by date" className="mt-3 w-[82px] rounded border border-[#ddd] px-1 py-1 text-[9px] text-[#555] sm:w-24 sm:text-[10px]" />}
           <button type="button" onClick={() => setLayout((value) => value === 'grid' ? 'large' : 'grid')} aria-label={layout === 'grid' ? 'Use large card view' : 'Use grid view'} title={layout === 'grid' ? 'Use large card view' : 'Use grid view'} aria-pressed={layout === 'grid'} className={`mt-3 flex h-10 w-10 items-center justify-center rounded-md transition ${layout === 'grid' ? 'bg-[#f4f4f6] text-[#777]' : 'hover:bg-[#f4f4f4]'}`}>{layout === 'grid' ? <Grid2X2 className="h-5 w-5" /> : <Rows3 className="h-5 w-5" />}</button>
           <button type="button" onClick={() => { setSearchOpen((open) => !open); if (searchOpen) setQuery(''); }} aria-label="Search notes" title="Search notes" className="mt-3 flex h-10 w-10 items-center justify-center rounded-md hover:bg-[#f4f4f4]"><Search className="h-5 w-5" /></button>
-          <button type="button" onClick={() => setInstantRetrievalOpen(true)} aria-label="Open Instant Retrieval" title="Open Instant Retrieval" className="mt-3 flex h-10 w-10 items-center justify-center rounded-md text-[#477bea] hover:bg-[#edf3ff]"><ScanSearch className="h-5 w-5" /></button>
         </aside>
 
         <section className="min-w-0 flex-1 overflow-y-auto px-5 pt-10 sm:px-8 lg:px-12 lg:pt-14">
           {searchOpen && <label className="mb-10 flex h-12 w-full max-w-[330px] items-center rounded-xl bg-[#f7f7f9] px-4 shadow"><Search className="mr-3 h-5 w-5 text-[#aaa]" /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'Escape') { setSearchOpen(false); setQuery(''); } }} placeholder="Search your notes" className="min-w-0 flex-1 bg-transparent text-sm outline-none" /></label>}
           <div data-testid="note-library-cards" data-layout={query.trim() ? 'search' : layout} className={`mx-auto grid max-w-[1520px] gap-7 pb-20 lg:gap-x-12 lg:gap-y-10 ${query.trim() ? 'grid-cols-1 xl:grid-cols-2' : layout === 'grid' ? 'grid-cols-1 md:grid-cols-2 xl:grid-cols-3' : 'grid-cols-1 lg:grid-cols-2'}`}>
             {visibleNotes.map((note) => <LibraryNoteCard key={note.id} note={note} query={query} layout={query.trim() ? 'search' : layout} onClick={() => onOpenNote(note)} />)}
-            {query.trim() && <InstantRetrievalCard onClick={() => setInstantRetrievalOpen(true)} tall />}
             {!query.trim() && <AddLibraryCard layout={layout} onClick={() => onAddNote(selectedMuses.size === 1 ? firstSelectedMuse : undefined)} />}
           </div>
           {!visibleNotes.length && query.trim() && <p className="pb-20 text-sm text-[#999]">No notes contain “{query.trim()}”.</p>}
@@ -1279,20 +1276,18 @@ function MuseGrid({ muses, projects, notes, notesByMuse, busy, onClose, onAddNot
       </div>
 
       {musesOpen && <MuseSelector muses={muses} notesByMuse={notesByMuse} selected={selectedMuses} busy={busy} onClose={() => setMusesOpen(false)} onSave={(next) => { setSelectedMuses(next); setMusesOpen(false); }} onCreate={() => { setMusesOpen(false); onAddMuse(); }} onEdit={(muse) => { setMusesOpen(false); onEditMuse(muse); }} onDelete={onDeleteMuse} />}
-      {instantRetrievalOpen && <InstantRetrievalOverlay notes={notes} muses={muses} projects={projects} initialQuery={query} saving={busy} onClose={() => setInstantRetrievalOpen(false)} onOpenNote={(note) => { setInstantRetrievalOpen(false); onOpenNote(note); }} onSave={onSaveRetrieval} />}
     </div>
   );
 }
 
 function AddLibraryCard({ layout, onClick }: { layout: LibraryLayout; onClick: () => void }) {
-  return <button type="button" onClick={onClick} className={`relative overflow-hidden rounded-lg border border-[#e1e1e3] bg-white text-left text-[#477bea] shadow-[0_3px_12px_rgba(0,0,0,0.15)] transition hover:-translate-y-0.5 hover:border-[#a9c0f5] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${layout === 'grid' ? 'h-[360px] p-8' : 'h-[440px] p-8'}`}><span className="flex items-center gap-2 text-base"><Plus className="h-5 w-5" /> Add</span><span className="absolute inset-x-5 bottom-6 text-center text-sm italic text-[#b4b4b8]">You can always add more</span><span className="sr-only">{layout === 'grid' ? 'grid' : 'large card'} layout</span></button>;
+  return <button type="button" onClick={onClick} className={`relative overflow-hidden rounded-lg border border-[#e3e3e5] bg-white text-left text-[#477bea] shadow-[0_2px_8px_rgba(0,0,0,0.1)] transition hover:-translate-y-0.5 hover:border-[#a9c0f5] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${layout === 'grid' ? 'h-[360px] p-8' : 'h-[440px] p-8'}`}><span className="flex items-center gap-2 text-base"><Plus className="h-5 w-5" /> Add</span><span className="absolute inset-x-5 bottom-6 text-center text-sm italic text-[#b4b4b8]">You can always add more</span><span className="sr-only">{layout === 'grid' ? 'grid' : 'large card'} layout</span></button>;
 }
 
 function LibraryNoteCard({ note, query, layout, onClick }: { note: Note; query: string; layout: LibraryLayout | 'search'; onClick: () => void }) {
   const content = splitNote(note);
-  const isGrid = layout === 'grid';
   const isLarge = layout === 'large';
-  return <button type="button" onClick={onClick} className={`relative overflow-hidden rounded-lg border border-[#e1e1e3] bg-[#f7f7f9] p-2 text-left shadow-[0_3px_12px_rgba(0,0,0,0.15)] transition hover:-translate-y-0.5 hover:border-[#7ca2ff] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${isGrid ? 'h-[360px]' : isLarge ? 'h-[440px]' : 'h-[360px]'}`}><span className={`block overflow-hidden rounded-md bg-white ${isGrid ? 'h-[280px] px-7 py-7' : isLarge ? 'h-[360px] px-8 py-8' : 'h-[280px] px-7 py-7'}`}>{content.hasTitle && <strong className={`block text-base leading-snug text-[#151515] ${isLarge ? 'line-clamp-4 text-lg' : 'line-clamp-3'}`}><HighlightedText text={content.title} query={query} /></strong>}<span className={`mt-4 block whitespace-pre-wrap text-[15px] leading-[1.55] text-[#777] ${isGrid ? 'line-clamp-[8]' : isLarge ? 'line-clamp-[12]' : 'line-clamp-[8]'}`}><HighlightedText text={content.body || notePreview(note)} query={query} /></span></span><span className="absolute inset-x-5 bottom-4 flex items-center justify-between gap-3 text-xs text-[#aaa]"><span className="min-w-0 truncate">{cleanCategory(note.category) || 'Instant retrieval'}</span><span className="shrink-0">{formatDate(note.created_at)}</span></span><span className="sr-only">{isLarge ? 'large card' : layout} layout</span></button>;
+  return <button type="button" onClick={onClick} title={content.title || undefined} className={`flex flex-col overflow-hidden rounded-lg border border-[#e3e3e5] bg-white text-left shadow-[0_2px_8px_rgba(0,0,0,0.1)] transition hover:-translate-y-0.5 hover:border-[#7ca2ff] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${isLarge ? 'h-[440px] p-8' : 'h-[360px] p-7'}`}>{content.hasTitle && <strong className={`line-clamp-2 shrink-0 leading-snug text-[#151515] ${isLarge ? 'text-lg' : 'text-base'}`}><HighlightedText text={defaultNoteTitle(content.title)} query={query} /></strong>}<span className="mt-4 block min-h-0 flex-1 overflow-hidden"><span className={`whitespace-pre-wrap text-[15px] leading-[1.55] text-[#777] ${isLarge ? 'line-clamp-[11]' : 'line-clamp-[8]'}`}><HighlightedText text={content.body || notePreview(note)} query={query} /></span></span><span className="mt-4 flex shrink-0 items-center justify-between gap-3 text-xs text-[#aaa]"><span className="min-w-0 truncate">{cleanCategory(note.category) || ORPHANS_MUSE}</span><span className="shrink-0">{formatDate(note.created_at)}</span></span><span className="sr-only">{isLarge ? 'large card' : layout} layout</span></button>;
 }
 
 function MuseSelector({ muses, notesByMuse, selected, busy, onClose, onSave, onCreate, onEdit, onDelete }: {
@@ -1343,7 +1338,7 @@ function MuseDetail({ title, notes, isUnsorted, busy, onClose, onAddNote, onOpen
       {searchOpen && <label className="mx-auto mt-6 flex h-11 w-full max-w-md items-center rounded-xl bg-[#f7f7f9] px-4 shadow-sm"><Search className="mr-3 h-4 w-4 text-[#aaa]" /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${title}`} className="min-w-0 flex-1 bg-transparent text-sm text-[#222] outline-none placeholder:text-[#aaa]" /></label>}
       {!isUnsorted && <div className="absolute right-5 top-4 sm:right-8"><button type="button" onClick={() => setMenuOpen((value) => !value)} aria-label="Domain options" aria-expanded={menuOpen} className="flex h-10 w-10 items-center justify-center rounded-md text-[#222] hover:bg-[#f4f4f4]"><MoreHorizontal className="h-5 w-5" /></button>{menuOpen && <div className="absolute right-0 top-11 z-10 w-60 overflow-hidden rounded-lg border border-[#ddd] bg-white py-1 text-sm shadow-xl"><button type="button" onClick={() => { setMenuOpen(false); onEdit(); }} className="block w-full px-4 py-2.5 text-left hover:bg-[#f5f5f5]">Edit Domain</button>{onShare && notes.length > 0 && <button type="button" disabled={busy} onClick={() => { setMenuOpen(false); onShare(); }} className="block w-full px-4 py-2.5 text-left hover:bg-[#f5f5f5]">Copy all {notes.length} to public notes</button>}<button type="button" disabled={busy} onClick={() => { setMenuOpen(false); onDelete(); }} className="block w-full px-4 py-2.5 text-left text-red-600 hover:bg-red-50">Delete Domain</button></div>}</div>}
       <div className={`mx-auto mt-14 grid max-w-[1510px] grid-cols-1 gap-8 sm:grid-cols-2 lg:gap-x-12 lg:gap-y-10 ${compact ? 'xl:grid-cols-4' : 'xl:grid-cols-3'}`}>
-        {visibleNotes.map((note) => { const content = splitNote(note); return <button key={note.id} type="button" onClick={() => onOpenNote(note)} className="relative h-[360px] min-w-0 overflow-hidden rounded-lg border border-[#e1e1e3] bg-[#f7f7f9] p-2 text-left shadow-[0_3px_12px_rgba(0,0,0,0.15)] transition hover:-translate-y-0.5 hover:border-[#7ca2ff] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]"><span className="block h-[280px] overflow-hidden rounded-md bg-white px-7 py-7">{content.hasTitle && <strong className="block line-clamp-3 text-base leading-snug text-[#151515]">{content.title}</strong>}<span className="mt-4 block whitespace-pre-wrap text-[15px] leading-[1.55] text-[#777] line-clamp-[8]">{content.body || notePreview(note)}</span></span><span className="absolute bottom-4 right-5 text-xs text-[#aaa]">{formatDate(note.created_at)}</span></button>; })}
+        {visibleNotes.map((note) => { const content = splitNote(note); return <button key={note.id} type="button" onClick={() => onOpenNote(note)} title={content.title || undefined} className="flex h-[360px] min-w-0 flex-col overflow-hidden rounded-lg border border-[#e3e3e5] bg-white p-7 text-left shadow-[0_2px_8px_rgba(0,0,0,0.1)] transition hover:-translate-y-0.5 hover:border-[#7ca2ff] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">{content.hasTitle && <strong className="line-clamp-2 shrink-0 text-base leading-snug text-[#151515]">{defaultNoteTitle(content.title)}</strong>}<span className="mt-4 block min-h-0 flex-1 overflow-hidden"><span className="line-clamp-[8] whitespace-pre-wrap text-[15px] leading-[1.55] text-[#777]">{content.body || notePreview(note)}</span></span><span className="mt-4 shrink-0 text-right text-xs text-[#aaa]">{formatDate(note.created_at)}</span></button>; })}
         <button type="button" onClick={onAddNote} aria-label={`Add a note to ${title}`} className="relative flex h-[360px] items-start rounded-lg border border-[#e1e1e3] bg-white p-8 text-[#477bea] shadow-[0_3px_12px_rgba(0,0,0,0.15)] transition hover:-translate-y-0.5 hover:border-[#a9c0f5] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]"><span className="flex items-center gap-2"><Plus className="h-5 w-5" /> Add</span><span className="absolute inset-x-5 bottom-6 text-center text-sm italic text-[#b4b4b8]">You can always add more</span></button>
       </div>
       {!visibleNotes.length && query.trim() && <p className="mt-8 text-center text-sm text-[#999]">No notes contain “{query.trim()}”.</p>}
@@ -1426,7 +1421,9 @@ function NoteDomainPicker({ category, muses, saving, onChange, showPrefix = fals
   onChange: (category: string | null) => void; showPrefix?: boolean;
 }) {
   const current = cleanCategory(category);
-  const label = current || 'Instant retrieval';
+  const label = current || ORPHANS_MUSE;
+  const isOrphans = (title: string) => title.toLowerCase() === ORPHANS_MUSE.toLowerCase();
+  const hasOrphansDomain = muses.some((muse) => isOrphans(muse.title));
   const itemClassName = 'flex cursor-pointer items-center justify-between rounded-md px-3 py-2 !text-[#252525] data-[highlighted]:!bg-[#e8efff] data-[highlighted]:!text-[#1b3f88]';
   return (
     <DropdownMenu>
@@ -1437,12 +1434,12 @@ function NoteDomainPicker({ category, muses, saving, onChange, showPrefix = fals
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align={showPrefix ? 'start' : 'center'} sideOffset={6} className="z-[60] max-h-72 w-56 overflow-y-auto rounded-lg border-[#e0e0e0] bg-white p-1.5 shadow-xl">
-        <DropdownMenuItem disabled={saving} onSelect={() => { if (current) onChange(null); }} className={itemClassName}>
-          Instant retrieval {!current && <Check className="h-4 w-4 text-[#477bea]" />}
-        </DropdownMenuItem>
-        {muses.length > 0 && <DropdownMenuSeparator className="my-1 bg-[#ececef]" />}
+        {!hasOrphansDomain && <DropdownMenuItem disabled={saving} onSelect={() => { if (current) onChange(null); }} className={itemClassName}>
+          {ORPHANS_MUSE} {!current && <Check className="h-4 w-4 text-[#477bea]" />}
+        </DropdownMenuItem>}
+        {!hasOrphansDomain && muses.length > 0 && <DropdownMenuSeparator className="my-1 bg-[#ececef]" />}
         {muses.map((muse) => {
-          const selected = current?.toLowerCase() === muse.title.toLowerCase();
+          const selected = current ? current.toLowerCase() === muse.title.toLowerCase() : isOrphans(muse.title);
           return <DropdownMenuItem key={muse.title} disabled={saving} onSelect={() => { if (!selected) onChange(muse.title); }} className={itemClassName}>
             <span className="min-w-0 truncate">{muse.title}</span>{selected && <Check className="h-4 w-4 shrink-0 text-[#477bea]" />}
           </DropdownMenuItem>;
@@ -1484,14 +1481,14 @@ function RelatedNotePanel({ note, relevance, focusText = '', onClose, onOpenFull
   // A quote can come from the title, which the body below does not show.
   const focusInBody = focusText && content.body && findAnchor(content.body, focusText) ? focusText : '';
   const matchedText = focusInBody || (relevance?.matched_text?.trim() ?? '');
-  const relation = relevance?.relation_type ? RELATION_BADGES[relevance.relation_type] : null;
+  const relation = relationBadgeFor(relevance);
 
   return <div className="flex min-h-0 flex-1 flex-col bg-[#f7f7f9]">
     <header className="flex min-h-14 shrink-0 items-center justify-between gap-3 border-b border-[#e2e2e2] bg-[#f7f7f9]/95 px-4 py-2 backdrop-blur">
       <div className="min-w-0 text-xs text-[#999]">
         <span>{fullNoteDate(note.created_at)}</span>
         <span className="mx-2 text-[#ccc]" aria-hidden="true">·</span>
-        <span className="truncate">{cleanCategory(note.category) || 'Instant retrieval'}</span>
+        <span className="truncate">{cleanCategory(note.category) || ORPHANS_MUSE}</span>
       </div>
       <div className="flex shrink-0 items-center gap-2">
         <button type="button" onClick={onOpenFull} className="rounded-md border border-[#dedede] bg-white px-3 py-1.5 text-xs text-[#477bea] shadow-sm hover:border-[#adc3ff] hover:bg-[#edf3ff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">Open full note</button>
@@ -1513,17 +1510,16 @@ function RelatedNotePanel({ note, relevance, focusText = '', onClose, onOpenFull
   </div>;
 }
 
-function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, saving, userId, initialRetrievalMode, autoSearch, onClose, onReturnToPrevious, onAddNote, onOpenNote, onOpenPage, onUpdate, onChangeDomain, onCreateDomain, onDelete, onShare, onSaveRetrieval, onSetDomainGoal }: {
+function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, saving, userId, initialRetrievalMode, autoSearch, onClose, onReturnToPrevious, onAddNote, onOpenNote, onOpenPage, onUpdate, onChangeDomain, onCreateDomain, onDelete, onShare, onSetDomainGoal }: {
   note: Note; previousNote: Note | null; allNotes: Note[]; muses: MuseMeta[]; projects: CortexProject[]; saving: boolean; userId: string; initialRetrievalMode: 'similar' | 'relevant'; autoSearch: boolean;
   onClose: () => void; onReturnToPrevious: () => void; onAddNote: () => void; onOpenNote: (note: Note, autoSearch?: boolean) => void; onOpenPage: (project: CortexProject, page: ProjectPage) => void;
   onUpdate: (noteId: string, rawText: string) => Promise<void>; onChangeDomain: (category: string | null) => void; onCreateDomain: () => void; onDelete: (note: Note) => Promise<void>;
-  onSaveRetrieval: (queryText: string, resultNotes: Note[], projectId: string, newProjectTitle?: string) => Promise<void>;
   onSetDomainGoal: (domainTitle: string, goal: string) => void;
   /** Copies the note into the person's public notes, to share by link. */
   onShare: (note: Note) => Promise<void>;
 }) {
   const initial = splitNote(note);
-  const [title, setTitle] = useState(initial.title);
+  const [title, setTitle] = useState(editableTitle(note));
   const [body, setBody] = useState(initial.body);
   const [editing, setEditing] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -1554,7 +1550,6 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
   // after an explicit request (or when the caller intentionally auto-searches).
   const [searchRequested, setSearchRequested] = useState(autoSearch && !isGuide && !requiresDomain);
   const [searchRequest, setSearchRequest] = useState<KnowledgeSearchRequest | null>(null);
-  const [instantRetrievalOpen, setInstantRetrievalOpen] = useState(false);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const [selectedInsightIndex, setSelectedInsightIndex] = useState(0);
   const [selectedSectionId, setSelectedSectionId] = useState<string | null>(null);
@@ -1562,15 +1557,19 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
   const bodyRef = useRef<HTMLTextAreaElement>(null);
   const latestSaveRef = useRef(onUpdate);
   latestSaveRef.current = onUpdate;
-  const muse = cleanCategory(note.category) || 'Instant retrieval';
-  const rawText = title.trim() && body.trim() ? `${title.trim()}\n\n${body.trim()}` : title.trim() || body.trim();
+  const muse = cleanCategory(note.category) || ORPHANS_MUSE;
+  const rawText = composeNoteText(title, body);
+  // An older note without a title reads back as a made-up title over its text;
+  // opening it is not an edit, so only a real change saves.
+  const unchangedText = useMemo(() => composeNoteText(editableTitle(note), splitNote(note).body), [note]);
+  const noteChanged = Boolean(rawText) && rawText !== note.raw_text.trim() && rawText !== unchangedText;
 
   useEffect(() => {
     if (window.matchMedia('(min-width: 1280px)').matches) setSummaryOpen(true);
   }, []);
 
   useEffect(() => {
-    if (!editing || !rawText || rawText === note.raw_text.trim()) return;
+    if (!editing || !noteChanged) return;
     setSaveState('saving');
     const timeout = window.setTimeout(() => {
       latestSaveRef.current(note.id, rawText).then(() => setSaveState('saved')).catch(() => setSaveState('error'));
@@ -1583,7 +1582,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
   // restored, so a quick mobile exit does not discard the latest edit.
   useEffect(() => {
     const saveBeforeHistoryExit = () => {
-      if (rawText && rawText !== note.raw_text.trim()) void latestSaveRef.current(note.id, rawText);
+      if (noteChanged) void latestSaveRef.current(note.id, rawText);
     };
     window.addEventListener('popstate', saveBeforeHistoryExit);
     return () => window.removeEventListener('popstate', saveBeforeHistoryExit);
@@ -1618,61 +1617,90 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
     // what the reader shows.
     const searchedText = requestNote.raw_text.trim();
     const requestBody = splitNote(requestNote).body || searchedText;
-    const saved = retrievalAttempt === 0 ? readSavedRetrieval(userId, requestNote) : null;
     const availableNoteIds = new Set(inputs.allNotes.filter((item) => item.id !== requestNote.id).map((item) => item.id));
-    const savedHasVisibleNotes = Boolean(saved?.search.results.some((result) => availableNoteIds.has(result.note_id)));
-    const savedMatchesMode = Boolean(saved && (retrievalMode === 'similar' || saved.mode === 'relevant'));
     // A saved search costs nothing to show, so it shows even for a note opened
-    // only to read it. A new search runs only when one was asked for.
-    if (saved && savedHasVisibleNotes && savedMatchesMode) {
+    // only to read it, as long as it still names notes that exist and suits the mode.
+    const canShow = (saved: SavedRetrieval | null): saved is SavedRetrieval => Boolean(saved
+      && saved.search.results.some((result) => availableNoteIds.has(result.note_id))
+      && (retrievalMode === 'similar' || saved.mode === 'relevant'));
+    const savedTime = (saved: SavedRetrieval) => Date.parse(saved.savedAt) || 0;
+    const showSaved = (saved: SavedRetrieval) => {
+      cacheSavedRetrieval(userId, requestNote.id, saved);
       setRetrieval(saved.search);
       setRetrievalLoading(false);
-      return;
-    }
-    if (!searchRequested || isSampleGuide(requestNote)) return;
-    setRetrievalError(''); setRetrievalProgress(null);
-    // Empty retrievals and caches whose notes no longer exist are not useful
-    // completed searches. Retry instead of leaving the panel blank forever.
-    setRetrieval(null);
-    const requestTooShort = requestNote.raw_text.trim().length < MIN_RELEVANCE_DRAFT_CHARS;
-    const requestHasOtherNotes = inputs.allNotes.some((item) => item.id !== requestNote.id);
-    if (requestTooShort || !requestHasOtherNotes) { setRetrievalLoading(false); return; }
-    setRetrievalLoading(true);
+    };
     // Whether every agent has reported back, which decides what leaving does.
     let agentsFinished = false;
-    const onProgress = (progress: RelevanceProgress) => {
-      agentsFinished = progress.agents_total > 0 && progress.agents_done >= progress.agents_total;
-      if (active) setRetrievalProgress(progress);
-    };
     // Leaving the note (or searching again) before the agents finish hangs up,
     // and the server stops before its next model call. After they finish, the
     // costly part is paid for and only the insight call is left, so the search
     // finishes in the background and is saved for the next time the note opens.
     const cancel = new AbortController();
-    // One search for the whole note. In relevant mode the server splits it
-    // into its ideas and keeps up to three notes for each, reading every note
-    // once however many ideas there are.
-    const search = retrievalMode === 'relevant'
-      ? findRelevantNotes(searchedText, requestNote.id, onProgress, inputs.domainName ? { name: inputs.domainName, goal: inputs.goalText } : null, cancel.signal)
-      : findSimilarNotes(searchedText, requestNote.id, onProgress, inputs.allNotes);
-    search
-      .then((found) => {
-        const response: RelevanceSearch = { ...found, sections: sectionsInBody(found.sections, searchedText, requestBody) };
-        // Saved even when the person has already left, so the note shows it
-        // next time without searching again. A failed insight step is not
-        // saved, so opening the note again retries it.
-        if (!response.insight_failed) persistSavedRetrieval(userId, requestNote, inputs.goalText, retrievalMode, response, requestSignature);
-        if (active) setRetrieval(response);
-      })
-      .catch((err) => {
-        if (cancel.signal.aborted || (err instanceof Error && err.name === 'AbortError')) return;
-        if (active) setRetrievalError(safeErrorMessage(err, 'Could not retrieve related notes.'));
-      })
-      .finally(() => { if (active) setRetrievalLoading(false); });
-    return () => {
+    const cleanup = () => {
       active = false;
       if (!agentsFinished) cancel.abort();
     };
+
+    // A new search runs only when one was asked for.
+    const runSearch = () => {
+      if (!searchRequested || isSampleGuide(requestNote)) return;
+      setRetrievalError(''); setRetrievalProgress(null);
+      // Empty retrievals and caches whose notes no longer exist are not useful
+      // completed searches. Retry instead of leaving the panel blank forever.
+      setRetrieval(null);
+      const requestTooShort = requestNote.raw_text.trim().length < MIN_RELEVANCE_DRAFT_CHARS;
+      const requestHasOtherNotes = inputs.allNotes.some((item) => item.id !== requestNote.id);
+      if (requestTooShort || !requestHasOtherNotes) { setRetrievalLoading(false); return; }
+      setRetrievalLoading(true);
+      const onProgress = (progress: RelevanceProgress) => {
+        agentsFinished = progress.agents_total > 0 && progress.agents_done >= progress.agents_total;
+        if (active) setRetrievalProgress(progress);
+      };
+      // One search for the whole note. In relevant mode the server splits it
+      // into its ideas and keeps up to three notes for each, reading every note
+      // once however many ideas there are.
+      const search = retrievalMode === 'relevant'
+        ? findRelevantNotes(searchedText, requestNote.id, onProgress, inputs.domainName ? { name: inputs.domainName, goal: inputs.goalText } : null, cancel.signal)
+        : findSimilarNotes(searchedText, requestNote.id, onProgress, inputs.allNotes);
+      search
+        .then((found) => {
+          const response: RelevanceSearch = { ...found, sections: sectionsInBody(found.sections, searchedText, requestBody) };
+          // Saved even when the person has already left, so the note shows it
+          // next time without searching again. A failed insight step is not
+          // saved, so opening the note again retries it.
+          if (!response.insight_failed) persistSavedRetrieval(userId, requestNote, inputs.goalText, retrievalMode, response, requestSignature);
+          if (active) setRetrieval(response);
+        })
+        .catch((err) => {
+          // Cancelling is expected when the reader leaves or searches again; it is not an error.
+          if (cancel.signal.aborted || (err instanceof Error && err.name === 'AbortError')) return;
+          if (active) setRetrievalError(safeErrorMessage(err, 'Could not retrieve related notes.'));
+        })
+        .finally(() => { if (active) setRetrievalLoading(false); });
+    };
+
+    if (retrievalAttempt > 0) { runSearch(); return cleanup; }
+    const local = readSavedRetrieval(userId, requestNote);
+    if (canShow(local)) {
+      setRetrieval(local.search);
+      setRetrievalLoading(false);
+      // Another device may have searched this note since: its newer result replaces this one.
+      void loadSharedRetrieval(requestNote.id, SAVED_RETRIEVAL_VERSION).then((shared) => {
+        const remote = fromShared(shared);
+        if (active && canShow(remote) && savedTime(remote) > savedTime(local)) showSaved(remote);
+      });
+      return cleanup;
+    }
+    // Nothing saved in this browser. Another device may have searched this
+    // note already; only when none has does it run the AI calls again.
+    if (searchRequested) setRetrievalLoading(true);
+    void loadSharedRetrieval(requestNote.id, SAVED_RETRIEVAL_VERSION).then((shared) => {
+      if (!active) return;
+      const remote = fromShared(shared);
+      if (canShow(remote)) showSaved(remote);
+      else runSearch();
+    });
+    return cleanup;
   }, [note.id, requiresDomain, retrievalAttempt, retrievalMode, searchRequested, userId]);
 
   const wasDomainRequiredRef = useRef(requiresDomain);
@@ -1702,12 +1730,22 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
     () => new Map((retrieval?.results ?? []).map((result) => [result.note_id, result])),
     [retrieval]
   );
+  // Retrievals saved on other devices aren't in this browser until those
+  // notes are opened here, so the database names the rest.
+  const [usedInElsewhere, setUsedInElsewhere] = useState<string[]>([]);
+  useEffect(() => {
+    let active = true;
+    setUsedInElsewhere([]);
+    void loadNotesUsing(note.id, SAVED_RETRIEVAL_VERSION).then((ids) => { if (active) setUsedInElsewhere(ids); });
+    return () => { active = false; };
+  }, [note.id, retrieval]);
   const usedInNotes = useMemo(() => allNotes.filter((item) => {
     if (item.id === note.id) return false;
+    if (usedInElsewhere.includes(item.id)) return true;
     const saved = readSavedRetrieval(userId, item);
     return Boolean(saved?.search.results.some((result) => result.note_id === note.id)
       || saved?.search.insights?.some((itemInsight) => itemInsight.note_ids.includes(note.id)));
-  }), [allNotes, note.id, retrieval, userId]);
+  }), [allNotes, note.id, retrieval, usedInElsewhere, userId]);
   const panelNote = panelNoteId ? allNotes.find((item) => item.id === panelNoteId) ?? null : null;
   const displayedBody = body || note.raw_text;
   const noteSections = useMemo(() => noteSectionsFor(displayedBody, retrieval?.sections), [displayedBody, retrieval]);
@@ -1788,7 +1826,8 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
         const lineEnd = Math.min(lineEndAfter(displayedBody, span.end), limit);
         const choice = view.decision?.choice;
         // When this note answered an earlier one, the box goes on that note; here a chip points to it.
-        const answeredElsewhere = !view.fromNoteId && choice === 'solved' && view.item.direction === 'outbound';
+        // The same goes for a lesson marked as helping an earlier note: the help is this note.
+        const answeredElsewhere = !view.fromNoteId && (choice === 'solved' || choice === 'helped') && view.item.direction === 'outbound';
         if ((choice === 'solved' || choice === 'helped') && !answeredElsewhere) overlays.push({ type: 'block', at: lineEnd, view });
         else if (choice === 'merged') overlays.push({ type: 'chip', at: sentenceEnd, view }, { type: 'block', at: lineEnd, view });
         else overlays.push({ type: 'chip', at: sentenceEnd, view });
@@ -1915,7 +1954,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
 
   /** Saves any edit, then opens `next` (without a search unless asked) or closes the note. */
   const leaveWorkspace = async (next?: Note | null, autoSearch = false) => {
-    if (rawText && rawText !== note.raw_text.trim()) {
+    if (noteChanged) {
       setSaveState('saving');
       try { await latestSaveRef.current(note.id, rawText); setSaveState('saved'); }
       catch { setSaveState('error'); return; }
@@ -1924,7 +1963,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
   };
 
   const returnToPrevious = async () => {
-    if (rawText && rawText !== note.raw_text.trim()) {
+    if (noteChanged) {
       setSaveState('saving');
       try { await latestSaveRef.current(note.id, rawText); setSaveState('saved'); }
       catch { setSaveState('error'); return; }
@@ -1934,7 +1973,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
 
   const finishEditing = () => {
     setEditing(false);
-    if (!rawText || rawText === note.raw_text.trim()) return;
+    if (!noteChanged) return;
     setSaveState('saving');
     latestSaveRef.current(note.id, rawText)
       .then(() => setSaveState('saved'))
@@ -1942,7 +1981,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
   };
 
   useEffect(() => {
-    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape' && !searchRequest && !instantRetrievalOpen) void leaveWorkspace(); };
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === 'Escape' && !searchRequest) void leaveWorkspace(); };
     window.addEventListener('keydown', closeOnEscape);
     return () => window.removeEventListener('keydown', closeOnEscape);
   });
@@ -1979,6 +2018,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
     // this note's answer to an earlier problem, that problem; otherwise the
     // past words the card quoted. An answer with an empty note id is this note's own.
     const outboundAnswer = item.direction === 'outbound' && choice === 'solved' && !view.fromNoteId;
+    const outboundHelp = item.direction === 'outbound' && choice === 'helped' && !view.fromNoteId;
     const sourceId = view.fromNoteId
       ?? (outboundAnswer ? item.problem?.note_id : undefined)
       ?? (item.answer?.note_id || item.quotes?.[0]?.note_id || item.note_ids[0]);
@@ -1999,6 +2039,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
     if (overlay.type === 'chip') {
       const label = choice === 'merged' ? 'Extended'
         : outboundAnswer ? `Solves ${sourceTitle}`
+          : outboundHelp ? `Helps ${sourceTitle}`
         : choice === 'today' ? `Updates ${sourceTitle}`
           : choice === 'earlier' ? `${sourceTitle} holds`
             : choice === 'confirmed' ? `Pattern · ${sourceTitle}`
@@ -2135,7 +2176,6 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
         <div className="flex items-center gap-1 text-[#777] sm:gap-2">
           {previousNote ? <><button type="button" onClick={() => void returnToPrevious()} aria-label={`Back to ${noteLabel(previousNote)}`} title={`Back to ${noteLabel(previousNote)}`} className="flex h-11 w-11 items-center justify-center rounded-md hover:bg-[#f4f4f4] sm:h-9 sm:w-9"><ArrowLeft className="h-5 w-5" /></button><span className="mx-1 hidden h-7 w-px bg-[#e5e5e5] sm:block" /></> : <button type="button" onClick={() => void leaveWorkspace()} aria-label="Back to dashboard" title="Back to dashboard" className="flex h-11 w-11 items-center justify-center rounded-md hover:bg-[#f4f4f4] xl:hidden"><ArrowLeft className="h-5 w-5" /></button>}
           <button type="button" onClick={onAddNote} aria-label="Add a note" title="Add a note" className="flex h-10 w-10 items-center justify-center rounded-md bg-[#477bea] text-white hover:bg-[#3d6ed7] sm:h-8 sm:w-8"><Plus className="h-5 w-5" /></button>
-          <button type="button" onClick={() => setInstantRetrievalOpen(true)} aria-label="Open Instant Retrieval" title="Open Instant Retrieval" className="hidden h-9 w-9 items-center justify-center rounded-md text-[#477bea] hover:bg-[#edf3ff] sm:flex"><ScanSearch className="h-5 w-5" /></button>
           <button type="button" onClick={() => setSearchRequest({ query: '' })} aria-label="Search notes, pages, and Domains" title="Search notes, pages, and Domains" className="flex h-10 w-10 items-center justify-center rounded-md hover:bg-[#f4f4f4] sm:h-9 sm:w-9"><Search className="h-5 w-5" /></button>
         </div>
         <div className="absolute left-1/2 hidden -translate-x-1/2 text-sm xl:block"><NoteDomainPicker category={note.category} muses={muses} saving={saving} onChange={onChangeDomain} /></div>
@@ -2162,7 +2202,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
             {!summaryOpen && <button type="button" onClick={() => setSummaryOpen(true)} aria-controls="note-suggestions-panel" className="rounded-md border border-[#dedede] bg-white px-3 py-1.5 text-xs text-[#555] shadow-sm hover:border-[#adc3ff] hover:text-[#477bea] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">Show suggestions</button>}
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-24 pt-14 sm:px-12 sm:pt-12 xl:px-[8%]">
-            {editing ? <div className="mx-auto max-w-3xl"><input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} aria-label="Note title" placeholder="Title (optional)" className="w-full bg-transparent text-2xl font-semibold outline-none placeholder:font-normal placeholder:text-[#c4c4c6]" /><textarea ref={bodyRef} value={body} onChange={(event) => setBody(event.target.value)} aria-label="Note text" className="mt-10 min-h-[520px] w-full resize-none bg-transparent text-base leading-[1.7] outline-none" /></div> : <article className="relative mx-auto max-w-3xl" onDoubleClick={() => { setEditing(true); requestAnimationFrame(() => bodyRef.current?.focus()); }} title="Double-click to edit">{title.trim() && <h1 className="break-words px-2 py-1 text-2xl font-semibold">{title}</h1>}<div className="mt-2 flex flex-wrap gap-x-3 px-2 text-xs text-[#999]" onDoubleClick={(event) => event.stopPropagation()}><NoteDomainPicker category={note.category} muses={muses} saving={saving} onChange={onChangeDomain} showPrefix /><button type="button" onClick={openDate} className="hover:text-[#477bea]">{fullNoteDate(note.created_at)}</button></div>
+            {editing ? <div className="mx-auto max-w-3xl"><input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} aria-label="Note title" placeholder={defaultNoteTitle(body) || 'Title (optional)'} className="w-full bg-transparent text-2xl font-semibold outline-none placeholder:font-normal placeholder:text-[#c4c4c6]" /><textarea ref={bodyRef} value={body} onChange={(event) => setBody(event.target.value)} aria-label="Note text" className="mt-10 min-h-[520px] w-full resize-none bg-transparent text-base leading-[1.7] outline-none" /></div> : <article className="relative mx-auto max-w-3xl" onDoubleClick={() => { setEditing(true); requestAnimationFrame(() => bodyRef.current?.focus()); }} title="Double-click to edit">{(title.trim() || body.trim()) && <h1 className="break-words px-2 py-1 text-2xl font-semibold">{title.trim() || defaultNoteTitle(body)}</h1>}<div className="mt-2 flex flex-wrap gap-x-3 px-2 text-xs text-[#999]" onDoubleClick={(event) => event.stopPropagation()}><NoteDomainPicker category={note.category} muses={muses} saving={saving} onChange={onChangeDomain} showPrefix /><button type="button" onClick={openDate} className="hover:text-[#477bea]">{fullNoteDate(note.created_at)}</button></div>
               <div className="mt-9 w-full rounded-md px-2 py-2 text-left text-base leading-[1.7]">
                 <div className="min-w-0 flex-1 space-y-7">
                   {noteSections.length ? noteSections.map((section) => <section key={section.id} id={`note-${section.id}`} tabIndex={0} aria-label={`Section ${section.index + 1}`} aria-current={selectedSectionId === section.id ? 'true' : undefined} onClick={() => selectSection(section.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectSection(section.id); } }} className={`cursor-text scroll-mt-20 border-l-[3px] pl-4 outline-none transition hover:border-[#888] focus-visible:ring-2 focus-visible:ring-[#477bea]/30 ${selectedSectionId === section.id ? 'border-[#666]' : 'border-[#d2d2d5]'}`}>{renderSectionContent(section)}</section>) : <span className="text-left text-[#999]">Double-click to start writing.</span>}
@@ -2221,8 +2261,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
         </aside>}
       </div>
 
-      {searchRequest && <KnowledgeSearchOverlay request={searchRequest} notes={allNotes} muses={muses} projects={projects} onClose={() => setSearchRequest(null)} onOpenPage={(project, page) => { setSearchRequest(null); onOpenPage(project, page); }} onOpenNote={(item) => { setSearchRequest(null); onOpenNote(item); }} onInstantRetrieval={() => { setSearchRequest(null); setInstantRetrievalOpen(true); }} />}
-      {instantRetrievalOpen && <InstantRetrievalOverlay notes={allNotes} muses={muses} projects={projects} saving={saving} onClose={() => setInstantRetrievalOpen(false)} onOpenNote={(item) => { setInstantRetrievalOpen(false); onOpenNote(item); }} onSave={onSaveRetrieval} />}
+      {searchRequest && <KnowledgeSearchOverlay request={searchRequest} notes={allNotes} muses={muses} projects={projects} onClose={() => setSearchRequest(null)} onOpenPage={(project, page) => { setSearchRequest(null); onOpenPage(project, page); }} onOpenNote={(item) => { setSearchRequest(null); onOpenNote(item); }} />}
       {requiresDomain && <div className="fixed inset-0 z-[130] flex items-center justify-center bg-black/45 p-4 backdrop-blur-[2px]" role="dialog" aria-modal="true" aria-labelledby="orphan-domain-title">
         <div className="w-full max-w-md rounded-2xl bg-white p-6 shadow-2xl sm:p-8">
           <div className="flex h-11 w-11 items-center justify-center rounded-full bg-[#edf3ff] text-[#477bea]"><FolderPlus className="h-5 w-5" /></div>
@@ -2249,21 +2288,25 @@ function RetrievedNoteOverlay({ note, muses, saving, onClose, onAddNote, onImpor
   onUpdate: (noteId: string, rawText: string) => Promise<void>; onDelete: (note: Note) => Promise<void>;
 }) {
   const initial = splitNote(note);
-  const [title, setTitle] = useState(initial.title);
+  const [title, setTitle] = useState(editableTitle(note));
   const [body, setBody] = useState(initial.body);
   const [editing, setEditing] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
   const bodyRef = useRef<HTMLTextAreaElement>(null);
-  const rawText = title.trim() && body.trim() ? `${title.trim()}\n\n${body.trim()}` : title.trim() || body.trim();
-  const muse = cleanCategory(note.category) || 'Instant retrieval';
+  const rawText = composeNoteText(title, body);
+  // An older note without a title reads back as a made-up title over its text;
+  // opening it is not an edit, so only a real change saves.
+  const unchangedText = useMemo(() => composeNoteText(editableTitle(note), splitNote(note).body), [note]);
+  const noteChanged = Boolean(rawText) && rawText !== note.raw_text.trim() && rawText !== unchangedText;
+  const muse = cleanCategory(note.category) || ORPHANS_MUSE;
   const usedMuses = useMemo(() => {
     const direct = muses.filter((item) => item.title.toLowerCase() === muse.toLowerCase());
     return (direct.length ? direct : muses).slice(0, 4);
   }, [muses, muse]);
 
   useEffect(() => {
-    if (!editing || !rawText || rawText === note.raw_text.trim()) return;
+    if (!editing || !noteChanged) return;
     setSaveState('saving');
     const timeout = window.setTimeout(() => {
       onUpdate(note.id, rawText).then(() => setSaveState('saved')).catch(() => setSaveState('error'));
@@ -2305,7 +2348,7 @@ function RetrievedNoteOverlay({ note, muses, saving, onClose, onAddNote, onImpor
         <div className="grid min-h-0 flex-1 overflow-hidden rounded-2xl border-[9px] border-white/80 bg-[#f7f7f9] shadow-2xl lg:grid-cols-[minmax(0,1fr)_330px]">
           <section className="relative flex min-h-0 flex-col overflow-hidden bg-white shadow-[4px_0_14px_rgba(0,0,0,0.14)]">
             <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-28 pt-12 sm:px-16 lg:px-[11%] lg:pt-20">
-              <input value={title} readOnly={!editing} onClick={() => setEditing(true)} onChange={(event) => setTitle(event.target.value)} aria-label="Retrieved note title" placeholder={editing ? 'Title (optional)' : ''} className={`w-full bg-transparent text-2xl font-semibold outline-none placeholder:font-normal placeholder:text-[#c4c4c6] ${editing ? 'cursor-text' : 'cursor-pointer'}`} />
+              <input value={title} readOnly={!editing} onClick={() => setEditing(true)} onChange={(event) => setTitle(event.target.value)} aria-label="Retrieved note title" placeholder={defaultNoteTitle(body) || (editing ? 'Title (optional)' : '')} className={`w-full bg-transparent text-2xl font-semibold outline-none placeholder:font-normal placeholder:text-[#c4c4c6] ${editing ? 'cursor-text' : 'cursor-pointer'}`} />
               <textarea ref={bodyRef} value={body} readOnly={!editing} onClick={() => setEditing(true)} onChange={(event) => setBody(event.target.value)} aria-label="Retrieved note text" className={`mt-8 min-h-[540px] w-full resize-none bg-transparent text-base leading-[1.7] outline-none ${editing ? 'cursor-text' : 'cursor-pointer'}`} />
             </div>
             <ReadingFormatBar onFormat={applyFormat} onDone={() => setEditing(false)} editing={editing} />
@@ -2333,12 +2376,8 @@ function ReadingFormatBar({ onFormat, onDone, editing }: { onFormat: (kind: 'bol
   return <div className="absolute bottom-5 left-1/2 z-20 flex max-w-[calc(100%-32px)] -translate-x-1/2 items-center gap-1 rounded-xl bg-[#f7f7f9] px-3 py-2 text-sm text-[#555] shadow-sm"><button type="button" aria-label="Voice input" className="flex h-8 w-8 items-center justify-center rounded hover:bg-white"><Mic className="h-4 w-4" /></button><span className="mx-1 h-7 w-px bg-[#ddd]" /><button type="button" onClick={() => onFormat('bold')} className="h-8 w-8 rounded font-bold hover:bg-white">B</button><button type="button" onClick={() => onFormat('italic')} className="h-8 w-8 rounded italic hover:bg-white">I</button><span className="mx-1 h-7 w-px bg-[#ddd]" />{(['h1', 'h2', 'h3'] as const).map((kind) => <button key={kind} type="button" onClick={() => onFormat(kind)} className="hidden h-8 rounded px-2 font-semibold hover:bg-white sm:block">{kind.toUpperCase()}</button>)}<button type="button" onClick={() => onFormat('body')} className="hidden h-8 rounded px-2 hover:bg-white md:block">Body</button><span className="mx-1 hidden h-7 w-px bg-[#ddd] md:block" /><button type="button" onClick={() => onFormat('bullet')} className="hidden h-8 items-center gap-1 rounded px-2 hover:bg-white lg:flex"><List className="h-4 w-4" /> Bullet list</button><button type="button" onClick={() => onFormat('number')} className="hidden h-8 items-center gap-1 rounded px-2 hover:bg-white xl:flex"><ListOrdered className="h-4 w-4" /> Numbered list</button><button type="button" onClick={onDone} className="ml-2 h-8 rounded-md bg-[#477bea] px-3 text-white hover:bg-[#3d6ed7]">Done</button></div>;
 }
 
-function InstantRetrievalCard({ onClick, tall = false }: { onClick: () => void; tall?: boolean }) {
-  return <button type="button" onClick={onClick} className={`flex w-full flex-col items-center justify-center rounded-lg border border-[#e6e6e6] bg-[#f7f7f9] text-center shadow-[0_2px_8px_rgba(0,0,0,0.1)] transition hover:-translate-y-0.5 hover:border-[#8fb1ff] hover:shadow-lg ${tall ? 'min-h-[340px]' : 'min-h-[270px]'}`}><span className="flex h-20 w-20 items-center justify-center rounded-md bg-[#477bea] text-[#8fb1ff] shadow-md"><ArrowUp className="h-16 w-16 stroke-[1.8]" /></span><span className="mt-7 text-sm font-medium text-[#222]">Instant retrieval instead</span></button>;
-}
-
-function KnowledgeSearchOverlay({ request, notes, muses, projects, hideProjectColumn = false, onClose, onOpenPage, onOpenNote, onInstantRetrieval }: {
-  request: KnowledgeSearchRequest; notes: Note[]; muses: MuseMeta[]; projects: CortexProject[]; hideProjectColumn?: boolean; onClose: () => void; onOpenPage: (project: CortexProject, page: ProjectPage) => void; onOpenNote: (note: Note) => void; onInstantRetrieval: () => void;
+function KnowledgeSearchOverlay({ request, notes, muses, projects, hideProjectColumn = false, onClose, onOpenPage, onOpenNote }: {
+  request: KnowledgeSearchRequest; notes: Note[]; muses: MuseMeta[]; projects: CortexProject[]; hideProjectColumn?: boolean; onClose: () => void; onOpenPage: (project: CortexProject, page: ProjectPage) => void; onOpenNote: (note: Note) => void;
 }) {
   const [query, setQuery] = useState(request.query);
   const [filter, setFilter] = useState<KnowledgeFilter | undefined>(request.filter);
@@ -2346,7 +2385,7 @@ function KnowledgeSearchOverlay({ request, notes, muses, projects, hideProjectCo
   const sortedNotes = useMemo(() => [...notes].sort((a, b) => b.created_at.localeCompare(a.created_at)), [notes]);
   const filteredNotes = useMemo(() => sortedNotes.filter((note) => {
     if (filter?.kind === 'date' && localDateKey(note.created_at) !== filter.value) return false;
-    if (filter?.kind === 'muse' && (cleanCategory(note.category) || 'Instant retrieval').toLowerCase() !== filter.value.toLowerCase()) return false;
+    if (filter?.kind === 'muse' && (cleanCategory(note.category) || ORPHANS_MUSE).toLowerCase() !== filter.value.toLowerCase()) return false;
     if (filter) return true;
     return !normalized || `${note.raw_text} ${note.category ?? ''}`.toLowerCase().includes(normalized);
   }), [filter, normalized, sortedNotes]);
@@ -2369,8 +2408,8 @@ function KnowledgeSearchOverlay({ request, notes, muses, projects, hideProjectCo
       <div className="mx-auto mt-12 flex h-[calc(100%-3rem)] max-w-[1640px] flex-col overflow-hidden rounded-[20px] bg-white shadow-2xl sm:mt-16 sm:h-[calc(100%-4rem)]">
         <div className="flex h-20 shrink-0 items-center border-b border-[#ddd] px-7 sm:px-10"><Search className="mr-4 h-6 w-6 shrink-0 text-[#aaa]" /><input autoFocus value={query} onChange={(event) => changeQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'Escape') onClose(); }} placeholder="Search notes, pages, and Domains" className="h-full min-w-0 flex-1 bg-transparent text-xl outline-none placeholder:text-[#b3b3b3] sm:text-2xl" />{filter && <button type="button" onClick={() => { setFilter(undefined); setQuery(''); }} className="rounded-full bg-[#edf3ff] px-3 py-1.5 text-xs text-[#477bea]">Clear {filter.kind === 'muse' ? 'domain' : filter.kind}</button>}</div>
         {!query.trim() && !filter ? <div className="min-h-0 flex-1 overflow-y-auto px-10 py-12 sm:px-16"><p className="text-sm text-[#aaa]">Recent</p><div className="mt-5 max-w-2xl space-y-1">{recentTerms.map((term) => <button key={term} type="button" onClick={() => setQuery(term)} className="block w-full rounded-lg px-1 py-3 text-left text-base text-[#555] hover:bg-[#f6f6f6] hover:px-3">{term}</button>)}</div></div> : <div className={`grid min-h-0 flex-1 overflow-y-auto lg:overflow-hidden ${showProjectColumn ? 'lg:grid-cols-[450px_minmax(0,1fr)]' : 'lg:grid-cols-1'}`}>
-          {showProjectColumn && <aside className="border-b border-[#ddd] px-7 py-10 lg:overflow-y-auto lg:border-b-0 lg:border-r sm:px-10"><p className="mb-7 text-sm text-[#aaa]">Found in project pages</p><div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-1">{matchingPages.map(({ project, page }) => <button key={`${project.id}-${page.id}`} type="button" onClick={() => onOpenPage(project, page)} className="relative min-h-[300px] rounded-lg border border-[#e3e3e3] bg-white p-7 text-left shadow-[0_2px_8px_rgba(0,0,0,0.14)] transition hover:-translate-y-0.5 hover:border-[#8fb1ff]"><strong className="block text-base"><HighlightedText text={page.title} query={query} /></strong><p className="mt-5 line-clamp-[10] whitespace-pre-wrap text-sm leading-relaxed text-[#777]"><HighlightedText text={page.content || 'Empty page'} query={query} /></p><div className="absolute inset-x-4 bottom-4 flex justify-between text-xs text-[#aaa]"><span>{project.title}</span><span>{formatDate(page.updatedAt)}</span></div></button>)}{!matchingPages.length && <p className="text-sm text-[#999] sm:col-span-2 lg:col-span-1">No project page contains this search.</p>}<InstantRetrievalCard onClick={onInstantRetrieval} tall /></div></aside>}
-          <section className="min-h-0 px-7 py-10 lg:overflow-y-auto sm:px-12"><p className="mb-7 text-sm text-[#aaa]">{heading}</p><div className={`grid gap-7 ${showProjectColumn ? 'xl:grid-cols-2' : 'lg:grid-cols-2 xl:grid-cols-3'}`}>{filteredNotes.map((item) => { const content = splitNote(item); const preview = content.body || notePreview(item); return <button key={item.id} type="button" onClick={() => onOpenNote(item)} className="relative min-h-[250px] rounded-lg border border-[#e3e3e3] bg-[#f7f7f9] p-2 text-left shadow-[0_2px_8px_rgba(0,0,0,0.14)] transition hover:-translate-y-0.5 hover:border-[#8fb1ff]"><div className="h-[190px] rounded-md bg-white p-6">{content.hasTitle && <strong className="block text-base"><HighlightedText text={content.title} query={filter ? '' : query} /></strong>}<p className="mt-4 line-clamp-6 text-sm leading-relaxed text-[#777]"><HighlightedText text={preview} query={filter ? '' : query} /></p></div><div className="flex items-center justify-between px-3 py-3 text-xs text-[#aaa]"><span>{cleanCategory(item.category) || 'Instant retrieval'}</span><span>{formatDate(item.created_at)}</span></div></button>; })}{!filteredNotes.length && <p className="text-sm text-[#999] xl:col-span-2">No notes match this search.</p>}<InstantRetrievalCard onClick={onInstantRetrieval} /></div></section>
+          {showProjectColumn && <aside className="border-b border-[#ddd] px-7 py-10 lg:overflow-y-auto lg:border-b-0 lg:border-r sm:px-10"><p className="mb-7 text-sm text-[#aaa]">Found in project pages</p><div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-1">{matchingPages.map(({ project, page }) => <button key={`${project.id}-${page.id}`} type="button" onClick={() => onOpenPage(project, page)} title={page.title || undefined} className="flex h-[300px] flex-col overflow-hidden rounded-lg border border-[#e3e3e5] bg-white p-7 text-left shadow-[0_2px_8px_rgba(0,0,0,0.1)] transition hover:-translate-y-0.5 hover:border-[#8fb1ff]"><strong className="line-clamp-2 shrink-0 text-base leading-snug"><HighlightedText text={page.title} query={query} /></strong><span className="mt-4 block min-h-0 flex-1 overflow-hidden"><span className="line-clamp-6 whitespace-pre-wrap text-sm leading-relaxed text-[#777]"><HighlightedText text={page.content || 'Empty page'} query={query} /></span></span><span className="mt-4 flex shrink-0 items-center justify-between gap-3 text-xs text-[#aaa]"><span className="min-w-0 truncate">{project.title}</span><span className="shrink-0">{formatDate(page.updatedAt)}</span></span></button>)}{!matchingPages.length && <p className="text-sm text-[#999] sm:col-span-2 lg:col-span-1">No project page contains this search.</p>}</div></aside>}
+          <section className="min-h-0 px-7 py-10 lg:overflow-y-auto sm:px-12"><p className="mb-7 text-sm text-[#aaa]">{heading}</p><div className={`grid gap-7 ${showProjectColumn ? 'xl:grid-cols-2' : 'lg:grid-cols-2 xl:grid-cols-3'}`}>{filteredNotes.map((item) => { const content = splitNote(item); const preview = content.body || notePreview(item); return <button key={item.id} type="button" onClick={() => onOpenNote(item)} title={content.title || undefined} className="flex h-[280px] flex-col overflow-hidden rounded-lg border border-[#e3e3e5] bg-white p-6 text-left shadow-[0_2px_8px_rgba(0,0,0,0.1)] transition hover:-translate-y-0.5 hover:border-[#8fb1ff]">{content.hasTitle && <strong className="line-clamp-2 shrink-0 text-base leading-snug"><HighlightedText text={defaultNoteTitle(content.title)} query={filter ? '' : query} /></strong>}<span className="mt-4 block min-h-0 flex-1 overflow-hidden"><span className="line-clamp-5 text-sm leading-relaxed text-[#777]"><HighlightedText text={preview} query={filter ? '' : query} /></span></span><span className="mt-4 flex shrink-0 items-center justify-between gap-3 text-xs text-[#aaa]"><span className="min-w-0 truncate">{cleanCategory(item.category) || ORPHANS_MUSE}</span><span className="shrink-0">{formatDate(item.created_at)}</span></span></button>; })}{!filteredNotes.length && <p className="text-sm text-[#999] xl:col-span-2">No notes match this search.</p>}</div></section>
         </div>}
       </div>
     </div>
@@ -2380,92 +2419,6 @@ function KnowledgeSearchOverlay({ request, notes, muses, projects, hideProjectCo
 function retrievalKeywords(value: string): string[] {
   const ignored = new Set(['about', 'after', 'also', 'been', 'between', 'could', 'difference', 'find', 'from', 'have', 'looking', 'note', 'something', 'stated', 'that', 'their', 'there', 'these', 'they', 'this', 'what', 'when', 'where', 'which', 'will', 'with', 'would']);
   return (value.toLowerCase().match(/[a-z0-9']{3,}/g) ?? []).filter((word) => !ignored.has(word));
-}
-
-function InstantRetrievalOverlay({ notes, projects, initialQuery = '', saving, onClose, onOpenNote, onSave }: {
-  notes: Note[]; muses: MuseMeta[]; projects: CortexProject[]; saving: boolean; onClose: () => void; onOpenNote: (note: Note) => void;
-  initialQuery?: string;
-  onSave: (queryText: string, resultNotes: Note[], projectId: string, newProjectTitle?: string) => Promise<void>;
-}) {
-  const [phase, setPhase] = useState<'intro' | 'clarify' | 'results'>('intro');
-  const [query, setQuery] = useState(initialQuery);
-  const [clarificationRound, setClarificationRound] = useState(0);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [saveMenuOpen, setSaveMenuOpen] = useState(false);
-  const [newProject, setNewProject] = useState('');
-  const [saveMessage, setSaveMessage] = useState('');
-  const [saveError, setSaveError] = useState('');
-
-  const results = useMemo(() => {
-    const keywords = retrievalKeywords(query);
-    return [...notes].map((note) => {
-      const haystack = `${note.raw_text} ${note.category ?? ''}`.toLowerCase();
-      const keywordScore = keywords.reduce((score, word) => score + (haystack.includes(word) ? 2 : 0), 0);
-      return { note, score: keywordScore + sharedWordScore(query, note.raw_text) };
-    }).sort((left, right) => right.score - left.score || right.note.created_at.localeCompare(left.note.created_at)).filter((item, index) => item.score > 0 || index < 2).slice(0, 6).map((item) => item.note);
-  }, [notes, query]);
-
-  useEffect(() => { setSelectedId(results[0]?.id ?? null); }, [results]);
-
-  const keywords = retrievalKeywords(query);
-  const topic = keywords.slice(-3).join(' ');
-  const clarification = clarificationRound === 0
-    ? `Did it mention anything about ${topic || 'a specific detail'}?`
-    : 'Should I search broadly across every Domain and include the closest related ideas?';
-
-  const beginClarification = () => {
-    if (!query.trim()) return;
-    setClarificationRound(0); setPhase('clarify'); setSaveMessage(''); setSaveError('');
-  };
-
-  const answerClarification = (yes: boolean) => {
-    if (yes || clarificationRound > 0) setPhase('results');
-    else setClarificationRound(1);
-  };
-
-  const saveTo = async (projectId: string, newProjectTitle?: string) => {
-    if (!query.trim() || (!projectId && !cleanCategory(newProjectTitle))) return;
-    setSaveError('');
-    try {
-      await onSave(query, results, projectId, newProjectTitle);
-      const label = projects.find((project) => project.id === projectId)?.title ?? cleanCategory(newProjectTitle) ?? 'project';
-      setSaveMessage(`Saved as a page in ${label}`); setSaveMenuOpen(false); setNewProject('');
-    } catch (error) { setSaveError(safeErrorMessage(error, 'Unable to save this retrieval.')); }
-  };
-
-  if (phase === 'intro') return (
-    <div className="fixed inset-0 z-[90] bg-black/25 p-3 backdrop-blur-[5px] sm:p-6" role="dialog" aria-modal="true" aria-label="Instant retrieval introduction" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
-      <button type="button" onClick={onClose} aria-label="Close instant retrieval" className="absolute right-5 top-5 z-10 flex h-10 w-10 items-center justify-center rounded-md text-white hover:bg-white/10"><X className="h-7 w-7" /></button>
-      <button type="button" onClick={() => setPhase('clarify')} className="mx-auto flex h-full w-full max-w-[1760px] items-center justify-center rounded-2xl border-[9px] border-white/80 bg-[#f7f7f9] text-left shadow-2xl">
-        <span className="w-[min(90%,720px)] space-y-8 text-base leading-relaxed text-[#222] sm:text-lg"><span className="block">This is a temporary retrieval space where you can instantly find anything from your Ocreda.</span><span className="block">You can ask for a specific thing you are looking for or go as broad as you want.</span><span className="block">This will not be saved unless you save it as a page in a Project.</span><span className="block font-medium">Tap on the screen.</span></span>
-      </button>
-    </div>
-  );
-
-  return (
-    <div className="fixed inset-0 z-[90] bg-black/25 p-3 backdrop-blur-[5px] sm:p-6" role="dialog" aria-modal="true" aria-label="Instant retrieval workspace" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) onClose(); }}>
-      <div className="relative mx-auto flex h-full max-w-[1760px] flex-col">
-        <div className="relative flex h-14 shrink-0 items-center justify-between px-2 text-white">
-          <div className="relative">
-            <button type="button" disabled={!query.trim() || saving} onClick={() => setSaveMenuOpen((open) => !open)} className="rounded-md bg-white px-3 py-2 text-sm text-[#222] shadow disabled:opacity-45">{saving ? 'Saving...' : 'Save this as a page'}</button>
-            {saveMenuOpen && <div className="absolute left-0 top-11 z-30 w-[300px] overflow-hidden rounded-lg border border-[#ddd] bg-white py-2 text-sm text-[#222] shadow-xl"><p className="px-4 pb-2 text-xs text-[#999]">Choose a Project</p>{projects.map((project) => <button key={project.id} type="button" onClick={() => void saveTo(project.id)} className="block w-full px-4 py-2.5 text-left hover:bg-[#f5f5f5]">{project.title}</button>)}{!projects.length && <p className="px-4 py-2 text-xs text-[#999]">No projects yet. Create one below.</p>}<div className="mt-1 flex items-center gap-2 border-t border-[#eee] px-3 pt-2"><input value={newProject} onChange={(event) => setNewProject(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void saveTo('', newProject); } }} placeholder="New Project" className="min-w-0 flex-1 rounded border border-[#ddd] px-2 py-2 outline-none focus:border-[#477bea]" /><button type="button" disabled={!newProject.trim()} onClick={() => void saveTo('', newProject)} aria-label="Create Project and save page" className="rounded bg-[#477bea] p-2 text-white disabled:opacity-35"><Check className="h-4 w-4" /></button></div>{saveError && <p className="px-4 pt-2 text-xs text-red-600">{saveError}</p>}</div>}
-          </div>
-          {saveMessage && <span className="absolute left-1/2 -translate-x-1/2 rounded-full bg-white/90 px-4 py-1.5 text-xs text-[#477bea] shadow">{saveMessage}</span>}
-          <button type="button" onClick={onClose} aria-label="Close instant retrieval" className="flex h-10 w-10 items-center justify-center rounded-md hover:bg-white/10"><X className="h-7 w-7" /></button>
-        </div>
-        <div className={`grid min-h-0 flex-1 overflow-y-auto rounded-xl border border-[#cfcfcf] bg-white shadow-[0_2px_9px_rgba(0,0,0,0.16)] lg:overflow-hidden ${phase === 'results' ? 'lg:grid-cols-[minmax(0,1.05fr)_minmax(360px,.95fr)_360px]' : 'lg:grid-cols-2'}`}>
-          <section className="relative min-h-[430px] overflow-hidden bg-[#f7f7f9] px-8 py-16 shadow-[4px_0_12px_rgba(0,0,0,0.14)] sm:px-14 lg:min-h-0">
-            <textarea autoFocus value={query} onChange={(event) => { setQuery(event.target.value); if (phase === 'results') setPhase('clarify'); }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); beginClarification(); } }} placeholder="Ask for a specific note or explore a broad idea…" aria-label="Instant retrieval request" className="h-full min-h-[300px] w-full resize-none bg-transparent text-lg leading-relaxed outline-none placeholder:text-[#aaa]" />
-            <span className="absolute bottom-5 left-1/2 -translate-x-1/2 text-xs text-[#aaa]">Press Enter to continue · Shift+Enter for a new line</span>
-          </section>
-          <section className="relative min-h-[430px] overflow-y-auto bg-white px-8 py-16 sm:px-14 lg:min-h-0">
-            {!query.trim() ? <p className="text-base text-[#aaa]">Start typing what you want to find.</p> : phase === 'clarify' ? <div><p className="text-lg leading-relaxed">{clarification}</p><div className="mt-8 flex gap-6"><button type="button" onClick={() => answerClarification(true)} aria-label="Yes" className="flex h-10 w-10 items-center justify-center rounded-full bg-[#477bea] text-white hover:bg-[#3d6ed7]"><Check className="h-5 w-5" /></button><button type="button" onClick={() => answerClarification(false)} aria-label="No" className="flex h-10 w-10 items-center justify-center rounded-full border-2 border-[#222] hover:bg-[#f5f5f5]"><X className="h-5 w-5" /></button></div></div> : <div><Check className="h-10 w-10 rounded-full bg-[#477bea] p-2 text-white" /><p className="mt-10 text-lg">I have found {results.length} {results.length === 1 ? 'note' : 'notes'} that are close to your request.</p>{results[0] && <div className="mt-12 border-t border-[#eee] pt-7"><strong className="text-base">Closest match: <HighlightedText text={splitNote(results[0]).title} query={query} /></strong><p className="mt-4 line-clamp-8 whitespace-pre-wrap text-sm leading-relaxed text-[#555]"><HighlightedText text={splitNote(results[0]).body || notePreview(results[0])} query={query} /></p></div>}</div>}
-          </section>
-          {phase === 'results' && <aside className="min-h-[430px] overflow-y-auto border-l border-[#d6d6d6] bg-white p-5 lg:min-h-0"><div className="mb-4 flex items-center justify-between"><h2 className="text-sm text-[#999]">Retrieved notes</h2><span className="rounded border border-[#bbb] px-3 py-1 text-xs text-[#477bea]">See notes</span></div><div className="space-y-5">{results.map((item) => { const content = splitNote(item); return <button key={item.id} type="button" onMouseEnter={() => setSelectedId(item.id)} onFocus={() => setSelectedId(item.id)} onClick={() => onOpenNote(item)} className={`block min-h-[200px] w-full rounded-lg border bg-white p-5 text-left shadow-[0_2px_8px_rgba(0,0,0,0.13)] transition hover:-translate-y-0.5 ${selectedId === item.id ? 'border-[#6f9cff] ring-1 ring-[#6f9cff]/40' : 'border-[#e2e2e2]'}`}><span className="float-right text-xs text-[#477bea]">note</span>{content.hasTitle && <strong className="block max-w-[82%] text-base"><HighlightedText text={content.title} query={query} /></strong>}<p className="mt-4 line-clamp-6 whitespace-pre-wrap text-sm leading-relaxed text-[#777]"><HighlightedText text={content.body || notePreview(item)} query={query} /></p><div className="mt-7 flex justify-between text-xs text-[#aaa]"><span>{cleanCategory(item.category) || 'Instant retrieval'}</span><span>{formatDate(item.created_at)}</span></div></button>; })}{!results.length && <p className="text-sm text-[#999]">No close notes yet. Try a broader request.</p>}</div></aside>}
-        </div>
-      </div>
-    </div>
-  );
 }
 
 type NoteSection = { id: string; index: number; label: string; text: string; start: number; end: number };
@@ -2536,6 +2489,16 @@ const RELATION_BADGES: Partial<Record<NoteRelationType, { label: string; classNa
   parallel: { label: 'Parallel', className: 'bg-[#e3f4f1] text-[#1b7a6e]' },
   solves: { label: 'Solves', className: 'bg-[#e6f4ea] text-[#1e7b3c]' },
 };
+
+/**
+ * The badge for a related note. "Solves" alone hides which way it goes, so it
+ * says which note holds the answer: this related note, or the one being read.
+ */
+function relationBadgeFor(result: RelevanceResult | undefined): { label: string; className: string } | null {
+  const badge = result?.relation_type ? RELATION_BADGES[result.relation_type] : null;
+  if (!badge || result?.relation_type !== 'solves') return badge ?? null;
+  return { ...badge, label: result.direction === 'outbound' ? 'Your new note answers it' : 'Answers your new note' };
+}
 
 type CardDecisions = Record<string, CardDecision>;
 
@@ -2695,9 +2658,11 @@ function IconChoice({ kind, accept, label, onClick }: { kind: SuggestionKind; ac
  * The action under a card. Nothing here edits the note: every choice is kept
  * beside it and drawn over it, and every choice can be undone.
  */
-function CardAction({ insight, kind, decision, sourceTitle, sourceDate, onChoose, onOpenSource }: {
+function CardAction({ insight, kind, decision, sourceTitle, sourceDate, outbound, onChoose, onOpenSource }: {
   insight: NoteInsight;
   kind: SuggestionKind;
+  /** True when this note is the help and the earlier note is the one helped. */
+  outbound: boolean;
   decision?: CardDecision;
   sourceTitle: string;
   sourceDate: string;
@@ -2728,7 +2693,7 @@ function CardAction({ insight, kind, decision, sourceTitle, sourceDate, onChoose
       </div>
     </div>;
     return <div className={box}>
-      <p className="text-[13px] leading-relaxed text-[#315078]">Click “Solved” and your earlier note will show this as its answer.</p>
+      <p className="text-[13px] leading-relaxed text-[#315078]">Your new note answers “{sourceTitle}”. Click “Solved” and that note will show this as its answer.</p>
       <div className="mt-3 flex gap-2">
         <button type="button" onClick={(event) => { event.stopPropagation(); onChoose('solved'); }} className="rounded-md bg-[#477bea] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#3d6ed7] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] focus-visible:ring-offset-2">Solved</button>
         {/* As a Helps card it would only quote this note's own words back, so Dismiss removes it. */}
@@ -2755,6 +2720,25 @@ function CardAction({ insight, kind, decision, sourceTitle, sourceDate, onChoose
     </div>;
   }
 
+  if (kind === 'helps' && outbound) {
+    // This note is the help and the earlier note is where it applies, so the
+    // wording says so rather than reading as advice for this note.
+    const idea = sentenceCase(insight.action);
+    if (choice === 'helped') return <div className={box}>
+      <p className={`flex items-center gap-1.5 ${heading}`}><Check className="h-3.5 w-3.5" /> Marked as helping “{sourceTitle}”</p>
+      <p className="mt-1 text-[14px] font-medium leading-relaxed text-[#1f4d2e]">{idea}</p>
+      <div className="mt-2"><UndoButton onUndo={() => onChoose(null)} /></div>
+    </div>;
+    return <div className={`${box} flex items-center gap-3`}>
+      <div className="min-w-0 flex-1">
+        <p className={heading}>Your new note could help “{sourceTitle}”</p>
+        <p className="mt-1 text-[15px] font-semibold leading-relaxed text-[#1f4d2e]">{idea}</p>
+      </div>
+      <IconChoice kind={kind} accept={false} label="Doesn’t apply there" onClick={() => onChoose('rejected')} />
+      <IconChoice kind={kind} accept label="Yes, it helps there" onClick={() => onChoose('helped')} />
+    </div>;
+  }
+
   if (kind === 'helps') {
     // A dismissed solution has no idea of its own, so its answer stands in.
     const idea = insight.kind === 'helps' ? sentenceCase(insight.action) : `“${answer?.text ?? insight.action}”`;
@@ -2765,7 +2749,7 @@ function CardAction({ insight, kind, decision, sourceTitle, sourceDate, onChoose
     </div>;
     return <div className={`${box} flex items-center gap-3`}>
       <div className="min-w-0 flex-1">
-        <p className={heading}>This might help</p>
+        <p className={heading}>This might help your new note</p>
         <p className="mt-1 text-[15px] font-semibold leading-relaxed text-[#1f4d2e]">{idea}</p>
       </div>
       <IconChoice kind={kind} accept={false} label="Not helpful" onClick={() => onChoose('rejected')} />
@@ -2860,7 +2844,7 @@ function RelatedNotesList({ heading, results, notesById, onOpen }: {
       {results.slice(0, shown).map((result) => {
         const relatedNote = notesById.get(result.note_id);
         if (!relatedNote) return null;
-        const badge = result.relation_type ? RELATION_BADGES[result.relation_type] : null;
+        const badge = relationBadgeFor(result);
         const summary = result.gist.trim() || notePreview(relatedNote);
         const reason = result.explanation.trim();
         return <li key={result.note_id}>
@@ -2916,19 +2900,23 @@ function SuggestionCard({ insight, kind, decision, notesById, trigger, outbound 
   const sourceTitle = source ? noteLabel(source) : 'Earlier note';
   const sourceDate = source ? formatDate(source.created_at) : '';
   const cited = insight.note_ids.map((id) => notesById.get(id)).filter((note): note is Note => note !== undefined);
+  // When this note is the help, the badge says the earlier note is the one helped.
+  const badgeLabel = outbound && kind === 'solution' ? 'Answers an earlier note'
+    : outbound && kind === 'helps' ? 'Helps an earlier note'
+      : style.label;
   return (
     <section aria-label={`${style.label} suggestion`} className={`rounded-xl border bg-white shadow-sm ${style.border} ${compact ? 'p-4' : 'p-6'}`}>
       <div className="flex items-center justify-between gap-2">
-        <p className="flex min-w-0 items-center gap-2"><span className={`shrink-0 rounded-md px-2 py-1 text-xs font-medium ${style.badge}`}>{style.label}</span></p>
+        <p className="flex min-w-0 items-center gap-2"><span className={`shrink-0 rounded-md px-2 py-1 text-xs font-medium ${style.badge}`}>{badgeLabel}</span></p>
         {kind === 'contradiction' && onChoose && !decision && <button type="button" onClick={(event) => { event.stopPropagation(); onChoose('rejected'); }} aria-label="Dismiss" title="Dismiss" className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[#999] hover:bg-[#f5f5f5] hover:text-[#555]"><X className="h-4 w-4" /></button>}
       </div>
       {(trigger || insight.anchor) && <blockquote className="mt-3 border-l-2 border-[#ddd] pl-3 text-[13px] italic leading-relaxed text-[#777]">“{trigger
         ? <>{trigger.before}<span className={`rounded-sm px-0.5 not-italic text-[#444] ${HIGHLIGHT_STYLES[kind].idle}`}>{trigger.key}</span>{trigger.after}</>
         : insight.anchor}”</blockquote>}
       <p className={`mt-4 leading-relaxed text-[#222] ${compact ? 'text-[14px]' : 'text-[16px]'}`}><InsightSentence insight={insight} kind={kind} onOpenSource={onOpenSource} /></p>
-      {source && <p className="mt-2 text-[11px] text-[#999]">From your notes: “{sourceTitle}” · {sourceDate}</p>}
+      {source && <p className="mt-2 text-[11px] text-[#999]">{outbound ? 'The earlier note this helps' : 'From your notes'}: “{sourceTitle}” · {sourceDate}</p>}
       {onChoose
-        ? <CardAction insight={insight} kind={kind} decision={decision} sourceTitle={sourceTitle} sourceDate={sourceDate} onChoose={onChoose} onOpenSource={onOpenSource} />
+        ? <CardAction insight={insight} kind={kind} decision={decision} sourceTitle={sourceTitle} sourceDate={sourceDate} outbound={outbound} onChoose={onChoose} onOpenSource={onOpenSource} />
         : <p className="mt-3 text-[11px] text-[#999]">Save the note to act on this.</p>}
       {cited.length > 0 && <div className="mt-4 flex flex-wrap items-center justify-center gap-x-3 gap-y-1 border-t border-[#ececef] pt-3 text-[11px] text-[#999]">
         <span>{outbound ? 'Where this applies' : 'Notes used'}</span>
@@ -3148,7 +3136,7 @@ function RelevantNotesPanel({ notes, relevance, loading, progress, error, stale,
               const note = noteById.get(result.note_id);
               if (!note) return null;
               const content = splitNote(note);
-              const badge = result.relation_type ? RELATION_BADGES[result.relation_type] : null;
+              const badge = relationBadgeFor(result);
               const expanded = expandedId === result.note_id;
               const flipped = Boolean(flippedById[result.note_id]);
               const hasHeading = content.hasTitle;
@@ -3196,7 +3184,7 @@ function RelevantNotesPanel({ notes, relevance, loading, progress, error, stale,
       {/* Only render the footer when it has something to say, otherwise it
           shows as an empty bordered strip under the results. */}
       {!loading && !error && relevance && (stale || coverage?.complete === false || results.length > RELEVANCE_PAGE_SIZE) && <footer className="shrink-0 space-y-2 border-t border-[#eee] px-4 py-3">
-        {stale && <p className="text-[11px] leading-relaxed text-[#a06a00]">Your draft changed since this search. Run it again to refresh.</p>}
+        {stale && <p className="text-[11px] leading-relaxed text-[#a06a00]">Your new note changed since this search. Run it again to refresh.</p>}
         {coverage && !coverage.complete && <p className="text-[11px] leading-relaxed text-[#a06a00]">Searched {coverage.notes_searched} of {coverage.notes_total} notes — the rest couldn’t be read. <button type="button" onClick={onRetry} className="underline">Search again</button></p>}
         {results.length > RELEVANCE_PAGE_SIZE && <div className="flex items-center justify-between">
           <button type="button" onClick={() => onPageChange(currentPage - 1)} disabled={currentPage === 0} className="flex items-center gap-1 rounded px-2 py-1 text-xs text-[#555] hover:bg-[#f4f4f4] disabled:opacity-35"><ChevronLeft className="h-3.5 w-3.5" /> Previous</button>

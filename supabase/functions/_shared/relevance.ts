@@ -135,6 +135,12 @@ export interface RelevanceResult {
   matched_text: string;
   /** The draft section (one of its ideas) the note bears on, or WHOLE_DRAFT. */
   section_id: string;
+  /**
+   * Set when this note was added because the person marked it as what solved
+   * an earlier problem, and that problem note matched the draft: the id of the
+   * problem note. See applyCardRules.
+   */
+  solved_problem_note_id?: string;
 }
 
 export function truncate(text: string, limit: number): string {
@@ -142,6 +148,16 @@ export function truncate(text: string, limit: number): string {
 }
 
 // ---------------------------------------------------------------- sections
+
+/**
+ * What an idea in the draft is doing, which decides what may be offered to it.
+ * "situation" - a problem, worry, question, plan, or what happened: it can be
+ * given solutions and help. "solution" - a lesson, advice, a quote, a rule, or
+ * a fix that worked: it is the answer, so it is never given a solution or help
+ * of its own, only earlier problems it answers. "other" - anything else.
+ */
+export const IDEA_KINDS = ["situation", "solution", "other"] as const;
+export type IdeaKind = (typeof IDEA_KINDS)[number];
 
 /**
  * One idea in the draft. Sections are in reading order and do not overlap, and
@@ -156,6 +172,12 @@ export interface DraftSection {
   start: number;
   end: number;
   text: string;
+  /**
+   * What the idea is doing. Given by the call that splits the draft; for a
+   * draft that skips that call it is inferred from the matches (see
+   * inferIdeaKinds), and missing when there is nothing to infer it from.
+   */
+  kind?: IdeaKind;
 }
 
 /** A match that bears on the draft as a whole rather than on any one idea in it. */
@@ -175,12 +197,18 @@ function trimmedSpan(text: string, start: number, end: number): { start: number;
   return end > start ? { start, end } : null;
 }
 
-function toSections(text: string, spans: { start: number; end: number; label: string }[]): DraftSection[] {
+function toSections(text: string, spans: { start: number; end: number; label: string; kind?: IdeaKind }[]): DraftSection[] {
   const sections: DraftSection[] = [];
   for (const span of spans) {
     const trimmed = trimmedSpan(text, span.start, span.end);
     if (!trimmed) continue;
-    sections.push({ id: String(sections.length + 1), label: span.label, ...trimmed, text: text.slice(trimmed.start, trimmed.end) });
+    sections.push({
+      id: String(sections.length + 1),
+      label: span.label,
+      ...trimmed,
+      text: text.slice(trimmed.start, trimmed.end),
+      ...(span.kind ? { kind: span.kind } : {}),
+    });
   }
   return sections;
 }
@@ -214,9 +242,14 @@ An idea is one thing the note works on: a problem, a decision, a plan, a questio
 For each idea, in the order they appear:
 STARTS_WITH - copy, word for word, the first 6 to 12 words of the idea exactly as they appear in the note. Do not paraphrase, fix typos, or add quotation marks.
 LABEL - 2 to 6 plain words naming the idea, such as "Tester pricing feedback".
+KIND - what the idea is doing. Pick exactly one:
+"situation" - a problem, a worry, a question, a plan, a decision still to make, or something that happened.
+"solution" - a lesson, advice, a quote, a principle, a rule, or a fix that worked, with nothing in it left open.
+"other" - anything else, such as an observation, a memory, or a note to self.
+When an idea mixes a lesson with something still unresolved ("cold emails got nothing, so next I'll try referrals"), it is a "situation".
 
 OUTPUT - a JSON object and nothing else, in this shape:
-{"ideas": [{"starts_with": "<exact opening words>", "label": "<a few words>"}]}
+{"ideas": [{"starts_with": "<exact opening words>", "label": "<a few words>", "kind": "<situation|solution|other>"}]}
 
 ========================================
 
@@ -250,7 +283,7 @@ export function parseSectionResponse(raw: string, draft: string): DraftSection[]
     : null;
   if (!ideas) return null;
 
-  const starts: { start: number; label: string }[] = [];
+  const starts: { start: number; label: string; kind?: IdeaKind }[] = [];
   let cursor = 0;
   for (const entry of ideas) {
     if (!entry || typeof entry !== "object") continue;
@@ -262,7 +295,8 @@ export function parseSectionResponse(raw: string, draft: string): DraftSection[]
     if (!found) continue;
     const start = cursor + found.start;
     if (starts.length && start <= starts[starts.length - 1].start) continue;
-    starts.push({ start, label: cleanLine(row.label, MAX_SECTION_LABEL_CHARS) });
+    const kind = IDEA_KINDS.includes(row.kind as IdeaKind) ? (row.kind as IdeaKind) : undefined;
+    starts.push({ start, label: cleanLine(row.label, MAX_SECTION_LABEL_CHARS), kind });
     cursor = start + 1;
   }
   if (!starts.length) return null;
@@ -271,6 +305,7 @@ export function parseSectionResponse(raw: string, draft: string): DraftSection[]
     start: index === 0 ? 0 : item.start,
     end: index + 1 < starts.length ? starts[index + 1].start : draft.length,
     label: item.label,
+    kind: item.kind,
   })));
   return sections.length ? sections : null;
 }
@@ -305,7 +340,7 @@ export async function findDraftSections({ draft, generate, onError }: FindSectio
 function renderDraft(draft: string, sections: DraftSection[]): string {
   if (sections.length <= 1) return draft;
   return sections
-    .map((section) => `<idea id="${section.id}"${section.label ? ` label="${section.label.replace(/"/g, "'")}"` : ""}>\n${section.text}\n</idea>`)
+    .map((section) => `<idea id="${section.id}"${section.label ? ` label="${section.label.replace(/"/g, "'")}"` : ""}${section.kind ? ` kind="${section.kind}"` : ""}>\n${section.text}\n</idea>`)
     .join("\n\n");
 }
 
@@ -386,13 +421,14 @@ RELATION TYPE - pick exactly one:
 
 DIRECTION - which way the help flows between this note and the draft. Decide it for each note on its own; the same note can go either way against different drafts.
 "inbound" - the note helps the draft. Usually the draft describes a situation (a problem, a project, an open question, a plan, what happened) and the note brings something to it: a solution, advice, a lesson, evidence, a counterpoint, or a past attempt.
-"outbound" - the draft helps the note. Usually the draft is a solution or a lesson (a book quote, an article, a principle, a rule, advice, a technique that worked) and the note describes a situation it applies to: a problem it solves, a question it answers, a plan it changes. Read the relation from that side: "solves" with "outbound" means the draft solves the problem in the note.
+"outbound" - the draft helps the note. Usually the draft is a solution or a lesson (a book quote, an article, a principle, a rule, advice, a technique that worked) and the note describes a situation it applies to: a problem it solves, a question it answers, a plan it changes. Read the relation from that side: "solves" with "outbound" means the draft solves the problem in the note. For an outbound note, the explanation says the draft helps this note ("Your new note is the fix for this"), never that this note helps the draft.
 When both could fit, pick the one that better serves what they are working toward. For an outbound note, prefer problems that still look open; skip one that a later note shows was already resolved.
+An idea marked kind="solution" is already an answer: never return an inbound "solves" or "helps" note for it, because there is nothing in it to fix. Look for the earlier problems it answers instead.
 
 GIST - exactly one short sentence: what the note actually says, in your own words. These are the person's own notes, so say it back to them in the second person, the way a friend recapping it would: "You noticed...", "You decided...", "You're worried that...". Never call them "the author", "the writer", "the user", or "this person". Anyone else in the note keeps their name ("Maya told you..."). Keep its specifics (names, numbers, decisions). Do not mention the draft here; this must make sense on its own as a summary of the note.
 
 EXPLANATION - one or two short sentences, in plain language, written to the person who wrote the draft: how the note bears on the draft, naming the specific thing in the draft it touches. Do not restate the gist; the reader sees them separately.
-Write both the way you would explain it to a friend. Address them as "you" and call the draft "your draft". No jargon, no academic register, and never open with "This note highlights/underscores/demonstrates".
+Write both the way you would explain it to a friend. Address them as "you" and call the draft "your new note". No jargon, no academic register, and never open with "This note highlights/underscores/demonstrates".
 Do the thinking for them: spell the connection out rather than gesturing at it. Never say two things are "both about X" without saying what about X ties them together.
 
 MATCHED TEXT - copy, word for word, the shortest sentence or passage from the candidate note that you actually used to make this match. Do not paraphrase, fix typos, or add quotation marks. Keep it under 45 words.
@@ -406,9 +442,9 @@ CRITICAL RULES:
 - Use the exact ID string as given. Never invent an ID, and never return one that is not listed above.
 
 Worked examples:
-- Draft: "From The Mom Test: ask people about what they did in the past, not what they would do in the future." Candidate note: "Tester interviews keep going nowhere - everyone says they'd use it, then nobody does." Level 5, relation_type "solves", direction "outbound", gist: "Your tester interviews keep ending with people saying they'd use it and then never doing.", explanation: "Your draft is the fix for this: those interviews asked what testers would do, which is exactly the question the book says gets you polite yeses.", matched_text: "everyone says they'd use it, then nobody does"
-- Draft: "Charging per seat punishes teams for adding people, so we should move to usage-based pricing." Candidate note: "Talked to Maya - she stopped adding teammates to the tool because each one cost another $12/mo." Level 5, relation_type "supports", gist: "You talked to Maya, a customer, who stopped adding teammates to the tool because each extra seat cost another $12 a month.", explanation: "That is the exact thing your draft argues, already happening to someone real - the problem with per-seat pricing isn't theoretical, she felt it and acted on it."
-- Draft: "I'm always running late, however early I start." Candidate note: "I'm the last one in my friend group to get married. Good things seem to reach me last." Level 4, relation_type "parallel", gist: "You're the last of your friends to get married, and feel like good things tend to reach you last.", explanation: "It's not about punctuality at all, but it's the same shape as your draft - being behind turns up in two different corners of your life, one you cause and one you don't, which is worth sitting with."
+- Draft: "From The Mom Test: ask people about what they did in the past, not what they would do in the future." Candidate note: "Tester interviews keep going nowhere - everyone says they'd use it, then nobody does." Level 5, relation_type "solves", direction "outbound", gist: "Your tester interviews keep ending with people saying they'd use it and then never doing.", explanation: "Your new note is the fix for this: those interviews asked what testers would do, which is exactly the question the book says gets you polite yeses.", matched_text: "everyone says they'd use it, then nobody does"
+- Draft: "Charging per seat punishes teams for adding people, so we should move to usage-based pricing." Candidate note: "Talked to Maya - she stopped adding teammates to the tool because each one cost another $12/mo." Level 5, relation_type "supports", gist: "You talked to Maya, a customer, who stopped adding teammates to the tool because each extra seat cost another $12 a month.", explanation: "That is the exact thing your new note argues, already happening to someone real - the problem with per-seat pricing isn't theoretical, she felt it and acted on it."
+- Draft: "I'm always running late, however early I start." Candidate note: "I'm the last one in my friend group to get married. Good things seem to reach me last." Level 4, relation_type "parallel", gist: "You're the last of your friends to get married, and feel like good things tend to reach you last.", explanation: "It's not about punctuality at all, but it's the same shape as your new note - being behind turns up in two different corners of your life, one you cause and one you don't, which is worth sitting with."
 - Draft: "I can't decide whether to take the design job or stay freelance." Candidate note: "Never stop believing in yourself." Omitted: level 3, general encouragement that would fit almost any draft, under the minimum of 4 for "helps".
 - Draft: the design job one again. Candidate note: "When a launch flops, treat it as data and move on." Omitted: level 2, it only connects if you assume something in the draft failed, and the draft says nothing failed.
 - Draft: the pricing one again. Candidate note: "Pricing page redesign - make the CTA green and move testimonials above the fold." Omitted: level 1, it shares the word "pricing" but has nothing to do with the draft's argument.
@@ -730,6 +766,10 @@ export interface SearchFunnel {
   kept: number;
   /** Cards written; null when the insight step did not run or failed. */
   cards: number | null;
+  /** Dropped by applyCardRules, by rule. */
+  dropped_by_rules?: CardRulesOutcome["dropped"];
+  /** Notes added by applyCardRules because they solved an earlier problem that matched. */
+  added_solvers?: number;
 }
 
 export function searchFunnel(
@@ -737,6 +777,7 @@ export function searchFunnel(
   kept: RelevanceResult[],
   cutByCap: RelevanceResult[],
   insight: InsightOutcome | null,
+  rules?: Pick<CardRulesOutcome, "dropped" | "added_solvers">,
 ): SearchFunnel {
   const below_bar: Partial<Record<RelationType, number[]>> = {};
   let belowCount = 0;
@@ -755,6 +796,7 @@ export function searchFunnel(
     cut_by_cap: cutByCap.map((result) => result.level),
     kept: kept.length,
     cards: insight && !insight.failed ? insight.insights.length : null,
+    ...(rules ? { dropped_by_rules: rules.dropped, added_solvers: rules.added_solvers } : {}),
   };
 }
 
@@ -804,6 +846,274 @@ export function diversifyByRelation(
     counts.set(chosen.relation_type, (counts.get(chosen.relation_type) ?? 0) + 1);
   }
   return picked;
+}
+
+// ------------------------------------------------------------ card history
+
+/**
+ * A problem in one note that the person already settled with another note, by
+ * choosing Solved or accepting a Helps card. Read from note_card_decisions.
+ */
+export interface SettledProblem {
+  problem_note_id: string;
+  /** The problem's words in that note, when the card recorded them; "" otherwise. */
+  problem_text: string;
+  /** The note that settled it. */
+  by_note_id: string;
+  /** The answer or idea they accepted; "" when the card did not record it. */
+  answer_text: string;
+  choice: "solved" | "helped";
+}
+
+/** A card the person waved off: the notes it offered, and the passage it was for. */
+export interface TurnedDown {
+  /** The note the card was shown on. */
+  shown_on_note_id: string;
+  note_ids: string[];
+  /** The words of that note the card was about; "" when unknown. */
+  passage: string;
+}
+
+export interface CardHistory {
+  settled: SettledProblem[];
+  turned_down: TurnedDown[];
+}
+
+export const EMPTY_CARD_HISTORY: CardHistory = { settled: [], turned_down: [] };
+
+/** How many past choices a search reads. Newest first, so the oldest go when there are more. */
+export const MAX_CARD_HISTORY_ROWS = 2000;
+const MAX_PASSAGE_CHARS = 500;
+
+/**
+ * Reads note_card_decisions rows (from Supabase, or from the browser in local
+ * mode) into what retrieval needs. Each row is { note_id, target_note_id,
+ * choice, kind, insight }, where insight is the card as it was when chosen.
+ * Anything malformed is skipped.
+ */
+export function readCardHistory(rows: unknown): CardHistory {
+  const history: CardHistory = { settled: [], turned_down: [] };
+  if (!Array.isArray(rows)) return history;
+  const text = (value: unknown) => (typeof value === "string" ? value.trim().slice(0, MAX_PASSAGE_CHARS) : "");
+  const id = (value: unknown) => (typeof value === "string" && value.trim() ? value.trim() : "");
+  const quote = (value: unknown) => {
+    const row = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+    return { note_id: id(row.note_id), text: text(row.text) };
+  };
+
+  for (const entry of rows.slice(0, MAX_CARD_HISTORY_ROWS)) {
+    if (!entry || typeof entry !== "object") continue;
+    const row = entry as Record<string, unknown>;
+    const shownOn = id(row.note_id);
+    const insight = row.insight && typeof row.insight === "object" ? (row.insight as Record<string, unknown>) : null;
+    if (!shownOn || !insight) continue;
+    const noteIds = Array.isArray(insight.note_ids) ? insight.note_ids.map(id).filter(Boolean) : [];
+    const anchor = text(insight.anchor);
+    const outbound = insight.direction === "outbound";
+    const answer = quote(insight.answer);
+    const problem = quote(insight.problem);
+    const quotes = Array.isArray(insight.quotes) ? insight.quotes.map(quote) : [];
+    const add = (problemNoteId: string, problemText: string, byNoteId: string, answerText: string, choice: SettledProblem["choice"]) => {
+      if (problemNoteId && byNoteId && problemNoteId !== byNoteId) {
+        history.settled.push({ problem_note_id: problemNoteId, problem_text: problemText, by_note_id: byNoteId, answer_text: answerText, choice });
+      }
+    };
+
+    if (row.choice === "solved") {
+      // Outbound: the note the card was on answered an earlier note's problem.
+      if (outbound) add(id(row.target_note_id) || problem.note_id, problem.text, shownOn, answer.text, "solved");
+      // Inbound: an earlier note answered the problem in the note the card was on.
+      else add(shownOn, anchor, answer.note_id || noteIds[0] || "", answer.text, "solved");
+    } else if (row.choice === "helped") {
+      const idea = text(insight.action);
+      if (outbound) {
+        for (const problemNoteId of noteIds) {
+          add(problemNoteId, quotes.find((item) => item.note_id === problemNoteId)?.text ?? "", shownOn, idea, "helped");
+        }
+      } else {
+        add(shownOn, anchor, noteIds[0] ?? "", idea, "helped");
+      }
+    } else if (row.choice === "rejected" && noteIds.length) {
+      history.turned_down.push({ shown_on_note_id: shownOn, note_ids: noteIds, passage: anchor });
+    }
+  }
+  return history;
+}
+
+/** Which paragraph of `text` a passage is in, or null when it cannot be found there. */
+function paragraphOf(text: string, passage: string): number | null {
+  if (!passage) return null;
+  const span = findAnchor(text, passage);
+  if (!span) return null;
+  const index = splitIntoParagraphs(text).findIndex((paragraph) => span.start >= paragraph.start && span.start < paragraph.end);
+  return index === -1 ? null : index;
+}
+
+/**
+ * Whether two passages of a note are about the same part of it. Notes are not
+ * stored split by idea, so a paragraph stands in for one. When either passage
+ * cannot be placed, they are taken to be the same, so a settled problem is
+ * never offered again just because a quote was copied loosely.
+ */
+function samePart(text: string, a: string, b: string): boolean {
+  const first = paragraphOf(text, a);
+  const second = paragraphOf(text, b);
+  return first === null || second === null || first === second;
+}
+
+/**
+ * Fills in the kind of any idea the split did not label: a draft short enough
+ * to skip the split, or one split by paragraphs after the call failed. The
+ * agents already said which way each match points, so an idea whose solves and
+ * helps matches mostly point outbound (the draft answers those notes) is a
+ * solution. A tie, or no such matches, says nothing, and the kind stays unset.
+ */
+export function inferIdeaKinds(sections: DraftSection[], results: RelevanceResult[]): DraftSection[] {
+  return sections.map((section) => {
+    if (section.kind) return section;
+    const helping = results.filter((result) =>
+      (result.section_id === section.id || (sections.length === 1 && result.section_id === WHOLE_DRAFT))
+      && (result.relation_type === "solves" || result.relation_type === "helps"));
+    const outbound = helping.filter((result) => result.direction === "outbound").length;
+    const inbound = helping.length - outbound;
+    if (outbound === inbound) return section;
+    return { ...section, kind: outbound > inbound ? "solution" : "situation" };
+  });
+}
+
+/** Whether a match's section is a solution. A match on the whole draft is, only when every idea is one. */
+export function isSolutionSection(sections: DraftSection[], sectionId: string): boolean {
+  if (sectionId === WHOLE_DRAFT) return sections.length > 0 && sections.every((section) => section.kind === "solution");
+  return sections.find((section) => section.id === sectionId)?.kind === "solution";
+}
+
+/** Relations that mean an earlier note is facing the same problem as the draft, rather than a similar shape elsewhere. */
+const SAME_PROBLEM_RELATIONS: RelationType[] = ["solves", "helps", "supports", "extends", "question"];
+
+export interface CardRulesInput {
+  draft: string;
+  results: RelevanceResult[];
+  sections: DraftSection[];
+  notes: NoteLike[];
+  history: CardHistory;
+  /** The saved note the draft is, when it is one. Its own past choices apply to it. */
+  draftNoteId: string | null;
+}
+
+export interface CardRulesOutcome {
+  results: RelevanceResult[];
+  /** The sections, with any kind the split left out inferred. */
+  sections: DraftSection[];
+  dropped: { help_for_solution: number; already_settled: number; turned_down: number };
+  /** Notes added because they solved an earlier problem that matched. */
+  added_solvers: number;
+}
+
+/**
+ * Rules applied to the merged matches before any card is written:
+ *
+ * 1. A solution gets no solutions. In an idea that is itself a solution or a
+ *    lesson, inbound "solves" and "helps" matches are dropped: there is
+ *    nothing in it to fix. Its outbound matches (earlier problems it answers)
+ *    stay.
+ * 2. One solution per situation. An outbound "solves" or "helps" match is
+ *    dropped when the person already settled that part of the earlier note
+ *    with a different note. A solution note itself can still be offered to
+ *    any number of problems.
+ * 3. Turned-down notes stay down. A note the person rejected on a card shown
+ *    on this same note is not offered again for the same idea. Rejections on
+ *    other notes are left to the insight call, which is told about them.
+ * 4. Solved before. When a match is an earlier note facing the same problem,
+ *    and the person marked another note as what solved it, that solving note
+ *    is added right after it, so the card can say they solved this before.
+ */
+export function applyCardRules({ draft, results, sections: given, notes, history, draftNoteId }: CardRulesInput): CardRulesOutcome {
+  const sections = inferIdeaKinds(given, results);
+  const textById = new Map(notes.map((note) => [note.id, note.raw_text]));
+  const dropped = { help_for_solution: 0, already_settled: 0, turned_down: 0 };
+  const helping = (result: RelevanceResult) => result.relation_type === "solves" || result.relation_type === "helps";
+
+  // Which section of this draft each rejection on it was about. A passage no
+  // longer in the draft says nothing about where, so it covers every section.
+  const turnedDownHere = history.turned_down
+    .filter((item) => draftNoteId && item.shown_on_note_id === draftNoteId)
+    .map((item) => {
+      const span = item.passage ? findAnchor(draft, item.passage) : null;
+      return { note_ids: item.note_ids, section_id: span ? sectionAt(sections, span.start)?.id ?? null : null };
+    });
+
+  const kept = results.filter((result) => {
+    if (result.direction === "inbound" && helping(result) && isSolutionSection(sections, result.section_id)) {
+      dropped.help_for_solution++;
+      return false;
+    }
+    if (result.direction === "outbound" && helping(result)) {
+      const text = textById.get(result.note_id) ?? "";
+      const settled = history.settled.some((item) =>
+        item.problem_note_id === result.note_id
+        && item.by_note_id !== draftNoteId
+        && samePart(text, item.problem_text, result.matched_text));
+      if (settled) {
+        dropped.already_settled++;
+        return false;
+      }
+    }
+    const turnedDown = turnedDownHere.some((item) =>
+      item.note_ids.includes(result.note_id)
+      && (item.section_id === null || sections.length <= 1 || item.section_id === result.section_id));
+    if (turnedDown) {
+      dropped.turned_down++;
+      return false;
+    }
+    return true;
+  });
+
+  const out: RelevanceResult[] = [];
+  const placed = new Set(kept.map((result) => result.note_id));
+  let addedSolvers = 0;
+  for (const result of kept) {
+    out.push(result);
+    if (result.direction !== "inbound" || !SAME_PROBLEM_RELATIONS.includes(result.relation_type)) continue;
+    if (isSolutionSection(sections, result.section_id)) continue;
+    const text = textById.get(result.note_id) ?? "";
+    const solved = history.settled.find((item) =>
+      item.choice === "solved"
+      && item.problem_note_id === result.note_id
+      && item.by_note_id !== draftNoteId
+      && textById.has(item.by_note_id)
+      && samePart(text, item.problem_text, result.matched_text));
+    if (!solved) continue;
+    const problemNote = notes.find((note) => note.id === result.note_id);
+    const title = problemNote ? (splitNoteTitle(problemNote.raw_text).title || (problemNote.summary ?? "").trim()) : "";
+    const explanation = `You had this same problem before${title ? ` in "${truncate(title, 80)}"` : ""}, and marked this note as what solved it.`;
+    if (placed.has(solved.by_note_id)) {
+      // Already a match: say why it matters, without moving it.
+      const index = out.findIndex((item) => item.note_id === solved.by_note_id);
+      const existing = index === -1 ? kept.find((item) => item.note_id === solved.by_note_id) : out[index];
+      if (existing && !existing.solved_problem_note_id) {
+        const marked = { ...existing, solved_problem_note_id: result.note_id };
+        if (index === -1) kept[kept.indexOf(existing)] = marked;
+        else out[index] = marked;
+      }
+      continue;
+    }
+    placed.add(solved.by_note_id);
+    addedSolvers++;
+    out.push({
+      note_id: solved.by_note_id,
+      level: result.level,
+      relevance_score: result.relevance_score,
+      relation_type: "solves",
+      direction: "inbound",
+      gist: "",
+      explanation,
+      matched_text: solved.answer_text,
+      section_id: result.section_id,
+      solved_problem_note_id: result.note_id,
+    });
+  }
+
+  return { results: out, sections, dropped, added_solvers: addedSolvers };
 }
 
 // ------------------------------------------------------------------ insight
@@ -923,16 +1233,78 @@ const MAX_ANSWER_CHARS = 250;
 const WHOLE_NOTE_SHARE = 0.8;
 const WHOLE_NOTE_MIN_CHARS = 160;
 
+/** How many words of a note make its title when the person gave it none. */
+export const DEFAULT_TITLE_WORDS = 5;
+/** Longer than this, a first line is the start of the note, not a title someone typed. */
+const MAX_TITLE_WORDS = 12;
+const MAX_TITLE_CHARS = 90;
+
+function titleWords(text: string): string[] {
+  return text
+    .replace(/^[\s>]*(?:#{1,6}|[-*+•]|\d+\.)[ \t]+/gm, "")
+    .replace(/[*_`~]/g, "")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
 /**
- * A note's title and its text. The app shows the first line as the title, so
- * it is a label, never something to quote; a note that is one line is all text.
+ * The title a note gets when the person gave it none: its first five words,
+ * with "..." when the note goes on past them.
+ */
+export function defaultNoteTitle(text: string): string {
+  const words = titleWords(text);
+  if (words.length <= DEFAULT_TITLE_WORDS) return words.join(" ");
+  return `${words.slice(0, DEFAULT_TITLE_WORDS).join(" ").replace(/[\s,.;:!?…\-–—]+$/, "")}...`;
+}
+
+/** Lowercased words only, to tell when a title is just the start of the text. */
+function titleKey(text: string): string {
+  return titleWords(text).join(" ").toLowerCase().replace(/(?:\.\.\.|…)$/, "").replace(/[^\p{L}\p{N} ]+/gu, "");
+}
+
+/**
+ * A note's title and body. The first line is the title, as the app stores it,
+ * unless it is plainly not one, which is how notes saved without a title look:
+ * - the whole note is one long line, so the title would be the entire note;
+ * - the first line is a sentence or paragraph, far longer than a title;
+ * - the first line is just the start of the body, as an older import wrote it.
+ * Then the title is the note's first five words and the body is all its text,
+ * so nothing reads as if it were written in the title. `written` is false for
+ * a title made this way.
+ */
+export function readNoteTitle(rawText: string): { title: string; body: string; written: boolean } {
+  const text = rawText.trim();
+  if (!text) return { title: "", body: "", written: false };
+  const newline = text.indexOf("\n");
+  const first = (newline === -1 ? text : text.slice(0, newline)).trim();
+  const rest = newline === -1 ? "" : text.slice(newline + 1).trim();
+  const isHeading = /^#{1,6}\s+\S/.test(first);
+  const words = titleWords(first).length;
+  if (!rest) {
+    return isHeading || words <= DEFAULT_TITLE_WORDS
+      ? { title: first, body: "", written: true }
+      : { title: defaultNoteTitle(text), body: text, written: false };
+  }
+  if (!isHeading && (words > MAX_TITLE_WORDS || first.length > MAX_TITLE_CHARS)) {
+    return { title: defaultNoteTitle(text), body: text, written: false };
+  }
+  // A title that only repeats how the body starts was made for the note, not by
+  // its writer: a whole first sentence, or five words and "...". A short title
+  // someone typed can share the body's first word or two, so that alone is not enough.
+  const key = titleKey(first);
+  const madeUp = words > DEFAULT_TITLE_WORDS || /(?:\.\.\.|…)$/.test(first);
+  if (key && madeUp && titleKey(rest).startsWith(key)) return { title: defaultNoteTitle(rest), body: rest, written: false };
+  return { title: first, body: rest, written: true };
+}
+
+/**
+ * A note's title and its text. The title is a label, never something to
+ * quote; a note with no title of its own is all text.
  */
 export function splitNoteTitle(rawText: string): { title: string; text: string } {
-  const trimmed = rawText.trim();
-  const newline = trimmed.indexOf("\n");
-  if (newline === -1) return { title: "", text: trimmed };
-  const text = trimmed.slice(newline + 1).trim();
-  return text ? { title: trimmed.slice(0, newline).trim(), text } : { title: "", text: trimmed };
+  const { title, body, written } = readNoteTitle(rawText);
+  if (!body) return { title: "", text: title };
+  return { title: written ? title : "", text: body };
 }
 const MAX_IDEA_CHARS = 160;
 const MAX_PATTERN_CHARS = 260;
@@ -1019,9 +1391,15 @@ export interface InsightPromptInput {
   matches: InsightMatch[];
   /** The draft's ideas; with more than one, insights are given per idea. */
   sections?: DraftSection[];
+  /** Cards the person waved off before; each related note lists the ones that offered it. */
+  turnedDown?: TurnedDown[];
 }
 
-export function buildInsightPrompt({ draft, context, recentNotes, matches, sections = [] }: InsightPromptInput): string {
+/** How many past rejections a related note lists, newest first. */
+const MAX_TURNED_DOWN_PER_NOTE = 3;
+const MAX_TURNED_DOWN_PASSAGE_CHARS = 160;
+
+export function buildInsightPrompt({ draft, context, recentNotes, matches, sections = [], turnedDown = [] }: InsightPromptInput): string {
   const askForGoal = Boolean(context.domain && !context.goal);
   const byIdea = sections.length > 1;
   const recent = recentNotes.length
@@ -1034,14 +1412,31 @@ export function buildInsightPrompt({ draft, context, recentNotes, matches, secti
     const section = sections.find((item) => item.id === result.section_id);
     return `\nIdea: ${section ? `${section.id}${section.label ? ` (${section.label})` : ""}` : "the note as a whole"}`;
   };
+  const writtenOn = new Map(matches.map(({ note }) => [note.id, note.created_at.slice(0, 10)]));
+  const solvedBeforeLine = (result: RelevanceResult) => {
+    if (!result.solved_problem_note_id) return "";
+    const when = writtenOn.get(result.solved_problem_note_id);
+    return `\nSolved before: they marked this note as what solved their problem in note ${result.solved_problem_note_id}${when ? ` (written ${when})` : ""}.`;
+  };
+  const turnedDownLines = (noteId: string) => turnedDown
+    .filter((item) => item.passage && item.note_ids.includes(noteId))
+    .slice(0, MAX_TURNED_DOWN_PER_NOTE)
+    .map((item) => `\nTurned down before: as a suggestion for "${truncate(item.passage.replace(/\s+/g, " "), MAX_TURNED_DOWN_PASSAGE_CHARS)}"`)
+    .join("");
   // The title is shown as a label apart from the text, since quotes may only
   // come from the text.
   const related = matches
     .map(({ note, result }) => {
       const { title, text } = splitNoteTitle(note.raw_text);
-      return `ID: ${note.id}\nTitle: ${title || "(none)"}\nWritten: ${note.created_at.slice(0, 10)}${ideaLine(result)}\nDirection: ${result.direction === "outbound" ? "outbound (the note being written helps this one)" : "inbound (this note helps the one being written)"}\nHow it relates: ${result.relation_type} - ${result.explanation}\nText:\n${truncate(text, MAX_NOTE_CHARS)}`;
+      return `ID: ${note.id}\nTitle: ${title || "(none)"}\nWritten: ${note.created_at.slice(0, 10)}${ideaLine(result)}\nDirection: ${result.direction === "outbound" ? "outbound (the note being written helps this one)" : "inbound (this note helps the one being written)"}\nHow it relates: ${result.relation_type} - ${result.explanation}${solvedBeforeLine(result)}${turnedDownLines(note.id)}\nText:\n${truncate(text, MAX_NOTE_CHARS)}`;
     })
     .join("\n\n---\n\n");
+  const solutionIdeas = sections.filter((section) => section.kind === "solution");
+  const solutionLine = !solutionIdeas.length
+    ? "(none)"
+    : byIdea
+      ? `ideas ${solutionIdeas.map((section) => section.id).join(", ")}`
+      : "the whole note";
   const howMany = byIdea
     ? `HOW MANY - the note works on ${sections.length} separate ideas, marked as numbered <idea> blocks, and each related note says which idea it bears on. Give at most one insight per idea, built on that idea's related notes, plus at most one about the note as a whole. Skip any idea where nothing clears the bar; an idea with no insight is a normal, frequent, and correct outcome. Do not stretch to cover every idea.`
     : `HOW MANY - a note can raise several separate issues. Give one insight per issue that clears the bar, at most ${MAX_INSIGHTS}, strongest first. Each must be about a different passage of the note, and must not repeat another insight's point. One insight is often right, and an empty list is a normal, frequent, and correct answer. Do not stretch to fill the slots.`;
@@ -1085,13 +1480,17 @@ ANSWER - for "solution" and "extension" only: the exact words from a past note's
 IDEA - for "helps" only: a short phrase, in plain words, that completes "Might help to ...", starting with a lowercase verb, such as "say the price and just wait".
 PATTERN - for "pattern" only: one or two short sentences naming what repeats, such as "Both times, price was what they said. Trust was what they asked about."
 NOTE_IDS - the IDs of the past notes this insight rests on, only from the list given.
-OUTBOUND - when the notes an insight rests on are outbound, the note being written is the lesson and the past note is where it applies. TEXT places that earlier situation with its own words ("You were stuck on {1}.").
+OUTBOUND - when the notes an insight rests on are outbound, the note being written is the lesson and the past note is where it applies. TEXT places that earlier situation with its own words and says the note being written is what helps it, so it can never read as advice for the note being written ("Your new note is the fix for when you were stuck on {1}.").
 - When the note being written answers a problem or open question in that past note, give "solution", and as clearly as any other solution: PROBLEM is the exact words from the past note's Text that state the problem, with its ID, and ANSWER is the exact words from the note being written that answer it, with "note_id": "this". ANCHOR is the key part of that answer.
-- Otherwise use "helps" or "pattern", never "extension": IDEA says how this lesson applies to that earlier situation.
+- Otherwise use "helps" or "pattern", never "extension": IDEA says what that earlier situation could do with this lesson, such as "test your hypotheses by watching what people do in the product".
+
+SOLUTIONS GET NO SOLUTIONS - a part of the note that is itself a solution or lesson (listed below as "Already a solution") is the answer. Never give it a "solution" or "helps" card built on inbound notes: there is nothing in it to fix. For that part, look only for earlier problems it answers (outbound).
+SOLVED BEFORE - a related note marked "Solved before" is the one they already chose as the answer to that same problem in an earlier note. When the note being written faces that same problem again, give a "solution" card that says they solved this before: TEXT places the earlier problem with its own words from the problem note, and ANSWER is the answer from the note marked "Solved before". Example TEXT: "You solved this before, when you were stuck on {1}."
+TURNED DOWN - a related note marked "Turned down before" was offered to them for that passage and they said no. Do not build a card on it for the same problem again; use it only for something clearly different.
 ${askForGoal ? `
 GOAL_SUGGESTIONS - they have not said what this area is for. Offer 2 or 3 short guesses at it, 2 to 6 words each and starting with a verb ("Validate pricing", "Find first 10 users"), based on the note and their recent notes in the area. Include these even when there are no insights.
 ` : ""}
-VOICE - these are their own notes. Speak to them as "you", like a friend who remembers everything they have written. Plain words, no jargon. Never say "the user", "the author", or "this note highlights".
+VOICE - these are their own notes. Speak to them as "you", and when you mention the note being written, call it "your new note", like a friend who remembers everything they have written. Plain words, no jargon. Never say "the user", "the author", or "this note highlights".
 
 OUTPUT - a JSON object and nothing else, in this shape:
 {"intent": "<stuck|planning|deciding|capturing|reflecting|learning>", "insights": [{"kind": "<solution|helps|extension|contradiction|pattern>", "anchor": "<exact words from the note being written>", "text": "<one sentence with {1}, {2}...>", "quotes": [{"note_id": "<id>", "text": "<exact words from that note>"}], "answer": {"note_id": "<id, or this>", "text": "<exact words>"}, "problem": {"note_id": "<id>", "text": "<exact words>"}, "idea": "<helps only>", "pattern": "<pattern only>", "note_ids": ["<id>"]}]${askForGoal ? ', "goal_suggestions": ["<guess>"]' : ""}}
@@ -1101,6 +1500,7 @@ Leave out "answer", "problem", "idea", and "pattern" where they do not apply. "i
 
 Area: ${context.domain ?? "(none)"}
 What they are working toward in this area: ${context.goal ?? "(not stated)"}
+Already a solution: ${solutionLine}
 
 Their most recent notes in this area:
 ${recent}
@@ -1284,6 +1684,9 @@ export function parseInsightResponse(
     const found = findAnchor(draft, quoted.slice(0, MAX_ANCHOR_CHARS * 2));
     const span = found && found.end - found.start <= MAX_ANCHOR_CHARS ? found : null;
     if (span && spans.some((taken) => span.start < taken.end && taken.start < span.end)) continue;
+    const sectionId = sectionFor(span, noteIds);
+    // A part of the draft that is itself a solution is never handed one.
+    if (direction === "inbound" && (kind === "solution" || kind === "helps") && isSolutionSection(sections, sectionId)) continue;
     if (span) spans.push(span);
     seenText.add(text.toLowerCase());
 
@@ -1299,7 +1702,7 @@ export function parseInsightResponse(
       problem,
       action,
       note_ids: noteIds,
-      section_id: sectionFor(span, noteIds),
+      section_id: sectionId,
     });
   }
 
@@ -1328,6 +1731,8 @@ export interface FindInsightOptions {
   excludeNoteId: string | null;
   /** The draft's ideas, as the search used them. */
   sections?: DraftSection[];
+  /** The person's past choices on cards; rejections are passed on to the prompt. */
+  history?: CardHistory;
   /** Injected so this module stays free of any particular model client. */
   generate: (prompt: string) => Promise<string>;
 }
@@ -1339,7 +1744,7 @@ export interface FindInsightOptions {
  * strongly enough.
  */
 export async function findInsight(options: FindInsightOptions): Promise<InsightOutcome> {
-  const { draft, context, notes, results, excludeNoteId, sections = [], generate } = options;
+  const { draft, context, notes, results, excludeNoteId, sections = [], history = EMPTY_CARD_HISTORY, generate } = options;
   const matches = selectInsightMatches(results, notes);
   if (!matches.length) return SKIPPED_INSIGHT;
   const prompt = buildInsightPrompt({
@@ -1348,6 +1753,8 @@ export async function findInsight(options: FindInsightOptions): Promise<InsightO
     recentNotes: recentDomainNotes(notes, context.domain, excludeNoteId),
     matches,
     sections,
+    // Rejections on this same note were already applied as a filter.
+    turnedDown: history.turned_down.filter((item) => item.shown_on_note_id !== excludeNoteId),
   });
   return parseInsightResponse(await generate(prompt), {
     draft,
@@ -1376,6 +1783,10 @@ export interface SearchOptions extends Omit<RunAgentsOptions, "sections"> {
   onError?: (error: unknown) => void;
   /** Where the matches went, once the search finishes. */
   onFunnel?: (funnel: SearchFunnel) => void;
+  /** The person's past choices on cards, for applyCardRules. */
+  history?: CardHistory;
+  /** The saved note being searched from, when it is one. */
+  draftNoteId?: string | null;
 }
 
 export interface SearchOutcome {
@@ -1400,10 +1811,10 @@ export interface SearchOutcome {
  * after the split, no retries, and no insight call after the agents.
  */
 export async function searchRelevance(options: SearchOptions): Promise<SearchOutcome> {
-  const { maxPerSection, findSections, summarize, findInsight, onError, onFunnel, ...agentOptions } = options;
+  const { maxPerSection, findSections, summarize, findInsight, onError, onFunnel, history = EMPTY_CARD_HISTORY, draftNoteId = null, ...agentOptions } = options;
   const { draft, notes, signal } = agentOptions;
   stopIfCancelled(signal);
-  const sections = findSections
+  const splitSections = findSections
     ? await findSections(draft, signal).catch((error) => {
       if (!signal?.aborted) onError?.(error);
       return splitIntoParagraphs(draft);
@@ -1411,10 +1822,13 @@ export async function searchRelevance(options: SearchOptions): Promise<SearchOut
     : wholeDraftSection(draft);
 
   stopIfCancelled(signal);
-  const { outcomes } = await runRelevanceAgents({ ...agentOptions, sections });
+  const { outcomes } = await runRelevanceAgents({ ...agentOptions, sections: splitSections });
   stopIfCancelled(signal);
   const createdAtById = new Map(notes.map((note) => [note.id, note.created_at]));
-  const { results, notesSearched, cutByCap } = mergeAgentResults(outcomes, createdAtById, maxPerSection);
+  const merged = mergeAgentResults(outcomes, createdAtById, maxPerSection);
+  const { notesSearched, cutByCap } = merged;
+  const ruled = applyCardRules({ draft, results: merged.results, sections: splitSections, notes, history, draftNoteId });
+  const { results, sections } = ruled;
   const base = { sections, results, notesSearched, notesTotal: notes.length };
   if (notesSearched === 0) return { ...base, summary: "", insight: null };
 
@@ -1431,7 +1845,7 @@ export async function searchRelevance(options: SearchOptions): Promise<SearchOut
       : Promise.resolve(null),
   ]);
   stopIfCancelled(signal);
-  try { onFunnel?.(searchFunnel(outcomes, results, cutByCap, insight)); } catch { /* measuring never breaks a search */ }
+  try { onFunnel?.(searchFunnel(outcomes, results, cutByCap, insight, ruled)); } catch { /* measuring never breaks a search */ }
   return { ...base, summary, insight };
 }
 

@@ -38,3 +38,7 @@ next-env.d.ts
 
 # local build output for supabase function logic
 /.relevance-build/
+
+# personal decisions log
+/decisions.txt
+/CLAUDE.local.md

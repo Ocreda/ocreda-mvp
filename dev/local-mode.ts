@@ -132,6 +132,20 @@ export function localMoveNotesToCategory(noteIds: string[], category: string | n
  * fan-out the Edge Function does. The notes travel in the request because
  * there is no database for the server to read them from.
  */
+/**
+ * The choices made on cards in this browser, as lib/card-decisions.ts keeps
+ * them in local mode. Read here directly, since importing that module would
+ * make the two import each other.
+ */
+function localCardDecisionRows(): unknown[] {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(`ocreda-card-decisions:v2:${LOCAL_USER_ID}`) ?? '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 export async function localFindRelevantNotes(
   draftText: string,
   excludeNoteId?: string | null,
@@ -153,7 +167,10 @@ export async function localFindRelevantNotes(
     method: 'POST',
     signal,
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ draft_text: draftText, notes, domain: domain ?? null, model_tier: getAiMode(), stream: true }),
+    body: JSON.stringify({
+      draft_text: draftText, notes, exclude_note_id: excludeNoteId ?? null, card_decisions: localCardDecisionRows(),
+      domain: domain ?? null, model_tier: getAiMode(), stream: true,
+    }),
   });
 
   if (!response.ok) {

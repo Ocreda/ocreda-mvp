@@ -88,7 +88,7 @@ Deno.test('production semantic endpoint does not use behavioral weights or gener
   assert(!endpoint.includes('.summary'));
 });
 
-Deno.test('live page surfacing and Instant Retrieval have no word-overlap fallback', async () => {
+Deno.test('live page surfacing has no word-overlap fallback', async () => {
   const page = await Deno.readTextFile(new URL('../../../app/page.tsx', import.meta.url));
   assert(!page.includes('sharedWordScore'));
   assert(!page.includes('keywordScore'));

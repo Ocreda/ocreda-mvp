@@ -32,4 +32,4 @@ The endpoint then:
 
 The similarity floor defaults to the neutral value `0` until Q3 selects a value from observed Stage 1 score distributions. Behavioral weighting remains off, structural vectors remain absent, and generated assistant output is never used as retrieval context.
 
-Both live page surfacing and Instant Retrieval now call this semantic endpoint. There is no local word-overlap fallback in either production surfacing path.
+Live page surfacing calls this semantic endpoint. There is no local word-overlap fallback in that production surfacing path.

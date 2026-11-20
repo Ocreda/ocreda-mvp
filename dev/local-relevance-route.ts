@@ -4,6 +4,7 @@ import { NextResponse } from 'next/server';
 import {
   findDraftSections,
   findInsight,
+  readCardHistory,
   readGoalContext,
   searchRelevance,
   searchResponseFields,
@@ -130,6 +131,8 @@ export async function POST(request: Request) {
   const tier = readModelTier(body?.model_tier);
   const model = modelForTier(tier);
   const excludeNoteId = typeof body?.exclude_note_id === 'string' ? body.exclude_note_id : null;
+  // In local mode the choices on cards live in the browser, so they arrive with the search.
+  const history = readCardHistory(body?.card_decisions);
 
   if (notes.length === 0) {
     return NextResponse.json({
@@ -150,6 +153,7 @@ export async function POST(request: Request) {
       results,
       sections,
       excludeNoteId,
+      history,
       generate: (prompt) => withFailureLog('insight call', (text, callSignal) =>
         generateWithGemini(INSIGHT_SYSTEM_PROMPT, [{ role: 'user', content: text }], apiKey, model, {
           responseMimeType: 'application/json',
@@ -174,6 +178,8 @@ export async function POST(request: Request) {
     findInsight: insightFor,
     draft,
     notes,
+    history,
+    draftNoteId: excludeNoteId,
     goal: goalContext.goal,
     agentCount: DEFAULT_AGENT_COUNT,
     concurrency: DEFAULT_AGENT_CONCURRENCY,

@@ -30,6 +30,12 @@ const {
   diversifyByRelation,
   recencyBoost,
   splitNoteTitle,
+  defaultNoteTitle,
+  readNoteTitle,
+  applyCardRules,
+  readCardHistory,
+  inferIdeaKinds,
+  EMPTY_CARD_HISTORY,
 } = require('../.relevance-build/relevance.js');
 
 let passed = 0;
@@ -611,6 +617,34 @@ test('a note\'s first line is its title, kept apart from the text; a one-line no
   assert.deepStrictEqual(splitNoteTitle('Title only\n\n   '), { title: '', text: 'Title only' });
 });
 
+test('a note without a title gets its first five words, with "..." only when it goes on', () => {
+  assert.strictEqual(defaultNoteTitle('I am trying to open up to Kate but it has been hard'), 'I am trying to open...');
+  assert.strictEqual(defaultNoteTitle('## Golden rule: never ask, if your idea is good'), 'Golden rule: never ask, if...');
+  assert.strictEqual(defaultNoteTitle('one two three four five, six'), 'one two three four five...');
+  assert.strictEqual(defaultNoteTitle('Call mom tomorrow'), 'Call mom tomorrow');
+});
+
+test('an older note saved without a title reads as five words over its whole text', () => {
+  const kate = "I am trying to open up to Kate but it's been hard like I don't fully know what to say.";
+  // The whole note on one line used to become the title, with nothing in the body.
+  assert.deepStrictEqual(readNoteTitle(kate), { title: 'I am trying to open...', body: kate, written: false });
+  // A first paragraph far longer than a title.
+  const long = `${kate}\n\nI want to be more open with her.`;
+  assert.deepStrictEqual(readNoteTitle(long), { title: 'I am trying to open...', body: long, written: false });
+  // An older import whose title was the body's first sentence.
+  const imported = `I went to the store today.\n\nI went to the store today. It was closed.`;
+  assert.deepStrictEqual(readNoteTitle(imported), { title: 'I went to the store...', body: 'I went to the store today. It was closed.', written: false });
+  // A title saved by the new rule reads back the same way.
+  assert.deepStrictEqual(readNoteTitle(`I am trying to open...\n\n${kate}`), { title: 'I am trying to open...', body: kate, written: false });
+  // Titles people wrote stay as they are, even when the body starts the same way.
+  assert.deepStrictEqual(readNoteTitle('Pricing\n\nPricing is too high for teams.'), { title: 'Pricing', body: 'Pricing is too high for teams.', written: true });
+  assert.deepStrictEqual(readNoteTitle('Call mom tomorrow'), { title: 'Call mom tomorrow', body: '', written: true });
+  assert.deepStrictEqual(readNoteTitle('# A long heading that someone wrote on purpose here and there\n\nBody.'), { title: '# A long heading that someone wrote on purpose here and there', body: 'Body.', written: true });
+  // The search reads the whole text, not the made-up title.
+  assert.deepStrictEqual(splitNoteTitle(kate), { title: '', text: kate });
+  assert.deepStrictEqual(splitNoteTitle(`I am trying to open...\n\n${kate}`), { title: '', text: kate });
+});
+
 const LONG_NOTE = 'Ran the camera counting test at the depot over the weekend. Accuracy: 94% accuracy across 400 cars, with the misses almost all at night. Rain did not seem to matter at all.';
 const quoteCard = (text) => JSON.stringify({ intent: 'capturing', insights: [card({ quotes: [quote(text)] })] });
 const longOpts = { ...parseOpts(), noteTextById: new Map([['n1', LONG_NOTE]]) };
@@ -1146,6 +1180,250 @@ test('a finished search reports its funnel', async () => {
   assert.strictEqual(funnel.returned, 6);
   assert.strictEqual(funnel.kept, 6);
   assert.strictEqual(funnel.cards, null, 'no insight step was given');
+});
+
+// ------------------------------------------------------------ card rules
+
+const match = (over = {}) => ({
+  note_id: 'n', level: 5, relevance_score: 1, relation_type: 'solves', direction: 'inbound',
+  gist: '', explanation: 'x', matched_text: '', section_id: '1', ...over,
+});
+const sec = (id, kind, text = `idea ${id}`) => ({ id, label: '', start: 0, end: 0, text, ...(kind ? { kind } : {}) });
+const rules = (over) => applyCardRules({
+  draft: 'the draft', results: [], sections: [sec('1')], notes: [], history: EMPTY_CARD_HISTORY, draftNoteId: 'draft', ...over,
+});
+const fullNote = (id, rawText) => ({ id, raw_text: rawText, summary: null, created_at: '2026-09-01' });
+
+test("the idea split reads each idea's kind, and ignores one it does not know", () => {
+  const draft = 'Our trial users never convert after the first week.\n\nFrom the book: ask what they did, not what they would do.';
+  const sections = parseSectionResponse(JSON.stringify({ ideas: [
+    { starts_with: 'Our trial users never convert', label: 'Trial churn', kind: 'situation' },
+    { starts_with: 'From the book: ask what they did', label: 'Interview rule', kind: 'answer' },
+  ] }), draft);
+  assert.strictEqual(sections[0].kind, 'situation');
+  assert.strictEqual(sections[1].kind, undefined);
+});
+
+test('a solution idea is marked as one for the agents', () => {
+  const draft = 'First idea about pricing that runs on.\n\nSecond idea, a lesson from a book.';
+  const sections = parseSectionResponse(JSON.stringify({ ideas: [
+    { starts_with: 'First idea about pricing that runs on', label: 'Pricing', kind: 'situation' },
+    { starts_with: 'Second idea, a lesson from a book', label: 'Lesson', kind: 'solution' },
+  ] }), draft);
+  const prompt = buildPrompt(draft, [note('a')], null, sections);
+  assert.ok(prompt.includes('kind="solution"'));
+  assert.ok(prompt.includes('kind="situation"'));
+});
+
+test('an unlabelled idea is a solution when its solves and helps matches mostly point outbound', () => {
+  const [one] = inferIdeaKinds([sec('1')], [
+    match({ note_id: 'a', direction: 'outbound' }), match({ note_id: 'b', direction: 'outbound', relation_type: 'helps' }), match({ note_id: 'c' }),
+  ]);
+  assert.strictEqual(one.kind, 'solution');
+  const [two] = inferIdeaKinds([sec('1')], [match({ note_id: 'a', direction: 'outbound' }), match({ note_id: 'c' })]);
+  assert.strictEqual(two.kind, undefined, 'a tie says nothing');
+  const [three] = inferIdeaKinds([sec('1', 'situation')], [match({ direction: 'outbound' })]);
+  assert.strictEqual(three.kind, 'situation', "the split's label wins");
+});
+
+test('rule 1: a solution idea gets no inbound solves or helps, but keeps its outbound problems', () => {
+  const out = rules({
+    sections: [sec('1', 'solution'), sec('2', 'situation')],
+    results: [
+      match({ note_id: 'fix-for-solution' }),
+      match({ note_id: 'help-for-solution', relation_type: 'helps' }),
+      match({ note_id: 'evidence', relation_type: 'supports' }),
+      match({ note_id: 'old-problem', direction: 'outbound' }),
+      match({ note_id: 'fix-for-situation', section_id: '2' }),
+    ],
+  });
+  assert.deepStrictEqual(out.results.map((r) => r.note_id), ['evidence', 'old-problem', 'fix-for-situation']);
+  assert.strictEqual(out.dropped.help_for_solution, 2);
+});
+
+test('rule 1: a match on the whole draft is held back only when every idea is a solution', () => {
+  const whole = match({ note_id: 'w', section_id: 'whole' });
+  assert.strictEqual(rules({ sections: [sec('1', 'solution'), sec('2', 'situation')], results: [whole] }).results.length, 1);
+  assert.strictEqual(rules({ sections: [sec('1', 'solution'), sec('2', 'solution')], results: [whole] }).results.length, 0);
+});
+
+test('rule 1: a card offering help to a solution idea is dropped even if the model writes one', () => {
+  const draft = 'From the book: ask what they did in the past, not what they would do.';
+  const out = parseInsightResponse(JSON.stringify({ insights: [{
+    kind: 'helps', anchor: 'ask what they did in the past', text: 'You once {1}.',
+    quotes: [{ note_id: 'a', text: 'tried asking about last week' }], idea: 'ask about last week', note_ids: ['a'],
+  }] }), {
+    draft, allowedNoteIds: new Set(['a']), askForGoal: false,
+    sections: [{ id: '1', label: '', start: 0, end: draft.length, text: draft, kind: 'solution' }],
+    noteTextById: new Map([['a', 'I tried asking about last week and it worked.']]),
+    directionOfNote: new Map([['a', 'inbound']]),
+  });
+  assert.strictEqual(out.insights.length, 0);
+});
+
+const solvedOutbound = {
+  note_id: 'solver', target_note_id: 'problem', choice: 'solved', kind: 'solution',
+  insight: {
+    direction: 'outbound', note_ids: ['problem'], anchor: 'ask what they did',
+    problem: { note_id: 'problem', text: 'everyone says they would use it' }, answer: { note_id: '', text: 'ask what they did' },
+  },
+};
+
+test('card history reads Solved both ways, Helped, and Rejected', () => {
+  const history = readCardHistory([
+    solvedOutbound,
+    { note_id: 'stuck', choice: 'solved', kind: 'solution', insight: { direction: 'inbound', note_ids: ['fix'], anchor: 'how do I price', answer: { note_id: 'fix', text: 'charge $20' } } },
+    { note_id: 'stuck', choice: 'helped', kind: 'helps', insight: { direction: 'inbound', note_ids: ['tip'], anchor: 'how do I price', action: 'ask them' } },
+    { note_id: 'draft', choice: 'rejected', kind: 'helps', insight: { note_ids: ['meh'], anchor: 'trial users' } },
+    { note_id: 'x', choice: 'merged', kind: 'extension', insight: { note_ids: ['y'] } },
+    'garbage',
+  ]);
+  assert.deepStrictEqual(history.settled.map((s) => [s.problem_note_id, s.by_note_id, s.choice]), [
+    ['problem', 'solver', 'solved'], ['stuck', 'fix', 'solved'], ['stuck', 'tip', 'helped'],
+  ]);
+  assert.strictEqual(history.settled[0].problem_text, 'everyone says they would use it');
+  assert.strictEqual(history.settled[1].answer_text, 'charge $20');
+  assert.deepStrictEqual(history.turned_down, [{ shown_on_note_id: 'draft', note_ids: ['meh'], passage: 'trial users' }]);
+});
+
+test('rule 2: an earlier problem already solved by another note is not offered to a new solution', () => {
+  const problemNote = fullNote('problem', 'Interviews\nTester interviews go nowhere: everyone says they would use it, then nobody does.');
+  const out = rules({
+    notes: [problemNote],
+    history: readCardHistory([solvedOutbound]),
+    results: [match({ note_id: 'problem', direction: 'outbound', matched_text: 'everyone says they would use it' })],
+  });
+  assert.strictEqual(out.results.length, 0);
+  assert.strictEqual(out.dropped.already_settled, 1);
+});
+
+test('rule 2: only the settled part is closed; another problem in the same note stays open', () => {
+  const problemNote = fullNote('problem', 'Two problems\nEveryone says they would use it, then nobody does.\n\nSeparately, our onboarding email bounces for Outlook users.');
+  const out = rules({
+    notes: [problemNote],
+    history: readCardHistory([solvedOutbound]),
+    results: [match({ note_id: 'problem', direction: 'outbound', matched_text: 'our onboarding email bounces for Outlook users' })],
+  });
+  assert.strictEqual(out.results.length, 1);
+});
+
+test('rule 2: the note that solved it can still see that problem, and a solution can serve many problems', () => {
+  const problemNote = fullNote('problem', 'Interviews\nEveryone says they would use it, then nobody does.');
+  const history = readCardHistory([solvedOutbound]);
+  const own = rules({ notes: [problemNote], history, draftNoteId: 'solver',
+    results: [match({ note_id: 'problem', direction: 'outbound', matched_text: 'Everyone says they would use it' })] });
+  assert.strictEqual(own.results.length, 1, 'searching from the solving note itself');
+  const other = rules({ notes: [problemNote, fullNote('other-problem', 'Users churn after a week.')], history,
+    results: [match({ note_id: 'other-problem', direction: 'outbound' })] });
+  assert.strictEqual(other.results.length, 1, 'the solver note is not used up');
+});
+
+test('rule 3: a note rejected on this note is not offered again for the same idea', () => {
+  const draft = 'Our trial users never convert.\n\nPricing feels too high.';
+  const sections = [
+    { id: '1', label: '', start: 0, end: 30, text: 'Our trial users never convert.' },
+    { id: '2', label: '', start: 32, end: draft.length, text: 'Pricing feels too high.' },
+  ];
+  const history = readCardHistory([{ note_id: 'draft', choice: 'rejected', kind: 'helps', insight: { note_ids: ['discount'], anchor: 'trial users never convert' } }]);
+  const out = rules({ draft, sections, history, results: [
+    match({ note_id: 'discount', relation_type: 'helps' }),
+    match({ note_id: 'discount-2', relation_type: 'helps' }),
+  ] });
+  assert.deepStrictEqual(out.results.map((r) => r.note_id), ['discount-2']);
+  const elsewhere = rules({ draft, sections, history, results: [match({ note_id: 'discount', relation_type: 'helps', section_id: '2' })] });
+  assert.strictEqual(elsewhere.results.length, 1, 'the other idea may still get it');
+  const otherNote = rules({ draft, sections, history, draftNoteId: 'another', results: [match({ note_id: 'discount', relation_type: 'helps' })] });
+  assert.strictEqual(otherNote.results.length, 1, 'rejections on other notes go to the insight prompt instead');
+});
+
+test('rejections on other notes are passed to the insight prompt for the note they offered', () => {
+  const prompt = buildInsightPrompt({
+    draft: 'Still losing trial users at the end of week one.',
+    context: { domain: null, goal: null }, recentNotes: [],
+    matches: [{ note: fullNote('discount', 'Discounts\nOffer a discount at day 7.'), result: match({ note_id: 'discount', relation_type: 'helps' }) }],
+    turnedDown: [{ shown_on_note_id: 'monday', note_ids: ['discount'], passage: 'Our trial users never convert' }],
+  });
+  assert.ok(prompt.includes('Turned down before: as a suggestion for "Our trial users never convert"'));
+});
+
+test('rule 4: a matched problem that was solved brings the note that solved it, right after it', () => {
+  const problemNote = fullNote('problem', 'Interviews\nEveryone says they would use it, then nobody does.');
+  const solver = fullNote('solver', 'Mom Test\nAsk what they did, not what they would do.');
+  const out = rules({
+    notes: [problemNote, solver, fullNote('other', 'unrelated')],
+    history: readCardHistory([solvedOutbound]),
+    results: [
+      match({ note_id: 'problem', relation_type: 'supports', level: 4, relevance_score: 0.8, matched_text: 'Everyone says they would use it' }),
+      match({ note_id: 'other', relation_type: 'extends', level: 4 }),
+    ],
+  });
+  assert.deepStrictEqual(out.results.map((r) => r.note_id), ['problem', 'solver', 'other']);
+  const added = out.results[1];
+  assert.strictEqual(added.relation_type, 'solves');
+  assert.strictEqual(added.direction, 'inbound');
+  assert.strictEqual(added.solved_problem_note_id, 'problem');
+  assert.strictEqual(added.matched_text, 'ask what they did');
+  assert.strictEqual(added.level, 4);
+  assert.ok(added.explanation.includes('"Interviews"'));
+  assert.strictEqual(out.added_solvers, 1);
+});
+
+test('rule 4: no solver for a parallel, for a solution idea, or when the solver is gone', () => {
+  const problemNote = fullNote('problem', 'Interviews\nEveryone says they would use it, then nobody does.');
+  const solver = fullNote('solver', 'Ask what they did.');
+  const history = readCardHistory([solvedOutbound]);
+  const problemMatch = match({ note_id: 'problem', relation_type: 'supports' });
+  assert.strictEqual(rules({ notes: [problemNote, solver], history, results: [{ ...problemMatch, relation_type: 'parallel' }] }).results.length, 1);
+  assert.strictEqual(rules({ notes: [problemNote, solver], history, sections: [sec('1', 'solution')], results: [problemMatch] }).results.length, 1);
+  assert.strictEqual(rules({ notes: [problemNote], history, results: [problemMatch] }).results.length, 1);
+});
+
+test('rule 4: a solver already among the matches is marked, not added twice', () => {
+  const problemNote = fullNote('problem', 'Interviews\nEveryone says they would use it, then nobody does.');
+  const solver = fullNote('solver', 'Ask what they did.');
+  const out = rules({
+    notes: [problemNote, solver],
+    history: readCardHistory([solvedOutbound]),
+    results: [match({ note_id: 'problem', relation_type: 'supports' }), match({ note_id: 'solver', relation_type: 'helps' })],
+  });
+  assert.deepStrictEqual(out.results.map((r) => r.note_id), ['problem', 'solver']);
+  assert.strictEqual(out.results[1].solved_problem_note_id, 'problem');
+  assert.strictEqual(out.added_solvers, 0);
+});
+
+test('the insight prompt says which note solved a problem before, and which ideas are solutions', () => {
+  const draft = 'People keep saying they would use it.';
+  const prompt = buildInsightPrompt({
+    draft, context: { domain: null, goal: null }, recentNotes: [],
+    sections: [{ id: '1', label: '', start: 0, end: draft.length, text: draft, kind: 'solution' }],
+    matches: [
+      { note: fullNote('problem', 'Interviews\nEveryone says they would use it.'), result: match({ note_id: 'problem', relation_type: 'supports' }) },
+      { note: fullNote('solver', 'Ask what they did.'), result: match({ note_id: 'solver', solved_problem_note_id: 'problem' }) },
+    ],
+  });
+  assert.ok(prompt.includes('Solved before: they marked this note as what solved their problem in note problem (written 2026-09-01).'));
+  assert.ok(prompt.includes('Already a solution: the whole note'));
+});
+
+test('a search applies the card rules before the insight call and reports them in the funnel', async () => {
+  let funnel = null;
+  let insightSaw = null;
+  const draft = 'From the book: ask what they did, not what they would do.';
+  await searchRelevance({
+    draft,
+    notes: [note('a'), note('b')],
+    agentCount: 1, concurrency: 1, isRetryable: () => false,
+    findSections: async () => [{ id: '1', label: '', start: 0, end: draft.length, text: draft, kind: 'solution' }],
+    generate: async () => JSON.stringify({ results: [
+      { note_id: 'a', level: 5, relation_type: 'solves', direction: 'inbound', explanation: 'x' },
+      { note_id: 'b', level: 5, relation_type: 'solves', direction: 'outbound', explanation: 'y' },
+    ] }),
+    findInsight: async (results) => { insightSaw = results.map((r) => r.note_id); return { insights: [], goal_suggestions: [], intent: null, failed: false }; },
+    onFunnel: (value) => { funnel = value; },
+  });
+  assert.deepStrictEqual(insightSaw, ['b']);
+  assert.deepStrictEqual(funnel.dropped_by_rules, { help_for_solution: 1, already_settled: 0, turned_down: 0 });
+  assert.strictEqual(funnel.added_solvers, 0);
 });
 
 run();

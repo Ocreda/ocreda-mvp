@@ -1,35 +1,6 @@
+import { defaultNoteTitle } from '../supabase/functions/_shared/relevance';
+
 const MAX_IMPORTED_TITLE_CHARS = 120;
-
-function withoutLeadingMarkup(value: string): string {
-  return value
-    .replace(/^\s{0,3}#{1,6}\s+/, '')
-    .replace(/^\s*(?:[-*+]\s+|>\s*)/, '')
-    .trim();
-}
-
-function trimToTitleLength(value: string): string {
-  if (value.length <= MAX_IMPORTED_TITLE_CHARS) return value;
-
-  const shortened = value.slice(0, MAX_IMPORTED_TITLE_CHARS - 1).trimEnd();
-  const lastSpace = shortened.lastIndexOf(' ');
-  const atWordBoundary = lastSpace >= Math.floor(MAX_IMPORTED_TITLE_CHARS * 0.65)
-    ? shortened.slice(0, lastSpace)
-    : shortened;
-  return `${atWordBoundary.trimEnd()}…`;
-}
-
-function firstSentence(value: string): string {
-  const readable = withoutLeadingMarkup(value).replace(/\s+/g, ' ').trim();
-  if (!readable) return '';
-
-  // Keep sentence-ending punctuation in the generated title. Requiring the
-  // punctuation to be followed by whitespace/end avoids splitting decimals.
-  const ending = readable.match(/[.!?](?:["'”’)]*)?(?=\s|$)/);
-  const sentence = ending?.index === undefined
-    ? readable
-    : readable.slice(0, ending.index + ending[0].length);
-  return trimToTitleLength(sentence.trim());
-}
 
 function hasExplicitTitle(value: string): boolean {
   const lines = value.split('\n');
@@ -49,13 +20,14 @@ function hasExplicitTitle(value: string): boolean {
 }
 
 /**
- * Give a titleless imported note a useful title without consuming any of its
- * source text. The original note remains intact beneath the generated title.
+ * Give a titleless imported note its first five words as a title, with "..."
+ * when it goes on, without consuming any of its text: the whole note stays
+ * beneath the title. A note of five words or fewer is its own title.
  */
 export function prepareImportedNoteText(rawText: string): string {
   const text = rawText.replace(/\r\n?/g, '\n').trim();
   if (!text || hasExplicitTitle(text)) return text;
 
-  const title = firstSentence(text);
-  return title ? `${title}\n\n${text}` : text;
+  const title = defaultNoteTitle(text);
+  return title.endsWith('...') ? `${title}\n\n${text}` : text;
 }

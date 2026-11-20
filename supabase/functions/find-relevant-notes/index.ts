@@ -24,6 +24,10 @@ import {
   SearchCancelledError,
   DEFAULT_AGENT_CONCURRENCY,
   DEFAULT_AGENT_COUNT,
+  EMPTY_CARD_HISTORY,
+  MAX_CARD_HISTORY_ROWS,
+  readCardHistory,
+  type CardHistory,
   type SearchFunnel,
   MIN_DRAFT_CHARS,
   type DraftSection,
@@ -108,6 +112,42 @@ function logUsage(usage: TokenUsage, notesTotal: number, sectionsTotal: number, 
   }));
 }
 
+/**
+ * The person's past choices on cards (Solved, Helped, Rejected), which the
+ * search uses so it never offers again what they already settled or turned
+ * down. Only the parts of each saved card that the rules read are selected.
+ * Row-level security limits this to the caller's own rows. A missing table or
+ * a failed read only costs the rules, never the search.
+ */
+async function loadCardHistory(supabase: ReturnType<typeof createClient>): Promise<CardHistory> {
+  const { data, error } = await supabase
+    .from("note_card_decisions")
+    .select("note_id, target_note_id, choice, kind, direction:insight->>direction, note_ids:insight->note_ids, anchor:insight->>anchor, problem:insight->problem, answer:insight->answer, quotes:insight->quotes, action:insight->>action")
+    .in("choice", ["solved", "helped", "rejected"])
+    .order("updated_at", { ascending: false })
+    .limit(MAX_CARD_HISTORY_ROWS);
+  if (error) {
+    console.error("find-relevant-notes could not read card choices:", errorMessage(error));
+    return EMPTY_CARD_HISTORY;
+  }
+  const rows = ((data ?? []) as unknown as Record<string, unknown>[]).map((row) => ({
+    note_id: row.note_id,
+    target_note_id: row.target_note_id,
+    choice: row.choice,
+    kind: row.kind,
+    insight: {
+      direction: row.direction,
+      note_ids: row.note_ids,
+      anchor: row.anchor,
+      problem: row.problem,
+      answer: row.answer,
+      quotes: row.quotes,
+      action: row.action,
+    },
+  }));
+  return readCardHistory(rows);
+}
+
 async function findMatchInsight(
   draft: string,
   context: GoalContext,
@@ -115,6 +155,7 @@ async function findMatchInsight(
   results: RelevanceResult[],
   sections: DraftSection[],
   excludeNoteId: string | null,
+  history: CardHistory,
   apiKey: string,
   usage: TokenUsage,
   model: string,
@@ -128,6 +169,7 @@ async function findMatchInsight(
       results,
       sections,
       excludeNoteId,
+      history,
       generate: async (prompt) => {
         const { text, truncated, usage: callUsage } = await generateWithGeminiResult(
           INSIGHT_SYSTEM_PROMPT,
@@ -242,6 +284,11 @@ Deno.serve(async (req: Request) => {
     // The rebuilt notes table (20260723080000_rebuild_as_second_brain.sql) has
     // no category column, so fall back without it, as lib/notes-api.ts does.
     // The goal still applies; only the Domain's recent notes go missing.
+    // Read alongside the notes, so it adds no time to the search.
+    const historyLoad = loadCardHistory(supabase).catch((error) => {
+      console.error("find-relevant-notes could not read card choices:", errorMessage(error));
+      return EMPTY_CARD_HISTORY;
+    });
     let loaded = await loadNotes(`${BASE_NOTE_COLUMNS}, category`);
     if (loaded.error && isMissingCategoryColumn(loaded.error)) loaded = await loadNotes(BASE_NOTE_COLUMNS);
     if (loaded.error) throw new Error(`Loading notes failed: ${loaded.error.message}`);
@@ -254,6 +301,7 @@ Deno.serve(async (req: Request) => {
       });
     }
 
+    const history = await historyLoad;
     const startedAt = Date.now();
     // Kept per step so the admin page can show where a search's cost went.
     const usage = { split: emptyTokenUsage(), agents: emptyTokenUsage(), insight: emptyTokenUsage(), summary: emptyTokenUsage() };
@@ -270,7 +318,7 @@ Deno.serve(async (req: Request) => {
       ? (results: RelevanceResult[]) => summarizeMatches(results, apiKey, usage.summary, model)
       : undefined;
     const insightFor = (results: RelevanceResult[], sections: DraftSection[], signal?: AbortSignal) =>
-      findMatchInsight(draft, goalContext, notes, results, sections, excludeNoteId, apiKey, usage.insight, model, signal);
+      findMatchInsight(draft, goalContext, notes, results, sections, excludeNoteId, history, apiKey, usage.insight, model, signal);
     let sectionsTotal = 0;
     const findSections = async (text: string, signal?: AbortSignal) => {
       const sections = await findDraftSections({
@@ -302,6 +350,8 @@ Deno.serve(async (req: Request) => {
       findInsight: insightFor,
       draft,
       notes,
+      history,
+      draftNoteId: excludeNoteId,
       goal: goalContext.goal,
       agentCount: DEFAULT_AGENT_COUNT,
       concurrency: DEFAULT_AGENT_CONCURRENCY,
