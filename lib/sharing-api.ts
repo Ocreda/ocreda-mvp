@@ -1,8 +1,7 @@
 import { supabase } from './supabase';
 import { createNote } from './notes-api';
-import { assignNotesToDomain, saveDomain } from './domains-api';
 import { Note } from './types';
-import { IS_LOCAL_MODE, LOCAL_USER_ID } from '@/dev/local-mode';  // DEV-LOCAL-MODE
+import { IS_LOCAL_MODE, localAcceptIntoVault, localReadVaults } from '@/dev/local-mode';  // DEV-LOCAL-MODE
 
 /**
  * Note sharing. A person copies notes into their public notes, then makes a
@@ -18,10 +17,17 @@ export type SharedLinkView = {
   sharerName: string;
   sharerAvatarUrl: string | null;
   isOwner: boolean;
-  /** The Domain the viewer already copied these notes into, if they did. */
+  /** The Domain the viewer copied these notes into before vaults existed, if they did. */
   copiedToDomain: string | null;
+  /**
+   * The viewer's vault for this person, if they have one, and how this link
+   * compares with what it holds: the same link, a newer one, or an older one.
+   */
+  vault: { name: string; status: 'current' | 'newer' | 'older' } | null;
   notes: SharedNote[];
 };
+
+export type AcceptStatus = 'added' | 'updated' | 'already' | 'older';
 
 /** How many notes a visitor without an account can read in full. */
 export const FREE_SHARED_NOTES = 3;
@@ -210,8 +216,13 @@ export async function getSharedLink(token: string, asVisitor = false): Promise<S
   if (IS_LOCAL_MODE) {  // DEV-LOCAL-MODE
     const link = readLocal().links.find((item) => item.token === token && !item.revokedAt);
     if (!link) return null;
+    const vault = localReadVaults().find((item) => item.sharerKey === LOCAL_SHARER);
+    const vaultStatus = !vault ? null
+      : vault.linkId === link.id ? 'current' as const
+        : vault.linkCreatedAt && vault.linkCreatedAt > link.createdAt ? 'older' as const : 'newer' as const;
     return {
-      sharerName: 'Local', sharerAvatarUrl: null, isOwner: false, copiedToDomain: asVisitor ? null : link.copiedToDomain,
+      sharerName: 'Local', sharerAvatarUrl: null, isOwner: false, copiedToDomain: null,
+      vault: asVisitor || !vault || !vaultStatus ? null : { name: vault.name, status: vaultStatus },
       notes: link.notes.map((note, position) => ({
         position, title: titleOf(note.rawText), notedAt: note.notedAt,
         text: asVisitor && position >= FREE_SHARED_NOTES ? null : note.rawText,
@@ -227,6 +238,7 @@ export async function getSharedLink(token: string, asVisitor = false): Promise<S
     sharerAvatarUrl: typeof view.sharer_avatar_url === 'string' ? view.sharer_avatar_url : null,
     isOwner: view.is_owner === true,
     copiedToDomain: typeof view.copied_to_domain === 'string' ? view.copied_to_domain : null,
+    vault: readVaultView(view.vault),
     notes: (Array.isArray(view.notes) ? view.notes as Array<Record<string, unknown>> : []).map((note) => ({
       position: Number(note.position), title: String(note.title ?? ''),
       text: typeof note.text === 'string' ? note.text : null, notedAt: String(note.noted_at ?? ''),
@@ -234,25 +246,31 @@ export async function getSharedLink(token: string, asVisitor = false): Promise<S
   };
 }
 
-/** Copies a link's notes into the viewer's own notes, in a "From <sharer>" Domain. Returns that Domain's name. */
-export async function copySharedNotes(token: string): Promise<{ domain: string; alreadyCopied: boolean }> {
+function readVaultView(raw: unknown): SharedLinkView['vault'] {
+  if (!raw || typeof raw !== 'object') return null;
+  const vault = raw as Record<string, unknown>;
+  const status = vault.status === 'current' || vault.status === 'older' ? vault.status : 'newer';
+  return typeof vault.name === 'string' ? { name: vault.name, status } : null;
+}
+
+/** Local mode has one account, so its own links stand in for someone else's. */
+const LOCAL_SHARER = 'local';
+
+/**
+ * Puts a link's notes in the vault of the person who shared it, made on first
+ * use. A newer link from the same person replaces what their vault held; an
+ * older one changes nothing. Returns the vault's name and what happened.
+ */
+export async function acceptSharedLink(token: string): Promise<{ vaultName: string; status: AcceptStatus }> {
   if (IS_LOCAL_MODE) {  // DEV-LOCAL-MODE
-    const state = readLocal();
-    const link = state.links.find((item) => item.token === token && !item.revokedAt);
+    const link = readLocal().links.find((item) => item.token === token && !item.revokedAt);
     if (!link) throw new Error('This link is no longer shared');
-    if (link.copiedToDomain) return { domain: link.copiedToDomain, alreadyCopied: true };
-    const domain = 'From Local';
-    await saveDomain(LOCAL_USER_ID, false, domain, 'Notes Local shared with me.');
-    const ids: string[] = [];
-    // Oldest first, so the newest shared note ends up newest here too.
-    for (const note of link.notes.slice().reverse()) ids.push((await createNote(note.rawText)).id);
-    await assignNotesToDomain(LOCAL_USER_ID, false, ids, domain);
-    link.copiedToDomain = domain;
-    writeLocal(state);
-    return { domain, alreadyCopied: false };
+    const result = localAcceptIntoVault({ id: link.id, createdAt: link.createdAt, sharerKey: LOCAL_SHARER, sharerName: 'Local', notes: link.notes });
+    return { vaultName: result.vaultName, status: result.status };
   }
-  const { data, error } = await supabase.rpc('copy_shared_notes', { link_token: token });
+  const { data, error } = await supabase.rpc('accept_shared_link', { link_token: token });
   if (error) throw error;
   const result = data as Record<string, unknown>;
-  return { domain: String(result.domain), alreadyCopied: result.already_copied === true };
+  const status = result.status === 'updated' || result.status === 'already' || result.status === 'older' ? result.status : 'added';
+  return { vaultName: String(result.vault_name ?? 'Shared notes'), status };
 }

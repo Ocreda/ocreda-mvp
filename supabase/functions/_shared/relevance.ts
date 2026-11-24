@@ -86,6 +86,11 @@ export interface NoteLike {
   created_at: string;
   /** The note's Domain name. Only read when building an insight's context. */
   category?: string | null;
+  /**
+   * Set on a note someone else shared with the person: who shared it. A
+   * shared note can inform their draft, but nothing is ever marked on it.
+   */
+  shared_by?: string | null;
 }
 
 /**
@@ -369,10 +374,18 @@ export function dealIntoChunks<T>(items: T[], chunkCount: number): T[][] {
  * variable too, so it sits beside the draft; only its instructions are fixed,
  * and so are the instructions about ideas, whether or not the draft has several.
  */
+/** The line that marks a note someone else wrote and shared with the person. */
+function sharedByLine(note: NoteLike): string {
+  return note.shared_by ? `\nShared by: ${truncate(note.shared_by.replace(/\s+/g, " ").trim(), 80)}` : "";
+}
+
 export function buildPrompt(draft: string, notes: NoteLike[], goal: string | null = null, sections: DraftSection[] = []): string {
   const candidates = notes
-    .map((note) => `ID: ${note.id}\n${truncate((note.summary || note.raw_text).trim(), MAX_NOTE_CHARS)}`)
+    .map((note) => `ID: ${note.id}${sharedByLine(note)}\n${truncate((note.summary || note.raw_text).trim(), MAX_NOTE_CHARS)}`)
     .join("\n\n---\n\n");
+  const sharedBlock = notes.some((note) => note.shared_by)
+    ? `\n\nSome notes are marked "Shared by": someone else wrote them and shared them with this person. Judge them exactly like the rest, but in their gist and explanation name that person ("Alice found…", "Alice's note…") instead of saying the person did or wrote it.`
+    : "";
   const goalBlock = goal
     ? `\n\nWhat they are working toward in this area:\n<goal>\n${goal}\n</goal>`
     : "";
@@ -457,7 +470,7 @@ OUTPUT - a JSON object and nothing else, with one entry in "results" per note th
 Here is the draft:
 <draft>
 ${renderDraft(draft, sections)}
-</draft>${goalBlock}
+</draft>${goalBlock}${sharedBlock}
 
 Here are the candidate notes:
 
@@ -1004,7 +1017,7 @@ export interface CardRulesOutcome {
   results: RelevanceResult[];
   /** The sections, with any kind the split left out inferred. */
   sections: DraftSection[];
-  dropped: { help_for_solution: number; already_settled: number; turned_down: number };
+  dropped: { help_for_solution: number; already_settled: number; turned_down: number; onto_shared: number };
   /** Notes added because they solved an earlier problem that matched. */
   added_solvers: number;
 }
@@ -1026,11 +1039,16 @@ export interface CardRulesOutcome {
  * 4. Solved before. When a match is an earlier note facing the same problem,
  *    and the person marked another note as what solved it, that solving note
  *    is added right after it, so the card can say they solved this before.
+ * 5. Shared notes are never the target. An outbound match says the draft
+ *    helps or answers an earlier note, and acting on it marks that note. A
+ *    note someone else shared is theirs, so those matches are dropped; shared
+ *    notes only ever inform the draft (docs/shared-note-vaults-plan.md).
  */
 export function applyCardRules({ draft, results, sections: given, notes, history, draftNoteId }: CardRulesInput): CardRulesOutcome {
   const sections = inferIdeaKinds(given, results);
   const textById = new Map(notes.map((note) => [note.id, note.raw_text]));
-  const dropped = { help_for_solution: 0, already_settled: 0, turned_down: 0 };
+  const sharedIds = new Set(notes.filter((note) => note.shared_by).map((note) => note.id));
+  const dropped = { help_for_solution: 0, already_settled: 0, turned_down: 0, onto_shared: 0 };
   const helping = (result: RelevanceResult) => result.relation_type === "solves" || result.relation_type === "helps";
 
   // Which section of this draft each rejection on it was about. A passage no
@@ -1043,6 +1061,10 @@ export function applyCardRules({ draft, results, sections: given, notes, history
     });
 
   const kept = results.filter((result) => {
+    if (result.direction === "outbound" && sharedIds.has(result.note_id)) {
+      dropped.onto_shared++;
+      return false;
+    }
     if (result.direction === "inbound" && helping(result) && isSolutionSection(sections, result.section_id)) {
       dropped.help_for_solution++;
       return false;
@@ -1075,6 +1097,8 @@ export function applyCardRules({ draft, results, sections: given, notes, history
     out.push(result);
     if (result.direction !== "inbound" || !SAME_PROBLEM_RELATIONS.includes(result.relation_type)) continue;
     if (isSolutionSection(sections, result.section_id)) continue;
+    // "You solved this before" is about their own problems only.
+    if (sharedIds.has(result.note_id)) continue;
     const text = textById.get(result.note_id) ?? "";
     const solved = history.settled.find((item) =>
       item.choice === "solved"
@@ -1428,7 +1452,7 @@ export function buildInsightPrompt({ draft, context, recentNotes, matches, secti
   const related = matches
     .map(({ note, result }) => {
       const { title, text } = splitNoteTitle(note.raw_text);
-      return `ID: ${note.id}\nTitle: ${title || "(none)"}\nWritten: ${note.created_at.slice(0, 10)}${ideaLine(result)}\nDirection: ${result.direction === "outbound" ? "outbound (the note being written helps this one)" : "inbound (this note helps the one being written)"}\nHow it relates: ${result.relation_type} - ${result.explanation}${solvedBeforeLine(result)}${turnedDownLines(note.id)}\nText:\n${truncate(text, MAX_NOTE_CHARS)}`;
+      return `ID: ${note.id}\nTitle: ${title || "(none)"}\nWritten: ${note.created_at.slice(0, 10)}${note.shared_by ? `\nWritten by: ${truncate(note.shared_by.replace(/\s+/g, " ").trim(), 80)} (someone else, who shared this note with them)` : ""}${ideaLine(result)}\nDirection: ${result.direction === "outbound" ? "outbound (the note being written helps this one)" : "inbound (this note helps the one being written)"}\nHow it relates: ${result.relation_type} - ${result.explanation}${solvedBeforeLine(result)}${turnedDownLines(note.id)}\nText:\n${truncate(text, MAX_NOTE_CHARS)}`;
     })
     .join("\n\n---\n\n");
   const solutionIdeas = sections.filter((section) => section.kind === "solution");
@@ -1441,6 +1465,12 @@ export function buildInsightPrompt({ draft, context, recentNotes, matches, secti
     ? `HOW MANY - the note works on ${sections.length} separate ideas, marked as numbered <idea> blocks, and each related note says which idea it bears on. Give at most one insight per idea, built on that idea's related notes, plus at most one about the note as a whole. Skip any idea where nothing clears the bar; an idea with no insight is a normal, frequent, and correct outcome. Do not stretch to cover every idea.`
     : `HOW MANY - a note can raise several separate issues. Give one insight per issue that clears the bar, at most ${MAX_INSIGHTS}, strongest first. Each must be about a different passage of the note, and must not repeat another insight's point. One insight is often right, and an empty list is a normal, frequent, and correct answer. Do not stretch to fill the slots.`;
 
+  const sharedNames = Array.from(new Set(matches.map(({ note }) => note.shared_by?.trim()).filter((name): name is string => Boolean(name))));
+  const sharedRule = sharedNames.length
+    ? `
+SOMEONE ELSE'S NOTES - a related note with "Written by" was written by that person (${sharedNames.join(", ")}) and shared with them; every other note is their own. Quote it word for word like any note, but never present it as theirs: no "you wrote", "you said", "your note", "you solved this before", "you changed your mind". Name the person instead: "Alice's note says {1}", "Alice found that {1}". A contradiction with someone else's note is a difference of view, not a change of mind: "Alice sees it differently: {1}". A card can rest on both their own notes and someone else's; say whose each quote is.
+`
+    : "";
   return `Someone is writing a note. You have the past notes of theirs that relate to it. Decide whether anything in those past notes should change what they do next, and if so, tell them in one short card.
 
 INTENT - first work out what the note is doing. Pick exactly one:
@@ -1465,7 +1495,7 @@ GOAL - if they have said what they are working toward in this area, use it to de
 ${howMany}
 
 THEIR WORDS, NOT YOURS - a card is their own past words, connected by you. You write only the short sentence that links those words to the note; everything taken from a past note appears inside it exactly as they wrote it, so the card sounds familiar.
-
+${sharedRule}
 For each insight:
 KIND - pick exactly one, by what the past notes actually offer:
 "solution" - a past note holds a clear, specific answer to a question or problem in the note being written: a number, a name, a decision, a fix. Whenever such an answer exists, give this card; it is the most valuable one, so never water it down to "helps".

@@ -1,5 +1,8 @@
 'use client';
 
+import { NoteBodyEditor, type NoteBodyEditorHandle, type NoteFormat } from '@/components/NoteBodyEditor';
+import { inlineRuns, LINE_MARKER, plainNoteText, previewNoteText, stripInlineMarkdown, type InlineRun } from '@/lib/note-markdown';
+
 import Link from 'next/link';
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowLeft, Bold, Check, ChevronDown, ChevronLeft, ChevronRight, Filter, FolderPlus, Grid2X2, Italic, Layers3, List, ListOrdered, Loader as Loader2, Mic, MoreHorizontal, PanelRightOpen, Pin, Plus, RefreshCw, Rows3, ScanSearch, Search, Share2, Trash2, Upload, X } from 'lucide-react';
@@ -21,6 +24,7 @@ import { getAiMode, useAiMode } from '@/lib/ai-mode';
 import { setSampleMode, useSampleMode, workspaceScope } from '@/lib/sample-mode';
 import { isSampleGuide, loadSampleVault, SampleVault } from '@/lib/sample-vault';
 import { copyNotesToPublic } from '@/lib/sharing-api';
+import { listVaults, removeVault, setVaultInRetrieval, Vault } from '@/lib/vaults-api';
 
 type MuseMeta = { title: string; description: string; createdAt: string };
 type ProjectPage = { id: string; title: string; content: string; sourceNoteIds: string[]; createdAt: string; updatedAt: string };
@@ -63,15 +67,28 @@ function domainGoalFor(category: string | null | undefined, muses: MuseMeta[]): 
  * the body is all of its text. That reading also fixes notes saved before,
  * whose whole text sat in the title. `written` is false for a made-up title.
  */
+/**
+ * A note's title and body for showing it. The title is plain text: a short
+ * note is its own title, so its bold or other markers would otherwise show as
+ * symbols in headings and labels.
+ */
 function splitNote(note: Note): { title: string; body: string; hasTitle: boolean; written: boolean } {
   const { title, body, written } = readNoteTitle(note.raw_text);
-  return { title, body, hasTitle: Boolean(title), written };
+  const plainTitle = plainNoteText(title);
+  return { title: plainTitle, body, hasTitle: Boolean(plainTitle), written };
 }
 
-/** What the title field starts with: empty when the person never wrote a title. */
-function editableTitle(note: Note): string {
-  const { title, written } = splitNote(note);
-  return written ? title : '';
+/**
+ * What the title field and the body editor start with. A one-line note (a
+ * short note, which is its own title, or a lone heading) opens in the body
+ * editor, so its formatting can still be changed there; saving it again
+ * stores the same text. The title field is empty when the person never wrote one.
+ */
+function editableNote(note: Note): { title: string; body: string } {
+  const { title, body, written } = readNoteTitle(note.raw_text);
+  const text = note.raw_text.trim();
+  if (written && !body && !text.includes('\n')) return { title: '', body: text };
+  return { title: written ? title : '', body };
 }
 
 /**
@@ -324,6 +341,10 @@ export default function OcredaHome() {
   const [activePageId, setActivePageId] = useState<string | null>(null);
   const [activeMuse, setActiveMuse] = useState<string | null>(null);
   const [showUnsorted, setShowUnsorted] = useState(false);
+  // Notes others shared with you, one vault per person, kept apart from your own.
+  const [vaults, setVaults] = useState<Vault[]>([]);
+  const [activeVaultId, setActiveVaultId] = useState<string | null>(null);
+  const [activeSharedNoteId, setActiveSharedNoteId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [savedOpen, setSavedOpen] = useState(false);
   const [error, setError] = useState('');
@@ -347,6 +368,8 @@ export default function OcredaHome() {
     setActivePageId(null);
     setActiveMuse(null);
     setShowUnsorted(false);
+    setActiveVaultId(null);
+    setActiveSharedNoteId(null);
     setView('cortex');
     setImportOpen(false);
   }, []);
@@ -372,7 +395,7 @@ export default function OcredaHome() {
 
   const hasInAppSurface = Boolean(
     noteEditor || activeNoteId || museEditor || projectEditor || activeProjectId
-    || activeMuse || showUnsorted || view === 'muses' || importOpen
+    || activeMuse || showUnsorted || view === 'muses' || importOpen || activeVaultId || activeSharedNoteId
   );
 
   useEffect(() => {
@@ -394,13 +417,20 @@ export default function OcredaHome() {
       if (!userId) return;
       let loaded: Note[];
       let domains: Awaited<ReturnType<typeof loadDomainState>>;
+      // Shared notes go with your own notes only, never with the samples.
+      let loadedVaults: Vault[] = [];
       if (sampleMode) {
         const vault = await loadSampleVault();
         if (request !== loadRequestRef.current) return;
         domains = await loadDomainState(userId, true, vault);
         loaded = vault.notes;
       } else {
-        [loaded, domains] = await Promise.all([getNotes(), loadDomainState(userId, false)]);
+        [loaded, domains, loadedVaults] = await Promise.all([
+          getNotes(),
+          loadDomainState(userId, false),
+          // A vault that fails to load leaves your own notes working.
+          listVaults().catch((err) => { console.error('Could not load shared notes:', err); return [] as Vault[]; }),
+        ]);
       }
       if (request !== loadRequestRef.current) return;
       // The latest load decides which Domains show, so a switch always ends
@@ -412,6 +442,7 @@ export default function OcredaHome() {
       setPinnedMuseTitles(state.pinned);
       // A note's Domain comes only from the Domain records.
       setNotes(loaded.map((note) => ({ ...note, category: state.assignments[note.id] ?? null })));
+      setVaults(loadedVaults);
       setNotesScope(scope);
     }
     catch (err) {
@@ -610,7 +641,28 @@ export default function OcredaHome() {
   }, [activeMuse, importProgress, loading, museMeta, notes, notesScope, sampleMode, saving, scope, userId]);
 
   const unsortedNotes = useMemo(() => notes.filter((note) => !cleanCategory(note.category)), [notes]);
-  const isEmpty = !loading && notes.length === 0 && muses.length === 0;
+  const isEmpty = !loading && notes.length === 0 && muses.length === 0 && vaults.length === 0;
+  const sharedNotes = useMemo(() => vaults.flatMap((vault) => vault.notes), [vaults]);
+  const hasSearchableShared = vaults.some((vault) => vault.useInRetrieval && vault.notes.length > 0);
+  const toggleVaultRetrieval = async (vault: Vault) => {
+    const on = !vault.useInRetrieval;
+    const apply = (value: boolean) => setVaults((current) => current.map((item) => item.id === vault.id ? { ...item, useInRetrieval: value } : item));
+    apply(on);
+    try { await setVaultInRetrieval(vault.id, on); }
+    catch (err) { apply(!on); setError(safeErrorMessage(err, 'That vault setting could not be saved.')); }
+  };
+  const deleteVault = async (vault: Vault) => {
+    const count = vault.notes.length;
+    if (!window.confirm(`Remove ${vault.name}’s vault? Its ${count} ${count === 1 ? 'note leaves' : 'notes leave'} your Ocreda. You can add them again from ${vault.name}’s link.`)) return;
+    setSaving(true);
+    try {
+      await removeVault(vault.id);
+      setVaults((current) => current.filter((item) => item.id !== vault.id));
+      setActiveVaultId(null);
+      setActiveSharedNoteId(null);
+    } catch (err) { setError(safeErrorMessage(err, 'The vault could not be removed.')); }
+    finally { setSaving(false); }
+  };
   const flashSaved = () => { setSavedOpen(true); window.setTimeout(() => setSavedOpen(false), 1350); };
   const closeLibrary = useCallback(() => { setActiveMuse(null); setShowUnsorted(false); setView('cortex'); }, []);
   const openMuse = useCallback((title: string) => {
@@ -621,6 +673,8 @@ export default function OcredaHome() {
   const openNewNote = (muse = ORPHANS_MUSE) => { setError(''); setNoteEditor({ note: null, title: '', body: '', muse, context: 'domain' }); };
   const openExistingNote = (note: Note, autoSearch = true, fromNoteId: string | null = null) => {
     setError('');
+    // A shared note opens read-only, with no search of its own.
+    if (note.vault_id) { setActiveSharedNoteId(note.id); return; }
     setActiveNoteRetrievalMode('relevant');
     setActiveNoteAutoSearch(autoSearch);
     setPreviousNoteId(fromNoteId);
@@ -900,6 +954,8 @@ export default function OcredaHome() {
   const activeProject = activeProjectId ? projects.find((project) => project.id === activeProjectId) ?? null : null;
   const activePage = activeProject && activePageId ? activeProject.pages.find((page) => page.id === activePageId) ?? null : null;
   const activeNote = activeNoteId ? notes.find((note) => note.id === activeNoteId) ?? null : null;
+  const activeVault = activeVaultId ? vaults.find((vault) => vault.id === activeVaultId) ?? null : null;
+  const activeSharedNote = activeSharedNoteId ? sharedNotes.find((note) => note.id === activeSharedNoteId) ?? null : null;
   const previousNote = previousNoteId ? notes.find((note) => note.id === previousNoteId) ?? null : null;
 
   return (
@@ -909,13 +965,15 @@ export default function OcredaHome() {
         {activeProject && activePage ? <ProjectPageWorkspace key={activePage.id} project={activeProject} page={activePage} notes={notes} muses={muses} projects={projects} saving={saving} onBack={() => setActivePageId(null)} onChange={(page) => updateProjectPage(activeProject.id, page)} onAddNote={() => openNewNote()} onOpenNote={openExistingNote} onOpenPage={(project, page) => { setActiveProjectId(project.id); setActivePageId(page.id); }} onDelete={() => removeProjectPage(activeProject.id, activePage.id)} />
           : activeProject ? <ProjectPagesGrid project={activeProject} onBack={() => { setActiveProjectId(null); setActivePageId(null); }} onAddPage={() => createProjectPage(activeProject.id)} onOpenPage={(page) => setActivePageId(page.id)} onEdit={() => setProjectEditor({ project: activeProject, title: activeProject.title, description: activeProject.description })} onDelete={() => removeProject(activeProject.id)} />
           : isEmpty ? <EmptyWorkspace displayName={displayName} userEmail={user?.email ?? ''} existingDomains={muses} onAddNote={() => openNewNote()} onImport={handleImport} onOpenImport={() => setImportOpen(true)} onTrySamples={user && !sampleMode ? () => setSampleMode(user.id, true) : undefined} importError={importError} progress={importProgress} />
+          : activeVault ? <VaultDetail vault={activeVault} busy={saving} onClose={() => setActiveVaultId(null)} onOpenNote={(note) => setActiveSharedNoteId(note.id)} onToggleRetrieval={() => void toggleVaultRetrieval(activeVault)} onRemove={() => void deleteVault(activeVault)} />
           : activeMuse || showUnsorted ? <MuseDetail title={showUnsorted ? ORPHANS_MUSE : activeMuse ?? ''} notes={showUnsorted ? unsortedNotes : notesByMuse.get(activeMuse ?? '') ?? []} isUnsorted={showUnsorted} busy={saving} onClose={closeLibrary} onAddNote={() => openNewNote(showUnsorted ? ORPHANS_MUSE : activeMuse ?? ORPHANS_MUSE)} onOpenNote={openExistingNote} onEdit={() => { const meta = muses.find((item) => item.title === activeMuse); if (meta) setMuseEditor({ originalTitle: meta.title, title: meta.title, description: meta.description }); }} onDelete={() => { if (activeMuse) void removeMuse(activeMuse); }} onShare={sampleMode || showUnsorted ? undefined : () => void shareNotes(notesByMuse.get(activeMuse ?? '') ?? [])} />
           : view === 'muses' ? <MuseGrid muses={muses} projects={projects} notes={notes} notesByMuse={notesByMuse} busy={saving} onClose={closeLibrary} onAddNote={(muse) => openNewNote(muse ?? ORPHANS_MUSE)} onAddMuse={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onEditMuse={(muse) => setMuseEditor({ originalTitle: muse.title, title: muse.title, description: muse.description })} onDeleteMuse={(title) => void removeMuse(title)} onOpenNote={openExistingNote} />
-          : <CortexHome projects={projects} muses={muses} pinnedMuseTitles={pinnedMuseTitles} notes={notes} notesByMuse={notesByMuse} userEmail={user?.email ?? ''} busy={saving} onOpenMuses={() => setView('muses')} onOpenMuse={openMuse} onTogglePin={togglePinnedMuse} onAddMuse={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onAddNote={() => openNewNote()} onOpenImport={() => setImportOpen(true)} onOpenPage={(project, page) => { setActiveProjectId(project.id); setActivePageId(page.id); }} onOpenNote={openExistingNote} />}
+          : <CortexHome vaults={vaults} onOpenVault={(vault) => setActiveVaultId(vault.id)} onToggleVaultRetrieval={(vault) => void toggleVaultRetrieval(vault)} onRemoveVault={(vault) => void deleteVault(vault)} projects={projects} muses={muses} pinnedMuseTitles={pinnedMuseTitles} notes={notes} notesByMuse={notesByMuse} userEmail={user?.email ?? ''} busy={saving} onOpenMuses={() => setView('muses')} onOpenMuse={openMuse} onTogglePin={togglePinnedMuse} onAddMuse={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onAddNote={() => openNewNote()} onOpenImport={() => setImportOpen(true)} onOpenPage={(project, page) => { setActiveProjectId(project.id); setActivePageId(page.id); }} onOpenNote={openExistingNote} />}
         {notice && !error && <div role="status" aria-live="polite" className="fixed bottom-5 left-1/2 z-40 max-w-[90vw] -translate-x-1/2 rounded-lg bg-[#202020] px-4 py-3 text-sm text-white shadow-xl">{notice}<button type="button" onClick={() => setNotice('')} aria-label="Dismiss" className="ml-4"><X className="inline h-4 w-4" /></button></div>}
         {error && !noteEditor && !museEditor && !projectEditor && <div role="alert" className="fixed bottom-5 left-1/2 z-40 max-w-[90vw] -translate-x-1/2 rounded-lg bg-[#202020] px-4 py-3 text-sm text-white shadow-xl">{error}<button type="button" onClick={() => setError('')} aria-label="Dismiss error" className="ml-4"><X className="inline h-4 w-4" /></button></div>}
       </section>
-      {activeNote && <NoteReadingWorkspace key={activeNote.id} note={activeNote} previousNote={previousNote} allNotes={notes} muses={muses} projects={projects} saving={saving} userId={scope ?? 'local'} initialRetrievalMode={activeNoteRetrievalMode} autoSearch={activeNoteAutoSearch} onClose={() => { setActiveNoteId(null); setPreviousNoteId(null); }} onReturnToPrevious={() => { if (previousNote) { setActiveNoteAutoSearch(false); setActiveNoteId(previousNote.id); setPreviousNoteId(null); } }} onAddNote={() => { setActiveNoteId(null); setPreviousNoteId(null); openNewNote(cleanCategory(activeNote.category) ?? ORPHANS_MUSE); }} onOpenNote={(note, autoSearch) => openExistingNote(note, autoSearch, activeNote.id)} onOpenPage={(project, page) => { setActiveNoteId(null); setPreviousNoteId(null); setActiveProjectId(project.id); setActivePageId(page.id); }} onUpdate={updateReadingNote} onChangeDomain={(category) => void changeReadingNoteDomain(activeNote.id, category)} onCreateDomain={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onDelete={removeReadingNote} onShare={shareNote} onSetDomainGoal={setDomainGoal} />}
+      {activeNote && <NoteReadingWorkspace key={activeNote.id} note={activeNote} previousNote={previousNote} allNotes={notes} sharedNotes={sharedNotes} hasSearchableShared={hasSearchableShared} muses={muses} projects={projects} saving={saving} userId={scope ?? 'local'} initialRetrievalMode={activeNoteRetrievalMode} autoSearch={activeNoteAutoSearch} onClose={() => { setActiveNoteId(null); setPreviousNoteId(null); }} onReturnToPrevious={() => { if (previousNote) { setActiveNoteAutoSearch(false); setActiveNoteId(previousNote.id); setPreviousNoteId(null); } }} onAddNote={() => { setActiveNoteId(null); setPreviousNoteId(null); openNewNote(cleanCategory(activeNote.category) ?? ORPHANS_MUSE); }} onOpenNote={(note, autoSearch) => openExistingNote(note, autoSearch, activeNote.id)} onOpenPage={(project, page) => { setActiveNoteId(null); setPreviousNoteId(null); setActiveProjectId(project.id); setActivePageId(page.id); }} onUpdate={updateReadingNote} onChangeDomain={(category) => void changeReadingNoteDomain(activeNote.id, category)} onCreateDomain={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onDelete={removeReadingNote} onShare={shareNote} onSetDomainGoal={setDomainGoal} />}
+      {activeSharedNote && <SharedNoteView note={activeSharedNote} vault={vaults.find((vault) => vault.id === activeSharedNote.vault_id) ?? null} onClose={() => setActiveSharedNoteId(null)} />}
       {shareNotice && <div role="status" aria-live="polite" className="fixed bottom-5 left-1/2 z-[95] flex max-w-[90vw] -translate-x-1/2 items-center gap-3 rounded-lg bg-[#202020] px-4 py-3 text-sm text-white shadow-xl"><span>{shareNotice}</span><Link href="/sharing" className="shrink-0 font-medium text-[#a8c4ff] hover:underline">Make a link</Link><button type="button" onClick={() => setShareNotice('')} aria-label="Dismiss"><X className="h-4 w-4" /></button></div>}
       {noteEditor && <NoteEditor state={noteEditor} muses={muses} notes={notes} saving={saving} error={error} onChange={setNoteEditor} onCreateMuse={createMuseFromEditor} onClose={() => { setNoteEditor(null); setError(''); }} onSave={() => void saveNote()} onFindRelevantNotes={() => void saveNote(true)} onImport={() => { setImportError(''); setImportOpen(true); }} onDelete={noteEditor.note ? () => void removeNote() : undefined} />}
       {museEditor && <MuseEditor state={museEditor} saving={saving} error={error} onChange={setMuseEditor} onClose={() => { setMuseEditor(null); setError(''); }} onSave={() => void saveMuse()} />}
@@ -1027,7 +1085,8 @@ function EmptyWorkspace({ displayName, userEmail, existingDomains, onAddNote, on
   );
 }
 
-function CortexHome({ projects, muses, pinnedMuseTitles, notes, notesByMuse, userEmail, busy, onOpenMuses, onOpenMuse, onTogglePin, onAddMuse, onAddNote, onOpenImport, onOpenPage, onOpenNote }: {
+function CortexHome({ vaults, onOpenVault, onToggleVaultRetrieval, onRemoveVault, projects, muses, pinnedMuseTitles, notes, notesByMuse, userEmail, busy, onOpenMuses, onOpenMuse, onTogglePin, onAddMuse, onAddNote, onOpenImport, onOpenPage, onOpenNote }: {
+  vaults: Vault[]; onOpenVault: (vault: Vault) => void; onToggleVaultRetrieval: (vault: Vault) => void; onRemoveVault: (vault: Vault) => void;
   projects: CortexProject[]; muses: MuseMeta[]; pinnedMuseTitles: string[]; notes: Note[]; notesByMuse: Map<string, Note[]>; userEmail: string; busy: boolean;
   onOpenMuses: () => void; onOpenMuse: (title: string) => void; onTogglePin: (title: string) => void; onAddMuse: () => void; onAddNote: () => void; onOpenImport: () => void;
   onOpenPage: (project: CortexProject, page: ProjectPage) => void; onOpenNote: (note: Note) => void;
@@ -1065,6 +1124,15 @@ function CortexHome({ projects, muses, pinnedMuseTitles, notes, notesByMuse, use
             <button type="button" onClick={onAddMuse} aria-label="Add a Domain" title="Add a Domain" className="flex h-[286px] items-center justify-center rounded-md border border-dashed border-[#dfe3ec] text-[#477bea] transition hover:border-[#8fb1ff] hover:bg-[#f8f9fc]"><FolderPlus className="h-9 w-9 stroke-[1.6]" /></button>
           </div>
         </section>
+        {vaults.length > 0 && <section className="mx-auto mt-14 w-full max-w-[1450px]" aria-label="Shared with me">
+          <div className="mb-6">
+            <h2 className="text-sm font-normal text-[#8d8d92]">Shared with me</h2>
+            <p className="mt-1 text-xs text-[#aaa]">Notes other people shared, one vault each. Ocreda brings them up while you write; they stay as they wrote them.</p>
+          </div>
+          <div className="grid grid-cols-1 gap-x-12 gap-y-10 sm:grid-cols-2 lg:grid-cols-3">
+            {vaults.map((vault) => <VaultHomeCard key={vault.id} vault={vault} onOpen={() => onOpenVault(vault)} onToggleRetrieval={() => onToggleVaultRetrieval(vault)} onRemove={() => onRemoveVault(vault)} />)}
+          </div>
+        </section>}
       </main>
 
       <button type="button" onClick={onOpenMuses} aria-label="Open Domains and notes" className="absolute bottom-0 left-1/2 z-20 flex h-16 w-[min(88vw,420px)] -translate-x-1/2 items-center justify-center gap-10 rounded-t-[52px] border border-b-0 border-[#e0e0e0] bg-white px-8 text-xs text-[#777] shadow-[0_-4px_16px_rgba(0,0,0,0.10)] transition hover:h-[70px] hover:text-[#222] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">
@@ -1072,7 +1140,7 @@ function CortexHome({ projects, muses, pinnedMuseTitles, notes, notesByMuse, use
         <span>{notes.length} {notes.length === 1 ? 'Note' : 'Notes'}</span>
       </button>
 
-      {searchOpen && <KnowledgeSearchOverlay request={{ query: '' }} notes={notes} muses={muses} projects={projects} hideProjectColumn onClose={() => setSearchOpen(false)} onOpenPage={(project, page) => { setSearchOpen(false); onOpenPage(project, page); }} onOpenNote={(note) => { setSearchOpen(false); onOpenNote(note); }} />}
+      {searchOpen && <KnowledgeSearchOverlay request={{ query: '' }} notes={notes} sharedNotes={vaults.flatMap((vault) => vault.notes)} muses={muses} projects={projects} hideProjectColumn onClose={() => setSearchOpen(false)} onOpenPage={(project, page) => { setSearchOpen(false); onOpenPage(project, page); }} onOpenNote={(note) => { setSearchOpen(false); onOpenNote(note); }} />}
     </div>
   );
 }
@@ -1185,7 +1253,7 @@ function ProjectPageWorkspace({ project, page, notes, muses, projects, saving, o
         {contextOpen && <aside className="min-h-[420px] overflow-y-auto border-l border-[#dedede] bg-white p-4 lg:min-h-0">
           <h2 className="mb-4 text-center text-sm font-normal text-[#999]">Retrieved for this page</h2>
           <div className="space-y-4">
-            {surfacedNotes.map((note) => { const noteContent = splitNote(note); return <button key={note.id} type="button" title={noteContent.title || undefined} onMouseEnter={() => setSelectedNoteId(note.id)} onFocus={() => setSelectedNoteId(note.id)} onClick={() => onOpenNote(note)} className={`flex h-[190px] w-full flex-col overflow-hidden rounded-md border bg-white p-4 text-left shadow-[0_2px_8px_rgba(0,0,0,0.08)] transition hover:border-[#8fb1ff] ${selectedNoteId === note.id ? 'border-[#7ca2ff] ring-1 ring-[#7ca2ff]/30' : 'border-[#e3e3e5]'}`}><span className="flex shrink-0 items-start gap-2">{noteContent.hasTitle && <strong className="line-clamp-2 min-w-0 flex-1 text-sm leading-snug">{defaultNoteTitle(noteContent.title)}</strong>}<span className="ml-auto shrink-0 text-[11px] text-[#477bea]">note</span></span><span className="mt-2 block min-h-0 flex-1 overflow-hidden"><span className="line-clamp-4 text-xs leading-relaxed text-[#777]">{noteContent.body || notePreview(note)}</span></span><span className="mt-2 flex shrink-0 items-center justify-between gap-2 text-[11px] text-[#aaa]"><span className="min-w-0 truncate">Domain: {cleanCategory(note.category) || ORPHANS_MUSE}</span><span className="shrink-0">{formatDate(note.created_at)}</span></span></button>; })}
+            {surfacedNotes.map((note) => { const noteContent = splitNote(note); return <button key={note.id} type="button" title={noteContent.title || undefined} onMouseEnter={() => setSelectedNoteId(note.id)} onFocus={() => setSelectedNoteId(note.id)} onClick={() => onOpenNote(note)} className={`flex h-[190px] w-full flex-col overflow-hidden rounded-md border bg-white p-4 text-left shadow-[0_2px_8px_rgba(0,0,0,0.08)] transition hover:border-[#8fb1ff] ${selectedNoteId === note.id ? 'border-[#7ca2ff] ring-1 ring-[#7ca2ff]/30' : 'border-[#e3e3e5]'}`}><span className="flex shrink-0 items-start gap-2">{noteContent.hasTitle && <strong className="line-clamp-2 min-w-0 flex-1 text-sm leading-snug">{defaultNoteTitle(noteContent.title)}</strong>}<span className="ml-auto shrink-0 text-[11px] text-[#477bea]">note</span></span><span className="mt-2 block min-h-0 flex-1 overflow-hidden"><span className="line-clamp-4 text-xs leading-relaxed text-[#777]">{noteContent.body ? previewNoteText(noteContent.body) : notePreview(note)}</span></span><span className="mt-2 flex shrink-0 items-center justify-between gap-2 text-[11px] text-[#aaa]"><span className="min-w-0 truncate">Domain: {cleanCategory(note.category) || ORPHANS_MUSE}</span><span className="shrink-0">{formatDate(note.created_at)}</span></span></button>; })}
             {!surfacedNotes.length && <p className="px-4 py-12 text-center text-sm leading-relaxed text-[#999]">Related notes will appear here as your knowledge base grows.</p>}
           </div>
         </aside>}
@@ -1287,7 +1355,7 @@ function AddLibraryCard({ layout, onClick }: { layout: LibraryLayout; onClick: (
 function LibraryNoteCard({ note, query, layout, onClick }: { note: Note; query: string; layout: LibraryLayout | 'search'; onClick: () => void }) {
   const content = splitNote(note);
   const isLarge = layout === 'large';
-  return <button type="button" onClick={onClick} title={content.title || undefined} className={`flex flex-col overflow-hidden rounded-lg border border-[#e3e3e5] bg-white text-left shadow-[0_2px_8px_rgba(0,0,0,0.1)] transition hover:-translate-y-0.5 hover:border-[#7ca2ff] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${isLarge ? 'h-[440px] p-8' : 'h-[360px] p-7'}`}>{content.hasTitle && <strong className={`line-clamp-2 shrink-0 leading-snug text-[#151515] ${isLarge ? 'text-lg' : 'text-base'}`}><HighlightedText text={defaultNoteTitle(content.title)} query={query} /></strong>}<span className="mt-4 block min-h-0 flex-1 overflow-hidden"><span className={`whitespace-pre-wrap text-[15px] leading-[1.55] text-[#777] ${isLarge ? 'line-clamp-[11]' : 'line-clamp-[8]'}`}><HighlightedText text={content.body || notePreview(note)} query={query} /></span></span><span className="mt-4 flex shrink-0 items-center justify-between gap-3 text-xs text-[#aaa]"><span className="min-w-0 truncate">{cleanCategory(note.category) || ORPHANS_MUSE}</span><span className="shrink-0">{formatDate(note.created_at)}</span></span><span className="sr-only">{isLarge ? 'large card' : layout} layout</span></button>;
+  return <button type="button" onClick={onClick} title={content.title || undefined} className={`flex flex-col overflow-hidden rounded-lg border border-[#e3e3e5] bg-white text-left shadow-[0_2px_8px_rgba(0,0,0,0.1)] transition hover:-translate-y-0.5 hover:border-[#7ca2ff] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${isLarge ? 'h-[440px] p-8' : 'h-[360px] p-7'}`}>{content.hasTitle && <strong className={`line-clamp-2 shrink-0 leading-snug text-[#151515] ${isLarge ? 'text-lg' : 'text-base'}`}><HighlightedText text={defaultNoteTitle(content.title)} query={query} /></strong>}<span className="mt-4 block min-h-0 flex-1 overflow-hidden"><span className={`whitespace-pre-wrap text-[15px] leading-[1.55] text-[#777] ${isLarge ? 'line-clamp-[11]' : 'line-clamp-[8]'}`}><HighlightedText text={content.body ? previewNoteText(content.body) : notePreview(note)} query={query} /></span></span><span className="mt-4 flex shrink-0 items-center justify-between gap-3 text-xs text-[#aaa]"><span className="min-w-0 truncate">{note.shared_by ? `Shared by ${note.shared_by}` : cleanCategory(note.category) || ORPHANS_MUSE}</span><span className="shrink-0">{formatDate(note.created_at)}</span></span><span className="sr-only">{isLarge ? 'large card' : layout} layout</span></button>;
 }
 
 function MuseSelector({ muses, notesByMuse, selected, busy, onClose, onSave, onCreate, onEdit, onDelete }: {
@@ -1338,12 +1406,97 @@ function MuseDetail({ title, notes, isUnsorted, busy, onClose, onAddNote, onOpen
       {searchOpen && <label className="mx-auto mt-6 flex h-11 w-full max-w-md items-center rounded-xl bg-[#f7f7f9] px-4 shadow-sm"><Search className="mr-3 h-4 w-4 text-[#aaa]" /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${title}`} className="min-w-0 flex-1 bg-transparent text-sm text-[#222] outline-none placeholder:text-[#aaa]" /></label>}
       {!isUnsorted && <div className="absolute right-5 top-4 sm:right-8"><button type="button" onClick={() => setMenuOpen((value) => !value)} aria-label="Domain options" aria-expanded={menuOpen} className="flex h-10 w-10 items-center justify-center rounded-md text-[#222] hover:bg-[#f4f4f4]"><MoreHorizontal className="h-5 w-5" /></button>{menuOpen && <div className="absolute right-0 top-11 z-10 w-60 overflow-hidden rounded-lg border border-[#ddd] bg-white py-1 text-sm shadow-xl"><button type="button" onClick={() => { setMenuOpen(false); onEdit(); }} className="block w-full px-4 py-2.5 text-left hover:bg-[#f5f5f5]">Edit Domain</button>{onShare && notes.length > 0 && <button type="button" disabled={busy} onClick={() => { setMenuOpen(false); onShare(); }} className="block w-full px-4 py-2.5 text-left hover:bg-[#f5f5f5]">Copy all {notes.length} to public notes</button>}<button type="button" disabled={busy} onClick={() => { setMenuOpen(false); onDelete(); }} className="block w-full px-4 py-2.5 text-left text-red-600 hover:bg-red-50">Delete Domain</button></div>}</div>}
       <div className={`mx-auto mt-14 grid max-w-[1510px] grid-cols-1 gap-8 sm:grid-cols-2 lg:gap-x-12 lg:gap-y-10 ${compact ? 'xl:grid-cols-4' : 'xl:grid-cols-3'}`}>
-        {visibleNotes.map((note) => { const content = splitNote(note); return <button key={note.id} type="button" onClick={() => onOpenNote(note)} title={content.title || undefined} className="flex h-[360px] min-w-0 flex-col overflow-hidden rounded-lg border border-[#e3e3e5] bg-white p-7 text-left shadow-[0_2px_8px_rgba(0,0,0,0.1)] transition hover:-translate-y-0.5 hover:border-[#7ca2ff] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">{content.hasTitle && <strong className="line-clamp-2 shrink-0 text-base leading-snug text-[#151515]">{defaultNoteTitle(content.title)}</strong>}<span className="mt-4 block min-h-0 flex-1 overflow-hidden"><span className="line-clamp-[8] whitespace-pre-wrap text-[15px] leading-[1.55] text-[#777]">{content.body || notePreview(note)}</span></span><span className="mt-4 shrink-0 text-right text-xs text-[#aaa]">{formatDate(note.created_at)}</span></button>; })}
+        {visibleNotes.map((note) => { const content = splitNote(note); return <button key={note.id} type="button" onClick={() => onOpenNote(note)} title={content.title || undefined} className="flex h-[360px] min-w-0 flex-col overflow-hidden rounded-lg border border-[#e3e3e5] bg-white p-7 text-left shadow-[0_2px_8px_rgba(0,0,0,0.1)] transition hover:-translate-y-0.5 hover:border-[#7ca2ff] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">{content.hasTitle && <strong className="line-clamp-2 shrink-0 text-base leading-snug text-[#151515]">{defaultNoteTitle(content.title)}</strong>}<span className="mt-4 block min-h-0 flex-1 overflow-hidden"><span className="line-clamp-[8] whitespace-pre-wrap text-[15px] leading-[1.55] text-[#777]">{content.body ? previewNoteText(content.body) : notePreview(note)}</span></span><span className="mt-4 shrink-0 text-right text-xs text-[#aaa]">{formatDate(note.created_at)}</span></button>; })}
         <button type="button" onClick={onAddNote} aria-label={`Add a note to ${title}`} className="relative flex h-[360px] items-start rounded-lg border border-[#e1e1e3] bg-white p-8 text-[#477bea] shadow-[0_3px_12px_rgba(0,0,0,0.15)] transition hover:-translate-y-0.5 hover:border-[#a9c0f5] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]"><span className="flex items-center gap-2"><Plus className="h-5 w-5" /> Add</span><span className="absolute inset-x-5 bottom-6 text-center text-sm italic text-[#b4b4b8]">You can always add more</span></button>
       </div>
       {!visibleNotes.length && query.trim() && <p className="mt-8 text-center text-sm text-[#999]">No notes contain “{query.trim()}”.</p>}
       {!notes.length && <p className="mt-8 text-center text-sm text-[#999]">This Domain is ready for its first note.</p>}
       </section>
+    </div>
+  );
+}
+
+/** The "Use in my retrieval" switch of a vault. */
+function RetrievalSwitch({ on, disabled = false, onChange }: { on: boolean; disabled?: boolean; onChange: () => void }) {
+  return <button type="button" role="switch" aria-checked={on} aria-label="Use in my retrieval" disabled={disabled} onClick={(event) => { event.stopPropagation(); onChange(); }} className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] disabled:opacity-50 ${on ? 'bg-[#477bea]' : 'bg-[#d4d4d8]'}`}>
+    <span className={`inline-block h-4 w-4 rounded-full bg-white shadow transition ${on ? 'translate-x-[18px]' : 'translate-x-0.5'}`} />
+  </button>;
+}
+
+/** A vault on the home screen: the notes one person shared, apart from your own Domains. */
+function VaultHomeCard({ vault, onOpen, onToggleRetrieval, onRemove }: { vault: Vault; onOpen: () => void; onToggleRetrieval: () => void; onRemove: () => void }) {
+  const [menuOpen, setMenuOpen] = useState(false);
+  const preview = vault.notes.slice(0, 3).map((note) => noteLabel(note)).join('\n') || 'Nothing in this vault yet.';
+  const count = vault.notes.length;
+  return (
+    <div className="relative h-[286px]">
+      <button type="button" onClick={onOpen} aria-label={`Open ${vault.name}’s vault`} className="relative flex h-full w-full flex-col overflow-hidden rounded-md border border-[#dfd6f0] bg-[#f7f5fb] p-2 text-left shadow-[0_2px_9px_rgba(0,0,0,0.14)] transition hover:-translate-y-0.5 hover:border-[#b9a4e3] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">
+        <span className="block min-h-0 flex-1 overflow-hidden rounded bg-white px-5 py-5 text-sm leading-relaxed text-[#777]"><span className="line-clamp-[9] whitespace-pre-line">{preview}</span></span>
+        <span className="flex h-10 w-full shrink-0 items-center justify-between gap-3 px-3 pr-11 text-xs"><strong className="min-w-0 truncate font-semibold text-[#5c4a85]">{vault.name}</strong><span className="shrink-0 text-[#999]">{count} {count === 1 ? 'entry' : 'entries'}</span></span>
+      </button>
+      {!vault.useInRetrieval && <span className="pointer-events-none absolute right-4 top-4 rounded bg-[#f1f1f3] px-2 py-0.5 text-[11px] text-[#888]">Not searched</span>}
+      <button type="button" onClick={() => setMenuOpen((open) => !open)} aria-label={`${vault.name}’s vault options`} aria-expanded={menuOpen} title="Vault options" className="absolute bottom-3 right-3 z-10 flex h-8 w-8 items-center justify-center rounded-md text-[#888] hover:bg-white hover:text-[#5c4a85] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]"><MoreHorizontal className="h-4 w-4" /></button>
+      {menuOpen && <div className="absolute bottom-12 right-3 z-20 w-64 overflow-hidden rounded-lg border border-[#ddd] bg-white py-1 text-sm shadow-xl">
+        <div className="flex items-center justify-between gap-3 px-4 py-2.5"><span><span className="block text-[#222]">Use in my retrieval</span><span className="block text-xs text-[#999]">Your drafts search these notes</span></span><RetrievalSwitch on={vault.useInRetrieval} onChange={onToggleRetrieval} /></div>
+        <button type="button" onClick={() => { setMenuOpen(false); onRemove(); }} className="block w-full px-4 py-2.5 text-left text-red-600 hover:bg-red-50">Remove vault</button>
+      </div>}
+    </div>
+  );
+}
+
+/** One person's shared notes, read-only. For now a vault is a single Domain. */
+function VaultDetail({ vault, busy, onClose, onOpenNote, onToggleRetrieval, onRemove }: {
+  vault: Vault; busy: boolean; onClose: () => void; onOpenNote: (note: Note) => void; onToggleRetrieval: () => void; onRemove: () => void;
+}) {
+  const [query, setQuery] = useState('');
+  const visibleNotes = useMemo(() => {
+    const normalized = query.trim().toLowerCase();
+    return normalized ? vault.notes.filter((note) => note.raw_text.toLowerCase().includes(normalized)) : vault.notes;
+  }, [query, vault.notes]);
+  return (
+    <div className="relative flex h-full min-h-0 flex-col overflow-hidden bg-[#c9c2d6] p-3 sm:p-5">
+      <header className="relative flex h-16 shrink-0 items-center gap-3 px-1 text-white sm:px-2">
+        <label className="flex h-10 w-full max-w-xs items-center rounded-lg bg-white/15 px-3"><Search className="mr-2 h-4 w-4 shrink-0 text-white/80" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${vault.name}’s notes`} aria-label={`Search ${vault.name}’s notes`} className="min-w-0 flex-1 bg-transparent text-sm text-white outline-none placeholder:text-white/70" /></label>
+        <h1 className="pointer-events-none absolute left-1/2 hidden max-w-[40vw] -translate-x-1/2 truncate text-sm font-normal text-white/90 sm:block">{vault.name}’s vault</h1>
+        <button type="button" onClick={onClose} aria-label="Close vault and return home" title="Close vault and return home" className="ml-auto flex h-10 w-10 shrink-0 items-center justify-center rounded-md text-white drop-shadow hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"><X className="h-6 w-6" /></button>
+      </header>
+      <section className="relative min-h-0 flex-1 overflow-y-auto rounded-[28px] bg-white px-5 pb-16 pt-8 shadow-[0_14px_40px_rgba(0,0,0,0.12)] sm:px-10 lg:px-16">
+        <div className="mx-auto flex max-w-[1510px] flex-wrap items-center justify-between gap-4">
+          <p className="text-sm text-[#777]">Shared by {vault.name} · updated {fullNoteDate(vault.acceptedAt)} · {vault.notes.length} {vault.notes.length === 1 ? 'entry' : 'entries'}</p>
+          <div className="flex items-center gap-4 text-sm">
+            <span className="flex items-center gap-2 text-[#555]">Use in my retrieval <RetrievalSwitch on={vault.useInRetrieval} disabled={busy} onChange={onToggleRetrieval} /></span>
+            <button type="button" disabled={busy} onClick={onRemove} className="text-red-600 hover:underline disabled:opacity-50">Remove vault</button>
+          </div>
+        </div>
+        <p className="mx-auto mt-2 max-w-[1510px] text-xs text-[#aaa]">These are {vault.name}’s words, read-only. {vault.useInRetrieval ? 'Your drafts search them for related notes and cards.' : 'Your drafts do not search them while this is off.'}</p>
+        <div className="mx-auto mt-10 grid max-w-[1510px] grid-cols-1 gap-8 sm:grid-cols-2 lg:gap-x-12 lg:gap-y-10 xl:grid-cols-3">
+          {visibleNotes.map((note) => <LibraryNoteCard key={note.id} note={note} query={query} layout="grid" onClick={() => onOpenNote(note)} />)}
+        </div>
+        {!visibleNotes.length && <p className="mt-8 text-center text-sm text-[#999]">{query.trim() ? `No notes contain “${query.trim()}”.` : 'Nothing in this vault.'}</p>}
+      </section>
+    </div>
+  );
+}
+
+/** A note someone shared with you: read-only, with no search of its own. */
+function SharedNoteView({ note, vault, onClose }: { note: Note; vault: Vault | null; onClose: () => void }) {
+  const content = splitNote(note);
+  const name = note.shared_by || vault?.name || 'Someone';
+  return (
+    <div className="fixed inset-0 z-[70] bg-black/25 p-3 backdrop-blur-[5px] sm:p-6" role="dialog" aria-modal="true" aria-label={`Shared note: ${content.title || 'Untitled note'}`} onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <div className="mx-auto flex h-full max-w-4xl flex-col overflow-hidden rounded-xl border border-[#d8d8d8] bg-white shadow-xl">
+        <header className="flex min-h-14 shrink-0 items-center justify-between gap-3 border-b border-[#eee] px-5">
+          <p className="min-w-0 truncate text-xs text-[#888]">Shared by <span className="font-medium text-[#5c4a85]">{name}</span> · {fullNoteDate(note.created_at)}</p>
+          <button type="button" onClick={onClose} aria-label="Close shared note" className="flex h-9 w-9 items-center justify-center rounded-md text-[#666] hover:bg-[#f4f4f4]"><X className="h-5 w-5" /></button>
+        </header>
+        <article className="min-h-0 flex-1 overflow-y-auto px-7 py-10 sm:px-12">
+          <div className="mx-auto max-w-2xl">
+            <h1 className="break-words text-2xl font-semibold text-[#171717]">{content.title || 'Untitled note'}</h1>
+            {content.body && <div className="mt-8 text-base leading-[1.7] text-[#2d2d2d]"><FormattedNoteBody text={content.body} /></div>}
+          </div>
+        </article>
+        <footer className="shrink-0 border-t border-[#eee] bg-[#faf9fc] px-5 py-3 text-xs text-[#888]">{name}’s note, read-only. {vault && !vault.useInRetrieval ? 'Your drafts do not search this vault right now.' : 'Ocreda brings it up when it relates to what you write.'}</footer>
+      </div>
     </div>
   );
 }
@@ -1383,35 +1536,75 @@ function HighlightedText({ text, query }: { text: string; query: string }) {
   return <>{text.split(expression).map((part, index) => termSet.has(part.toLowerCase()) ? <mark key={`${part}-${index}`} className="rounded-sm bg-[#eaf1ff] px-0.5 text-[#477bea]">{part}</mark> : part)}</>;
 }
 
+/** Draws a stretch of note text in its run's style: bold, italic, or both. */
+function styledRun(run: InlineRun, content: React.ReactNode, key: React.Key): React.ReactNode {
+  const inner = run.italic ? <em>{content}</em> : content;
+  return <Fragment key={key}>{run.bold ? <strong>{inner}</strong> : inner}</Fragment>;
+}
+
 function InlineNoteFormatting({ text }: { text: string }) {
-  const expression = /(\*\*[^*\n]+\*\*|__[^_\n]+__|\*[^*\n]+\*|_[^_\n]+_)/g;
-  return <>{text.split(expression).filter(Boolean).map((part, index) => {
-    if ((part.startsWith('**') && part.endsWith('**')) || (part.startsWith('__') && part.endsWith('__'))) return <strong key={index}>{part.slice(2, -2)}</strong>;
-    if ((part.startsWith('*') && part.endsWith('*')) || (part.startsWith('_') && part.endsWith('_'))) return <em key={index}>{part.slice(1, -1)}</em>;
-    return <Fragment key={index}>{part}</Fragment>;
-  })}</>;
+  return <>{inlineRuns(text).map((run, index) => styledRun(run, text.slice(run.start, run.end), index))}</>;
 }
 
 function hasNoteFormatting(text: string): boolean {
   return /(^|\n)#{1,3}\s|(^|\n)(?:[-+*•]\s|\d+\.\s)|\*\*[^*\n]+\*\*|__[^_\n]+__|\*[^*\n]+\*|_[^_\n]+_/.test(text);
 }
 
-/** Render the lightweight formatting inserted by the note toolbar. */
-function FormattedNoteBody({ text }: { text: string }) {
+type NoteMark = { start: number; end: number; label: string; markRef?: React.Ref<HTMLElement> };
+
+/**
+ * A line's text with its bold and italic drawn, and the part inside `mark`
+ * highlighted. `offset` is where the line starts in the note, since the mark's
+ * offsets point into the note's markdown, markers included.
+ */
+function InlineWithMark({ text, offset, mark }: { text: string; offset: number; mark?: NoteMark }) {
+  if (!mark || mark.end <= offset || mark.start >= offset + text.length) return <InlineNoteFormatting text={text} />;
+  // Visible runs of the line, each with where it sits in the note and its style.
+  const runs = inlineRuns(text, offset);
+  const nodes: React.ReactNode[] = [];
+  let first = true;
+  let lastMarked = -1;
+  runs.forEach((run, index) => {
+    const cuts = [run.start, Math.min(Math.max(mark.start, run.start), run.end), Math.min(Math.max(mark.end, run.start), run.end), run.end];
+    for (let piece = 0; piece < 3; piece++) {
+      const [from, to] = [cuts[piece], cuts[piece + 1]];
+      if (to <= from) continue;
+      const slice = text.slice(from - offset, to - offset);
+      let node: React.ReactNode = styledRun(run, slice, 'text');
+      if (piece === 1) {
+        node = <mark ref={first ? mark.markRef : undefined} className="rounded-sm bg-[#fff4c7] px-0.5 text-inherit underline decoration-[#e5b72f] decoration-2 underline-offset-4 [box-decoration-break:clone]" title={mark.label}>{node}</mark>;
+        first = false;
+      }
+      nodes.push(<Fragment key={`${index}-${piece}`}>{node}</Fragment>);
+      if (piece === 1) lastMarked = nodes.length;
+    }
+  });
+  // The label follows the marked words, on the line where they end.
+  if (lastMarked !== -1 && mark.end <= offset + text.length) nodes.splice(lastMarked, 0, <span key="label" className="ml-1 inline-block rounded bg-[#fff7d8] px-1 align-[1px] text-[10px] font-medium leading-4 text-[#9a7300]">{mark.label}</span>);
+  return <>{nodes}</>;
+}
+
+/** Render the lightweight formatting inserted by the note toolbar, with an optional highlighted passage. */
+function FormattedNoteBody({ text, mark }: { text: string; mark?: NoteMark }) {
+  let lineStart = 0;
   return <div className="space-y-3 break-words">
     {text.split('\n').map((rawLine, index) => {
+      const offset = lineStart;
+      lineStart += rawLine.length + 1;
+      const lineEnd = offset + rawLine.length;
+      const inline = (content: string) => <InlineWithMark text={content} offset={lineEnd - content.length} mark={mark} />;
       const heading = rawLine.match(/^(#{1,3})\s+(.*)$/);
       if (heading) {
         const level = heading[1].length;
         const className = level === 1 ? 'pt-2 text-2xl font-semibold leading-snug' : level === 2 ? 'pt-2 text-xl font-semibold leading-snug' : 'pt-1 text-lg font-semibold leading-snug';
-        return <div key={index} role="heading" aria-level={Math.min(level + 1, 6)} className={className}><InlineNoteFormatting text={heading[2]} /></div>;
+        return <div key={index} role="heading" aria-level={Math.min(level + 1, 6)} className={className}>{inline(heading[2])}</div>;
       }
       const bullet = rawLine.match(/^[-+*•]\s+(.*)$/);
-      if (bullet) return <div key={index} className="flex gap-3 pl-2"><span aria-hidden="true" className="mt-[0.72em] h-1.5 w-1.5 shrink-0 rounded-full bg-current" /><span><InlineNoteFormatting text={bullet[1]} /></span></div>;
+      if (bullet) return <div key={index} className="flex gap-3 pl-2"><span aria-hidden="true" className="mt-[0.72em] h-1.5 w-1.5 shrink-0 rounded-full bg-current" /><span>{inline(bullet[1])}</span></div>;
       const numbered = rawLine.match(/^(\d+)\.\s+(.*)$/);
-      if (numbered) return <div key={index} className="flex gap-3 pl-1"><span className="min-w-5 shrink-0 text-right text-[#777]">{numbered[1]}.</span><span><InlineNoteFormatting text={numbered[2]} /></span></div>;
+      if (numbered) return <div key={index} className="flex gap-3 pl-1"><span className="min-w-5 shrink-0 text-right text-[#777]">{numbered[1]}.</span><span>{inline(numbered[2])}</span></div>;
       if (!rawLine.trim()) return <div key={index} className="h-2" aria-hidden="true" />;
-      return <p key={index} className="whitespace-pre-wrap"><InlineNoteFormatting text={rawLine} /></p>;
+      return <p key={index} className="whitespace-pre-wrap">{inline(rawLine)}</p>;
     })}
   </div>;
 }
@@ -1457,15 +1650,7 @@ function RetrievalMatchedBody({ text, matchedText, label }: { text: string; matc
   const markRef = useRef<HTMLElement>(null);
   const span = matchedText ? findAnchor(text, matchedText) : null;
   useEffect(() => { markRef.current?.scrollIntoView({ block: 'center' }); }, [matchedText]);
-  if (!span) return <FormattedNoteBody text={text} />;
-  return <div className="whitespace-pre-wrap break-words">
-    {text.slice(0, span.start)}
-    <mark ref={markRef} className="rounded-sm bg-[#fff4c7] px-0.5 text-inherit underline decoration-[#e5b72f] decoration-2 underline-offset-4 [box-decoration-break:clone]" title={label}>
-      {text.slice(span.start, span.end)}
-    </mark>
-    <span className="ml-1 inline-block rounded bg-[#fff7d8] px-1 align-[1px] text-[10px] font-medium leading-4 text-[#9a7300]">{label}</span>
-    {text.slice(span.end)}
-  </div>;
+  return <FormattedNoteBody text={text} mark={span ? { ...span, label, markRef } : undefined} />;
 }
 
 function RelatedNotePanel({ note, relevance, focusText = '', onClose, onOpenFull }: {
@@ -1488,7 +1673,7 @@ function RelatedNotePanel({ note, relevance, focusText = '', onClose, onOpenFull
       <div className="min-w-0 text-xs text-[#999]">
         <span>{fullNoteDate(note.created_at)}</span>
         <span className="mx-2 text-[#ccc]" aria-hidden="true">·</span>
-        <span className="truncate">{cleanCategory(note.category) || ORPHANS_MUSE}</span>
+        <span className="truncate">{note.shared_by ? `Shared by ${note.shared_by}` : cleanCategory(note.category) || ORPHANS_MUSE}</span>
       </div>
       <div className="flex shrink-0 items-center gap-2">
         <button type="button" onClick={onOpenFull} className="rounded-md border border-[#dedede] bg-white px-3 py-1.5 text-xs text-[#477bea] shadow-sm hover:border-[#adc3ff] hover:bg-[#edf3ff] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">Open full note</button>
@@ -1510,8 +1695,12 @@ function RelatedNotePanel({ note, relevance, focusText = '', onClose, onOpenFull
   </div>;
 }
 
-function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, saving, userId, initialRetrievalMode, autoSearch, onClose, onReturnToPrevious, onAddNote, onOpenNote, onOpenPage, onUpdate, onChangeDomain, onCreateDomain, onDelete, onShare, onSetDomainGoal }: {
+function NoteReadingWorkspace({ note, previousNote, allNotes, sharedNotes = [], hasSearchableShared = false, muses, projects, saving, userId, initialRetrievalMode, autoSearch, onClose, onReturnToPrevious, onAddNote, onOpenNote, onOpenPage, onUpdate, onChangeDomain, onCreateDomain, onDelete, onShare, onSetDomainGoal }: {
   note: Note; previousNote: Note | null; allNotes: Note[]; muses: MuseMeta[]; projects: CortexProject[]; saving: boolean; userId: string; initialRetrievalMode: 'similar' | 'relevant'; autoSearch: boolean;
+  /** Notes others shared with you. Searches may cite them, so cards and links look them up here too. */
+  sharedNotes?: Note[];
+  /** Whether a search reads any shared notes, so a note can be searched with none of your own beside it. */
+  hasSearchableShared?: boolean;
   onClose: () => void; onReturnToPrevious: () => void; onAddNote: () => void; onOpenNote: (note: Note, autoSearch?: boolean) => void; onOpenPage: (project: CortexProject, page: ProjectPage) => void;
   onUpdate: (noteId: string, rawText: string) => Promise<void>; onChangeDomain: (category: string | null) => void; onCreateDomain: () => void; onDelete: (note: Note) => Promise<void>;
   onSetDomainGoal: (domainTitle: string, goal: string) => void;
@@ -1519,8 +1708,8 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
   onShare: (note: Note) => Promise<void>;
 }) {
   const initial = splitNote(note);
-  const [title, setTitle] = useState(editableTitle(note));
-  const [body, setBody] = useState(initial.body);
+  const [title, setTitle] = useState(() => editableNote(note).title);
+  const [body, setBody] = useState(() => editableNote(note).body);
   const [editing, setEditing] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [usedInMenuOpen, setUsedInMenuOpen] = useState(false);
@@ -1554,14 +1743,15 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
   const [selectedInsightIndex, setSelectedInsightIndex] = useState(0);
   const [selectedSectionId, setSelectedSectionId] = useState<string | null>(null);
   const aiMode = useAiMode();
-  const bodyRef = useRef<HTMLTextAreaElement>(null);
+  const bodyRef = useRef<NoteBodyEditorHandle>(null);
+  const [activeFormats, setActiveFormats] = useState<NoteFormat[]>([]);
   const latestSaveRef = useRef(onUpdate);
   latestSaveRef.current = onUpdate;
   const muse = cleanCategory(note.category) || ORPHANS_MUSE;
   const rawText = composeNoteText(title, body);
   // An older note without a title reads back as a made-up title over its text;
   // opening it is not an edit, so only a real change saves.
-  const unchangedText = useMemo(() => composeNoteText(editableTitle(note), splitNote(note).body), [note]);
+  const unchangedText = useMemo(() => { const start = editableNote(note); return composeNoteText(start.title, start.body); }, [note]);
   const noteChanged = Boolean(rawText) && rawText !== note.raw_text.trim() && rawText !== unchangedText;
 
   useEffect(() => {
@@ -1593,13 +1783,15 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
   const newerNote = noteIndex > 0 ? orderedNotes[noteIndex - 1] : null;
   const olderNote = noteIndex < orderedNotes.length - 1 ? orderedNotes[noteIndex + 1] : null;
   const noteTooShortForRetrieval = note.raw_text.trim().length < MIN_RELEVANCE_DRAFT_CHARS;
-  const hasOtherNotes = allNotes.some((item) => item.id !== note.id);
+  const hasOtherNotes = hasSearchableShared || allNotes.some((item) => item.id !== note.id);
   const domainGoal = domainGoalFor(note.category, muses);
   // Primitives, so a new muses array with the same content does not rerun the search.
   const domainName = domainGoal?.name ?? '';
   const goalText = domainGoal?.goal ?? '';
-  const retrievalInputsRef = useRef({ note, allNotes, domainName, goalText, aiMode, rawText });
-  retrievalInputsRef.current = { note, allNotes, domainName, goalText, aiMode, rawText };
+  // Your notes and the shared ones together, for finding any note a search names.
+  const lookupNotes = useMemo(() => (sharedNotes.length ? [...allNotes, ...sharedNotes] : allNotes), [allNotes, sharedNotes]);
+  const retrievalInputsRef = useRef({ note, allNotes, lookupNotes, hasSearchableShared, domainName, goalText, aiMode, rawText });
+  retrievalInputsRef.current = { note, allNotes, lookupNotes, hasSearchableShared, domainName, goalText, aiMode, rawText };
 
   useEffect(() => {
     let active = true;
@@ -1617,7 +1809,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
     // what the reader shows.
     const searchedText = requestNote.raw_text.trim();
     const requestBody = splitNote(requestNote).body || searchedText;
-    const availableNoteIds = new Set(inputs.allNotes.filter((item) => item.id !== requestNote.id).map((item) => item.id));
+    const availableNoteIds = new Set(inputs.lookupNotes.filter((item) => item.id !== requestNote.id).map((item) => item.id));
     // A saved search costs nothing to show, so it shows even for a note opened
     // only to read it, as long as it still names notes that exist and suits the mode.
     const canShow = (saved: SavedRetrieval | null): saved is SavedRetrieval => Boolean(saved
@@ -1649,7 +1841,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
       // completed searches. Retry instead of leaving the panel blank forever.
       setRetrieval(null);
       const requestTooShort = requestNote.raw_text.trim().length < MIN_RELEVANCE_DRAFT_CHARS;
-      const requestHasOtherNotes = inputs.allNotes.some((item) => item.id !== requestNote.id);
+      const requestHasOtherNotes = inputs.hasSearchableShared || inputs.allNotes.some((item) => item.id !== requestNote.id);
       if (requestTooShort || !requestHasOtherNotes) { setRetrievalLoading(false); return; }
       setRetrievalLoading(true);
       const onProgress = (progress: RelevanceProgress) => {
@@ -1721,11 +1913,11 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
   };
 
   const surfacedNotes = useMemo(() => {
-    const notesById = new Map(allNotes.map((item) => [item.id, item]));
+    const notesById = new Map(lookupNotes.map((item) => [item.id, item]));
     return (retrieval?.results ?? []).map((result) => notesById.get(result.note_id)).filter((item): item is Note => item !== undefined && item.id !== note.id).slice(0, 10);
-  }, [allNotes, note.id, retrieval]);
+  }, [lookupNotes, note.id, retrieval]);
 
-  const noteById = useMemo(() => new Map(allNotes.map((item) => [item.id, item])), [allNotes]);
+  const noteById = useMemo(() => new Map(lookupNotes.map((item) => [item.id, item])), [lookupNotes]);
   const relevanceByNoteId = useMemo(
     () => new Map((retrieval?.results ?? []).map((result) => [result.note_id, result])),
     [retrieval]
@@ -1746,7 +1938,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
     return Boolean(saved?.search.results.some((result) => result.note_id === note.id)
       || saved?.search.insights?.some((itemInsight) => itemInsight.note_ids.includes(note.id)));
   }), [allNotes, note.id, retrieval, usedInElsewhere, userId]);
-  const panelNote = panelNoteId ? allNotes.find((item) => item.id === panelNoteId) ?? null : null;
+  const panelNote = panelNoteId ? lookupNotes.find((item) => item.id === panelNoteId) ?? null : null;
   const displayedBody = body || note.raw_text;
   const noteSections = useMemo(() => noteSectionsFor(displayedBody, retrieval?.sections), [displayedBody, retrieval]);
   /** The relation of an insight's strongest cited note, for cards from servers that predate card kinds. */
@@ -1986,21 +2178,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
     return () => window.removeEventListener('keydown', closeOnEscape);
   });
 
-  const applyReadingFormat = (kind: 'bold' | 'italic' | 'h1' | 'h2' | 'h3' | 'body' | 'bullet' | 'number') => {
-    const field = bodyRef.current; if (!field) return;
-    const start = field.selectionStart; const end = field.selectionEnd; const selection = body.slice(start, end);
-    let replacement = selection;
-    if (kind === 'bold') replacement = `**${selection || 'bold text'}**`;
-    if (kind === 'italic') replacement = `*${selection || 'italic text'}*`;
-    if (kind === 'h1') replacement = `# ${selection || 'Heading'}`;
-    if (kind === 'h2') replacement = `## ${selection || 'Heading'}`;
-    if (kind === 'h3') replacement = `### ${selection || 'Heading'}`;
-    if (kind === 'body') replacement = selection.replace(/^#{1,3}\s+/gm, '');
-    if (kind === 'bullet') replacement = (selection || 'List item').split('\n').map((line) => `• ${line.replace(/^[-•]\s*/, '')}`).join('\n');
-    if (kind === 'number') replacement = (selection || 'List item').split('\n').map((line, index) => `${index + 1}. ${line.replace(/^\d+\.\s*/, '')}`).join('\n');
-    setBody(`${body.slice(0, start)}${replacement}${body.slice(end)}`);
-    requestAnimationFrame(() => { field.focus(); field.setSelectionRange(start, start + replacement.length); });
-  };
+  const applyReadingFormat = (kind: NoteFormat) => bodyRef.current?.format(kind);
 
   const openDate = () => setSearchRequest({ query: '', filter: { kind: 'date', value: localDateKey(note.created_at), label: fullNoteDate(note.created_at) } });
 
@@ -2024,6 +2202,8 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
       ?? (item.answer?.note_id || item.quotes?.[0]?.note_id || item.note_ids[0]);
     const source = sourceId ? noteById.get(sourceId) : undefined;
     const sourceTitle = source ? noteLabel(source) : 'earlier note';
+    // Someone else's note is named as theirs, never as one of yours.
+    const sharedBy = source?.shared_by ?? null;
     const focus = view.fromNoteId ? item.answer?.text ?? ''
       : outboundAnswer ? item.problem?.text ?? ''
         : (item.answer?.note_id ? item.answer.text : '') || item.quotes?.[0]?.text || '';
@@ -2040,20 +2220,20 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
       const label = choice === 'merged' ? 'Extended'
         : outboundAnswer ? `Solves ${sourceTitle}`
           : outboundHelp ? `Helps ${sourceTitle}`
-        : choice === 'today' ? `Updates ${sourceTitle}`
-          : choice === 'earlier' ? `${sourceTitle} holds`
+        : choice === 'today' ? (sharedBy ? `Differs from ${sharedBy}` : `Updates ${sourceTitle}`)
+          : choice === 'earlier' ? (sharedBy ? `${sharedBy}’s view holds` : `${sourceTitle} holds`)
             : choice === 'confirmed' ? `Pattern · ${sourceTitle}`
               : sourceTitle;
       return <span key={key} {...handlers} className={`ml-1.5 inline-block max-w-[16rem] cursor-pointer truncate rounded-full border px-2 align-[2px] text-[11px] font-medium leading-5 hover:brightness-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${style.chip}`}>{label}</span>;
     }
     const words = choice === 'merged'
-      ? view.decision?.text ?? item.answer?.text ?? item.action
-      : choice === 'solved' ? item.answer?.text ?? item.action
-        : item.kind === 'helps' ? `Might help to ${item.action}` : `Might help: “${item.answer?.text ?? item.action}”`;
+      ? plainNoteText(view.decision?.text ?? item.answer?.text ?? item.action)
+      : choice === 'solved' ? plainNoteText(item.answer?.text ?? item.action)
+        : item.kind === 'helps' ? `Might help to ${plainNoteText(item.action)}` : `Might help: “${plainNoteText(item.answer?.text ?? item.action)}”`;
     return <span key={key} {...handlers} className={`my-2 block cursor-pointer rounded-lg border px-3 py-2 text-[15px] leading-relaxed hover:brightness-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${choice === 'merged' ? 'border-y-0 border-r-0 border-l-[3px] border-[#c8acea] bg-[#fbf8ff] text-[#3d2a57]' : `border-dashed ${style.outline} text-[#2d2d2d]`}`}>
       {choice === 'solved' && <span className={`mr-1.5 text-[12px] font-semibold ${style.actionText}`}>Solution:</span>}
       {words}
-      <span className="mt-0.5 block text-[11px] text-[#999]">From “{sourceTitle}”{source ? ` · ${formatDate(source.created_at)}` : ''} ↗</span>
+      <span className="mt-0.5 block text-[11px] text-[#999]">From {sharedBy ? `${sharedBy}’s ` : ''}“{sourceTitle}”{source ? ` · ${formatDate(source.created_at)}` : ''} ↗</span>
     </span>;
   };
 
@@ -2118,23 +2298,23 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
 
     /** Hide lightweight Markdown markers while retaining retrieval decorations. */
     const renderInlineRange = (start: number, end: number, keyPrefix: string): React.ReactNode[] => {
-      const value = displayedBody.slice(start, end);
-      const expression = /(\*\*[^*\n]+\*\*|__[^_\n]+__|\*[^*\n]+\*|_[^_\n]+_)/g;
+      const runs = inlineRuns(displayedBody.slice(start, end), start);
       const nodes: React.ReactNode[] = [];
-      let cursor = start;
-      Array.from(value.matchAll(expression)).forEach((match, index) => {
-        const matched = match[0];
-        const matchStart = start + (match.index ?? 0);
-        const matchEnd = matchStart + matched.length;
-        const markerLength = matched.startsWith('**') || matched.startsWith('__') ? 2 : 1;
-        if (matchStart > cursor) nodes.push(...renderDecoratedRange(cursor, matchStart, `${keyPrefix}-p${index}`));
-        const content = renderDecoratedRange(matchStart + markerLength, matchEnd - markerLength, `${keyPrefix}-f${index}`);
-        nodes.push(markerLength === 2
-          ? <strong key={`${keyPrefix}-strong${index}`}>{content}</strong>
-          : <em key={`${keyPrefix}-em${index}`}>{content}</em>);
-        cursor = matchEnd;
+      // The markers themselves are not drawn, so a chip or box placed on one
+      // (a fully bold sentence puts it right after the closing **) is drawn
+      // next to the words instead of being dropped with the marker. Each run
+      // draws what sits on it, ends included; a gap draws what is strictly
+      // between runs, and at the line's own start and end.
+      const overlaysOnMarkers = (after: number, before: number, keyPart: string) => inserts
+        .filter((overlay) => overlay.at > after && overlay.at < before)
+        .map((overlay, position) => renderOverlay(overlay, `${keyPrefix}-${keyPart}${position}`));
+      let previousEnd = start - 1;
+      runs.forEach((run, index) => {
+        nodes.push(...overlaysOnMarkers(previousEnd, run.start, `gap${index}-`));
+        nodes.push(styledRun(run, renderDecoratedRange(run.start, run.end, `${keyPrefix}-r${index}`), `${keyPrefix}-s${index}`));
+        previousEnd = run.end;
       });
-      if (cursor < end) nodes.push(...renderDecoratedRange(cursor, end, `${keyPrefix}-tail`));
+      nodes.push(...overlaysOnMarkers(previousEnd, end + 1, 'tail-'));
       return nodes;
     };
 
@@ -2202,7 +2382,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
             {!summaryOpen && <button type="button" onClick={() => setSummaryOpen(true)} aria-controls="note-suggestions-panel" className="rounded-md border border-[#dedede] bg-white px-3 py-1.5 text-xs text-[#555] shadow-sm hover:border-[#adc3ff] hover:text-[#477bea] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">Show suggestions</button>}
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-24 pt-14 sm:px-12 sm:pt-12 xl:px-[8%]">
-            {editing ? <div className="mx-auto max-w-3xl"><input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} aria-label="Note title" placeholder={defaultNoteTitle(body) || 'Title (optional)'} className="w-full bg-transparent text-2xl font-semibold outline-none placeholder:font-normal placeholder:text-[#c4c4c6]" /><textarea ref={bodyRef} value={body} onChange={(event) => setBody(event.target.value)} aria-label="Note text" className="mt-10 min-h-[520px] w-full resize-none bg-transparent text-base leading-[1.7] outline-none" /></div> : <article className="relative mx-auto max-w-3xl" onDoubleClick={() => { setEditing(true); requestAnimationFrame(() => bodyRef.current?.focus()); }} title="Double-click to edit">{(title.trim() || body.trim()) && <h1 className="break-words px-2 py-1 text-2xl font-semibold">{title.trim() || defaultNoteTitle(body)}</h1>}<div className="mt-2 flex flex-wrap gap-x-3 px-2 text-xs text-[#999]" onDoubleClick={(event) => event.stopPropagation()}><NoteDomainPicker category={note.category} muses={muses} saving={saving} onChange={onChangeDomain} showPrefix /><button type="button" onClick={openDate} className="hover:text-[#477bea]">{fullNoteDate(note.created_at)}</button></div>
+            {editing ? <div className="mx-auto max-w-3xl"><input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} aria-label="Note title" placeholder={defaultNoteTitle(body) || 'Title (optional)'} className="w-full bg-transparent text-2xl font-semibold outline-none placeholder:font-normal placeholder:text-[#c4c4c6]" /><NoteBodyEditor ref={bodyRef} value={body} onChange={setBody} autoFocus ariaLabel="Note text" onActiveFormatsChange={setActiveFormats} wrapperClassName="mt-10" className="min-h-[520px] w-full bg-transparent text-base leading-[1.7]" /></div> : <article className="relative mx-auto max-w-3xl" onDoubleClick={() => { setEditing(true); requestAnimationFrame(() => bodyRef.current?.focus()); }} title="Double-click to edit">{(title.trim() || body.trim()) && <h1 className="break-words px-2 py-1 text-2xl font-semibold">{plainNoteText(title) || defaultNoteTitle(body)}</h1>}<div className="mt-2 flex flex-wrap gap-x-3 px-2 text-xs text-[#999]" onDoubleClick={(event) => event.stopPropagation()}><NoteDomainPicker category={note.category} muses={muses} saving={saving} onChange={onChangeDomain} showPrefix /><button type="button" onClick={openDate} className="hover:text-[#477bea]">{fullNoteDate(note.created_at)}</button></div>
               <div className="mt-9 w-full rounded-md px-2 py-2 text-left text-base leading-[1.7]">
                 <div className="min-w-0 flex-1 space-y-7">
                   {noteSections.length ? noteSections.map((section) => <section key={section.id} id={`note-${section.id}`} tabIndex={0} aria-label={`Section ${section.index + 1}`} aria-current={selectedSectionId === section.id ? 'true' : undefined} onClick={() => selectSection(section.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectSection(section.id); } }} className={`cursor-text scroll-mt-20 border-l-[3px] pl-4 outline-none transition hover:border-[#888] focus-visible:ring-2 focus-visible:ring-[#477bea]/30 ${selectedSectionId === section.id ? 'border-[#666]' : 'border-[#d2d2d5]'}`}>{renderSectionContent(section)}</section>) : <span className="text-left text-[#999]">Double-click to start writing.</span>}
@@ -2210,7 +2390,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, muses, projects, s
               </div>
             </article>}
           </div>
-          <ReadingFormatBar onFormat={applyReadingFormat} onDone={finishEditing} editing={editing} />
+          <ReadingFormatBar onFormat={applyReadingFormat} onDone={finishEditing} editing={editing} active={activeFormats} />
           <span className="absolute bottom-3 right-5 text-[11px] text-[#999]">{saving || saveState === 'saving' ? 'Saving…' : saveState === 'saved' ? 'Saved' : saveState === 'error' ? 'Save failed' : ''}</span>
         </section>
 
@@ -2288,16 +2468,17 @@ function RetrievedNoteOverlay({ note, muses, saving, onClose, onAddNote, onImpor
   onUpdate: (noteId: string, rawText: string) => Promise<void>; onDelete: (note: Note) => Promise<void>;
 }) {
   const initial = splitNote(note);
-  const [title, setTitle] = useState(editableTitle(note));
-  const [body, setBody] = useState(initial.body);
+  const [title, setTitle] = useState(() => editableNote(note).title);
+  const [body, setBody] = useState(() => editableNote(note).body);
   const [editing, setEditing] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [saveState, setSaveState] = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
-  const bodyRef = useRef<HTMLTextAreaElement>(null);
+  const bodyRef = useRef<NoteBodyEditorHandle>(null);
+  const [activeFormats, setActiveFormats] = useState<NoteFormat[]>([]);
   const rawText = composeNoteText(title, body);
   // An older note without a title reads back as a made-up title over its text;
   // opening it is not an edit, so only a real change saves.
-  const unchangedText = useMemo(() => composeNoteText(editableTitle(note), splitNote(note).body), [note]);
+  const unchangedText = useMemo(() => { const start = editableNote(note); return composeNoteText(start.title, start.body); }, [note]);
   const noteChanged = Boolean(rawText) && rawText !== note.raw_text.trim() && rawText !== unchangedText;
   const muse = cleanCategory(note.category) || ORPHANS_MUSE;
   const usedMuses = useMemo(() => {
@@ -2314,21 +2495,9 @@ function RetrievedNoteOverlay({ note, muses, saving, onClose, onAddNote, onImpor
     return () => window.clearTimeout(timeout);
   }, [body, editing, note.id, note.raw_text, onUpdate, rawText, title]);
 
-  const applyFormat = (kind: 'bold' | 'italic' | 'h1' | 'h2' | 'h3' | 'body' | 'bullet' | 'number') => {
+  const applyFormat = (kind: NoteFormat) => {
     setEditing(true);
-    const field = bodyRef.current; if (!field) return;
-    const start = field.selectionStart; const end = field.selectionEnd; const selection = body.slice(start, end);
-    let replacement = selection;
-    if (kind === 'bold') replacement = `**${selection || 'bold text'}**`;
-    if (kind === 'italic') replacement = `*${selection || 'italic text'}*`;
-    if (kind === 'h1') replacement = `# ${selection || 'Heading'}`;
-    if (kind === 'h2') replacement = `## ${selection || 'Heading'}`;
-    if (kind === 'h3') replacement = `### ${selection || 'Heading'}`;
-    if (kind === 'body') replacement = selection.replace(/^#{1,3}\s+/gm, '');
-    if (kind === 'bullet') replacement = (selection || 'List item').split('\n').map((line) => `• ${line.replace(/^[-•]\s*/, '')}`).join('\n');
-    if (kind === 'number') replacement = (selection || 'List item').split('\n').map((line, index) => `${index + 1}. ${line.replace(/^\d+\.\s*/, '')}`).join('\n');
-    setBody(`${body.slice(0, start)}${replacement}${body.slice(end)}`);
-    requestAnimationFrame(() => { field.focus(); field.setSelectionRange(start, start + replacement.length); });
+    bodyRef.current?.format(kind);
   };
 
   const openDate = () => onSearch({ query: '', filter: { kind: 'date', value: localDateKey(note.created_at), label: fullNoteDate(note.created_at) } });
@@ -2349,9 +2518,9 @@ function RetrievedNoteOverlay({ note, muses, saving, onClose, onAddNote, onImpor
           <section className="relative flex min-h-0 flex-col overflow-hidden bg-white shadow-[4px_0_14px_rgba(0,0,0,0.14)]">
             <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-28 pt-12 sm:px-16 lg:px-[11%] lg:pt-20">
               <input value={title} readOnly={!editing} onClick={() => setEditing(true)} onChange={(event) => setTitle(event.target.value)} aria-label="Retrieved note title" placeholder={defaultNoteTitle(body) || (editing ? 'Title (optional)' : '')} className={`w-full bg-transparent text-2xl font-semibold outline-none placeholder:font-normal placeholder:text-[#c4c4c6] ${editing ? 'cursor-text' : 'cursor-pointer'}`} />
-              <textarea ref={bodyRef} value={body} readOnly={!editing} onClick={() => setEditing(true)} onChange={(event) => setBody(event.target.value)} aria-label="Retrieved note text" className={`mt-8 min-h-[540px] w-full resize-none bg-transparent text-base leading-[1.7] outline-none ${editing ? 'cursor-text' : 'cursor-pointer'}`} />
+              <NoteBodyEditor ref={bodyRef} value={body} editable={editing} onClick={() => setEditing(true)} onChange={setBody} ariaLabel="Retrieved note text" onActiveFormatsChange={setActiveFormats} className={`mt-8 min-h-[540px] w-full bg-transparent text-base leading-[1.7] ${editing ? 'cursor-text' : 'cursor-pointer'}`} />
             </div>
-            <ReadingFormatBar onFormat={applyFormat} onDone={() => setEditing(false)} editing={editing} />
+            <ReadingFormatBar onFormat={applyFormat} onDone={() => setEditing(false)} editing={editing} active={activeFormats} />
             <span className="absolute bottom-3 right-5 text-[11px] text-[#999]">{saving || saveState === 'saving' ? 'Saving…' : saveState === 'saved' ? 'Saved' : saveState === 'error' ? 'Save failed' : ''}</span>
           </section>
           <aside className="relative min-h-0 overflow-y-auto bg-[#f7f7f9] px-6 pb-8 pt-16">
@@ -2371,13 +2540,19 @@ function RetrievedNoteOverlay({ note, muses, saving, onClose, onAddNote, onImpor
   );
 }
 
-function ReadingFormatBar({ onFormat, onDone, editing }: { onFormat: (kind: 'bold' | 'italic' | 'h1' | 'h2' | 'h3' | 'body' | 'bullet' | 'number') => void; onDone: () => void; editing: boolean }) {
+function ReadingFormatBar({ onFormat, onDone, editing, active = [] }: { onFormat: (kind: NoteFormat) => void; onDone: () => void; editing: boolean; active?: NoteFormat[] }) {
   if (!editing) return null;
-  return <div className="absolute bottom-5 left-1/2 z-20 flex max-w-[calc(100%-32px)] -translate-x-1/2 items-center gap-1 rounded-xl bg-[#f7f7f9] px-3 py-2 text-sm text-[#555] shadow-sm"><button type="button" aria-label="Voice input" className="flex h-8 w-8 items-center justify-center rounded hover:bg-white"><Mic className="h-4 w-4" /></button><span className="mx-1 h-7 w-px bg-[#ddd]" /><button type="button" onClick={() => onFormat('bold')} className="h-8 w-8 rounded font-bold hover:bg-white">B</button><button type="button" onClick={() => onFormat('italic')} className="h-8 w-8 rounded italic hover:bg-white">I</button><span className="mx-1 h-7 w-px bg-[#ddd]" />{(['h1', 'h2', 'h3'] as const).map((kind) => <button key={kind} type="button" onClick={() => onFormat(kind)} className="hidden h-8 rounded px-2 font-semibold hover:bg-white sm:block">{kind.toUpperCase()}</button>)}<button type="button" onClick={() => onFormat('body')} className="hidden h-8 rounded px-2 hover:bg-white md:block">Body</button><span className="mx-1 hidden h-7 w-px bg-[#ddd] md:block" /><button type="button" onClick={() => onFormat('bullet')} className="hidden h-8 items-center gap-1 rounded px-2 hover:bg-white lg:flex"><List className="h-4 w-4" /> Bullet list</button><button type="button" onClick={() => onFormat('number')} className="hidden h-8 items-center gap-1 rounded px-2 hover:bg-white xl:flex"><ListOrdered className="h-4 w-4" /> Numbered list</button><button type="button" onClick={onDone} className="ml-2 h-8 rounded-md bg-[#477bea] px-3 text-white hover:bg-[#3d6ed7]">Done</button></div>;
+  // Buttons keep the editor focused, so the selection, or a format turned on
+  // for what is typed next, survives the click.
+  const keepFocus = (event: React.MouseEvent) => event.preventDefault();
+  const on = (kind: NoteFormat) => (active.includes(kind) ? 'bg-white text-[#477bea] shadow-sm' : '');
+  return <div className="absolute bottom-5 left-1/2 z-20 flex max-w-[calc(100%-32px)] -translate-x-1/2 items-center gap-1 rounded-xl bg-[#f7f7f9] px-3 py-2 text-sm text-[#555] shadow-sm"><button type="button" aria-label="Voice input" className="flex h-8 w-8 items-center justify-center rounded hover:bg-white"><Mic className="h-4 w-4" /></button><span className="mx-1 h-7 w-px bg-[#ddd]" /><button type="button" onMouseDown={keepFocus} onClick={() => onFormat('bold')} aria-label="Bold" aria-pressed={active.includes('bold')} className={`h-8 w-8 rounded font-bold hover:bg-white ${on('bold')}`}>B</button><button type="button" onMouseDown={keepFocus} onClick={() => onFormat('italic')} aria-label="Italic" aria-pressed={active.includes('italic')} className={`h-8 w-8 rounded italic hover:bg-white ${on('italic')}`}>I</button><span className="mx-1 h-7 w-px bg-[#ddd]" />{(['h1', 'h2', 'h3'] as const).map((kind) => <button key={kind} type="button" onMouseDown={keepFocus} onClick={() => onFormat(kind)} aria-pressed={active.includes(kind)} className={`hidden h-8 rounded px-2 font-semibold hover:bg-white sm:block ${on(kind)}`}>{kind.toUpperCase()}</button>)}<button type="button" onMouseDown={keepFocus} onClick={() => onFormat('body')} className="hidden h-8 rounded px-2 hover:bg-white md:block">Body</button><span className="mx-1 hidden h-7 w-px bg-[#ddd] md:block" /><button type="button" onMouseDown={keepFocus} onClick={() => onFormat('bullet')} aria-pressed={active.includes('bullet')} className={`hidden h-8 items-center gap-1 rounded px-2 hover:bg-white lg:flex ${on('bullet')}`}><List className="h-4 w-4" /> Bullet list</button><button type="button" onMouseDown={keepFocus} onClick={() => onFormat('number')} aria-pressed={active.includes('number')} className={`hidden h-8 items-center gap-1 rounded px-2 hover:bg-white xl:flex ${on('number')}`}><ListOrdered className="h-4 w-4" /> Numbered list</button><button type="button" onClick={onDone} className="ml-2 h-8 rounded-md bg-[#477bea] px-3 text-white hover:bg-[#3d6ed7]">Done</button></div>;
 }
 
-function KnowledgeSearchOverlay({ request, notes, muses, projects, hideProjectColumn = false, onClose, onOpenPage, onOpenNote }: {
+function KnowledgeSearchOverlay({ request, notes, sharedNotes = [], muses, projects, hideProjectColumn = false, onClose, onOpenPage, onOpenNote }: {
   request: KnowledgeSearchRequest; notes: Note[]; muses: MuseMeta[]; projects: CortexProject[]; hideProjectColumn?: boolean; onClose: () => void; onOpenPage: (project: CortexProject, page: ProjectPage) => void; onOpenNote: (note: Note) => void;
+  /** Notes others shared with you, shown as their own group under a text search. */
+  sharedNotes?: Note[];
 }) {
   const [query, setQuery] = useState(request.query);
   const [filter, setFilter] = useState<KnowledgeFilter | undefined>(request.filter);
@@ -2389,6 +2564,10 @@ function KnowledgeSearchOverlay({ request, notes, muses, projects, hideProjectCo
     if (filter) return true;
     return !normalized || `${note.raw_text} ${note.category ?? ''}`.toLowerCase().includes(normalized);
   }), [filter, normalized, sortedNotes]);
+  // Only a text search reaches shared notes: the date and Domain filters are about your own.
+  const matchingShared = useMemo(() => (filter || !normalized ? [] : sharedNotes
+    .filter((note) => `${note.raw_text} ${note.shared_by ?? ''}`.toLowerCase().includes(normalized))
+    .sort((a, b) => b.created_at.localeCompare(a.created_at))), [filter, normalized, sharedNotes]);
   const matchingPages = useMemo(() => projects.flatMap((project) => project.pages.map((page) => ({ project, page }))).filter(({ page }) => {
     if (!normalized) return true;
     return `${page.title} ${page.content}`.toLowerCase().includes(normalized);
@@ -2409,7 +2588,7 @@ function KnowledgeSearchOverlay({ request, notes, muses, projects, hideProjectCo
         <div className="flex h-20 shrink-0 items-center border-b border-[#ddd] px-7 sm:px-10"><Search className="mr-4 h-6 w-6 shrink-0 text-[#aaa]" /><input autoFocus value={query} onChange={(event) => changeQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'Escape') onClose(); }} placeholder="Search notes, pages, and Domains" className="h-full min-w-0 flex-1 bg-transparent text-xl outline-none placeholder:text-[#b3b3b3] sm:text-2xl" />{filter && <button type="button" onClick={() => { setFilter(undefined); setQuery(''); }} className="rounded-full bg-[#edf3ff] px-3 py-1.5 text-xs text-[#477bea]">Clear {filter.kind === 'muse' ? 'domain' : filter.kind}</button>}</div>
         {!query.trim() && !filter ? <div className="min-h-0 flex-1 overflow-y-auto px-10 py-12 sm:px-16"><p className="text-sm text-[#aaa]">Recent</p><div className="mt-5 max-w-2xl space-y-1">{recentTerms.map((term) => <button key={term} type="button" onClick={() => setQuery(term)} className="block w-full rounded-lg px-1 py-3 text-left text-base text-[#555] hover:bg-[#f6f6f6] hover:px-3">{term}</button>)}</div></div> : <div className={`grid min-h-0 flex-1 overflow-y-auto lg:overflow-hidden ${showProjectColumn ? 'lg:grid-cols-[450px_minmax(0,1fr)]' : 'lg:grid-cols-1'}`}>
           {showProjectColumn && <aside className="border-b border-[#ddd] px-7 py-10 lg:overflow-y-auto lg:border-b-0 lg:border-r sm:px-10"><p className="mb-7 text-sm text-[#aaa]">Found in project pages</p><div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-1">{matchingPages.map(({ project, page }) => <button key={`${project.id}-${page.id}`} type="button" onClick={() => onOpenPage(project, page)} title={page.title || undefined} className="flex h-[300px] flex-col overflow-hidden rounded-lg border border-[#e3e3e5] bg-white p-7 text-left shadow-[0_2px_8px_rgba(0,0,0,0.1)] transition hover:-translate-y-0.5 hover:border-[#8fb1ff]"><strong className="line-clamp-2 shrink-0 text-base leading-snug"><HighlightedText text={page.title} query={query} /></strong><span className="mt-4 block min-h-0 flex-1 overflow-hidden"><span className="line-clamp-6 whitespace-pre-wrap text-sm leading-relaxed text-[#777]"><HighlightedText text={page.content || 'Empty page'} query={query} /></span></span><span className="mt-4 flex shrink-0 items-center justify-between gap-3 text-xs text-[#aaa]"><span className="min-w-0 truncate">{project.title}</span><span className="shrink-0">{formatDate(page.updatedAt)}</span></span></button>)}{!matchingPages.length && <p className="text-sm text-[#999] sm:col-span-2 lg:col-span-1">No project page contains this search.</p>}</div></aside>}
-          <section className="min-h-0 px-7 py-10 lg:overflow-y-auto sm:px-12"><p className="mb-7 text-sm text-[#aaa]">{heading}</p><div className={`grid gap-7 ${showProjectColumn ? 'xl:grid-cols-2' : 'lg:grid-cols-2 xl:grid-cols-3'}`}>{filteredNotes.map((item) => { const content = splitNote(item); const preview = content.body || notePreview(item); return <button key={item.id} type="button" onClick={() => onOpenNote(item)} title={content.title || undefined} className="flex h-[280px] flex-col overflow-hidden rounded-lg border border-[#e3e3e5] bg-white p-6 text-left shadow-[0_2px_8px_rgba(0,0,0,0.1)] transition hover:-translate-y-0.5 hover:border-[#8fb1ff]">{content.hasTitle && <strong className="line-clamp-2 shrink-0 text-base leading-snug"><HighlightedText text={defaultNoteTitle(content.title)} query={filter ? '' : query} /></strong>}<span className="mt-4 block min-h-0 flex-1 overflow-hidden"><span className="line-clamp-5 text-sm leading-relaxed text-[#777]"><HighlightedText text={preview} query={filter ? '' : query} /></span></span><span className="mt-4 flex shrink-0 items-center justify-between gap-3 text-xs text-[#aaa]"><span className="min-w-0 truncate">{cleanCategory(item.category) || ORPHANS_MUSE}</span><span className="shrink-0">{formatDate(item.created_at)}</span></span></button>; })}{!filteredNotes.length && <p className="text-sm text-[#999] xl:col-span-2">No notes match this search.</p>}</div></section>
+          <section className="min-h-0 px-7 py-10 lg:overflow-y-auto sm:px-12"><p className="mb-7 text-sm text-[#aaa]">{heading}</p><div className={`grid gap-7 ${showProjectColumn ? 'xl:grid-cols-2' : 'lg:grid-cols-2 xl:grid-cols-3'}`}>{filteredNotes.map((item) => { const content = splitNote(item); const preview = content.body ? previewNoteText(content.body) : notePreview(item); return <button key={item.id} type="button" onClick={() => onOpenNote(item)} title={content.title || undefined} className="flex h-[280px] flex-col overflow-hidden rounded-lg border border-[#e3e3e5] bg-white p-6 text-left shadow-[0_2px_8px_rgba(0,0,0,0.1)] transition hover:-translate-y-0.5 hover:border-[#8fb1ff]">{content.hasTitle && <strong className="line-clamp-2 shrink-0 text-base leading-snug"><HighlightedText text={defaultNoteTitle(content.title)} query={filter ? '' : query} /></strong>}<span className="mt-4 block min-h-0 flex-1 overflow-hidden"><span className="line-clamp-5 text-sm leading-relaxed text-[#777]"><HighlightedText text={preview} query={filter ? '' : query} /></span></span><span className="mt-4 flex shrink-0 items-center justify-between gap-3 text-xs text-[#aaa]"><span className="min-w-0 truncate">{cleanCategory(item.category) || ORPHANS_MUSE}</span><span className="shrink-0">{formatDate(item.created_at)}</span></span></button>; })}{!filteredNotes.length && <p className="text-sm text-[#999] xl:col-span-2">No notes match this search.</p>}</div>{matchingShared.length > 0 && <><p className="mb-7 mt-12 text-sm text-[#aaa]">Shared with me</p><div className={`grid gap-7 ${showProjectColumn ? 'xl:grid-cols-2' : 'lg:grid-cols-2 xl:grid-cols-3'}`}>{matchingShared.map((item) => <LibraryNoteCard key={item.id} note={item} query={query} layout="search" onClick={() => onOpenNote(item)} />)}</div></>}</section>
         </div>}
       </div>
     </div>
@@ -2602,7 +2781,15 @@ type TriggerSentence = { before: string; key: string; after: string };
 function triggerSentence(text: string, span: { start: number; end: number }): TriggerSentence {
   const start = sentenceStartBefore(text, span.start);
   const end = sentenceEndAfter(text, span.end);
-  return { before: text.slice(start, span.start), key: text.slice(span.start, span.end), after: text.slice(span.end, end) };
+  // The offsets point into the note's markdown, so each piece is cleaned on its
+  // own: a line marker can only open the sentence, and bold markers can sit on
+  // either side of the highlighted words.
+  const rawBefore = text.slice(start, span.start);
+  const opensLine = start === 0 || text[start - 1] === '\n';
+  const before = stripInlineMarkdown(opensLine ? rawBefore.replace(LINE_MARKER, '') : rawBefore).trimStart();
+  const rawKey = text.slice(span.start, span.end);
+  const key = stripInlineMarkdown(opensLine && !rawBefore.trim() ? rawKey.replace(LINE_MARKER, '') : rawKey);
+  return { before, key, after: stripInlineMarkdown(text.slice(span.end, end)).trimEnd() };
 }
 
 function sentenceCase(text: string): string {
@@ -2615,10 +2802,10 @@ function sentenceCase(text: string): string {
  */
 function InsightSentence({ insight, kind, onOpenSource }: { insight: NoteInsight; kind: SuggestionKind; onOpenSource: (noteId: string, focus?: string) => void }) {
   const quotes = insight.quotes ?? [];
-  if (!quotes.length) return <>{insight.text}</>;
+  if (!quotes.length) return <>{stripInlineMarkdown(insight.text)}</>;
   return <>{insight.text.split(/(\{\d+\})/).map((part, index) => {
     const quote = /^\{\d+\}$/.test(part) ? quotes[Number(part.slice(1, -1)) - 1] : undefined;
-    if (!quote) return <Fragment key={index}>{part}</Fragment>;
+    if (!quote) return <Fragment key={index}>{stripInlineMarkdown(part)}</Fragment>;
     const open = () => onOpenSource(quote.note_id, quote.text);
     // A span, not a button: browsers lay a button out as one block, so a long
     // quote filled the line and pushed the punctuation after it onto its own.
@@ -2635,7 +2822,7 @@ function InsightSentence({ insight, kind, onOpenSource }: { insight: NoteInsight
       }}
       title="Open the note this came from"
       className={`cursor-pointer rounded-sm font-semibold underline decoration-2 underline-offset-4 [box-decoration-break:clone] hover:bg-black/[0.04] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${SUGGESTION_STYLES[kind].quote}`}
-    >‘{quote.text}’</span>;
+    >‘{plainNoteText(quote.text)}’</span>;
   })}</>;
 }
 
@@ -2658,13 +2845,15 @@ function IconChoice({ kind, accept, label, onClick }: { kind: SuggestionKind; ac
  * The action under a card. Nothing here edits the note: every choice is kept
  * beside it and drawn over it, and every choice can be undone.
  */
-function CardAction({ insight, kind, decision, sourceTitle, sourceDate, outbound, onChoose, onOpenSource }: {
+function CardAction({ insight, kind, decision, sourceTitle, sourceDate, sharedBy = null, outbound, onChoose, onOpenSource }: {
   insight: NoteInsight;
   kind: SuggestionKind;
   /** True when this note is the help and the earlier note is the one helped. */
   outbound: boolean;
   decision?: CardDecision;
   sourceTitle: string;
+  /** Who shared the note the card rests on, when it is someone else's. */
+  sharedBy?: string | null;
   sourceDate: string;
   onChoose: (choice: CardChoice | null, text?: string) => void;
   onOpenSource: (noteId: string, focus?: string) => void;
@@ -2703,7 +2892,7 @@ function CardAction({ insight, kind, decision, sourceTitle, sourceDate, outbound
   }
 
   if (kind === 'solution') {
-    const answerText = answer?.text ?? insight.action;
+    const answerText = plainNoteText(answer?.text ?? insight.action);
     if (choice === 'solved') return <div className={box}>
       <p className={`flex items-center gap-1.5 ${heading}`}><Check className="h-3.5 w-3.5" /> Solved · shown beside your sentence</p>
       <p className="mt-1 text-[14px] leading-relaxed text-[#26467a]">{answerText}</p>
@@ -2712,7 +2901,7 @@ function CardAction({ insight, kind, decision, sourceTitle, sourceDate, outbound
     return <div className={box}>
       <p className={heading}>Solution</p>
       <p className="mt-1 text-[15px] leading-relaxed text-[#26467a]">{answerText}</p>
-      {answer && <button type="button" onClick={(event) => { event.stopPropagation(); openAnswer(); }} className="mt-1 text-[11px] text-[#5b7fc9] hover:underline">From “{sourceTitle}” · {sourceDate} ↗</button>}
+      {answer && <button type="button" onClick={(event) => { event.stopPropagation(); openAnswer(); }} className="mt-1 text-[11px] text-[#5b7fc9] hover:underline">From {sharedBy ? `${sharedBy}’s ` : ''}“{sourceTitle}” · {sourceDate} ↗</button>}
       <div className="mt-3 flex gap-2">
         <button type="button" onClick={(event) => { event.stopPropagation(); onChoose('solved'); }} className="rounded-md bg-[#477bea] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#3d6ed7] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] focus-visible:ring-offset-2">Solved</button>
         <button type="button" onClick={(event) => { event.stopPropagation(); onChoose('downgraded'); }} className="rounded-md bg-white px-3 py-1.5 text-xs font-medium text-[#666] shadow-sm hover:bg-[#f5f5f5]">Dismiss</button>
@@ -2723,7 +2912,7 @@ function CardAction({ insight, kind, decision, sourceTitle, sourceDate, outbound
   if (kind === 'helps' && outbound) {
     // This note is the help and the earlier note is where it applies, so the
     // wording says so rather than reading as advice for this note.
-    const idea = sentenceCase(insight.action);
+    const idea = sentenceCase(plainNoteText(insight.action));
     if (choice === 'helped') return <div className={box}>
       <p className={`flex items-center gap-1.5 ${heading}`}><Check className="h-3.5 w-3.5" /> Marked as helping “{sourceTitle}”</p>
       <p className="mt-1 text-[14px] font-medium leading-relaxed text-[#1f4d2e]">{idea}</p>
@@ -2741,7 +2930,7 @@ function CardAction({ insight, kind, decision, sourceTitle, sourceDate, outbound
 
   if (kind === 'helps') {
     // A dismissed solution has no idea of its own, so its answer stands in.
-    const idea = insight.kind === 'helps' ? sentenceCase(insight.action) : `“${answer?.text ?? insight.action}”`;
+    const idea = insight.kind === 'helps' ? sentenceCase(plainNoteText(insight.action)) : `“${plainNoteText(answer?.text ?? insight.action)}”`;
     if (choice === 'helped') return <div className={box}>
       <p className={`flex items-center gap-1.5 ${heading}`}><Check className="h-3.5 w-3.5" /> Shown beside your sentence</p>
       <p className="mt-1 text-[14px] font-medium leading-relaxed text-[#1f4d2e]">{idea}</p>
@@ -2758,7 +2947,8 @@ function CardAction({ insight, kind, decision, sourceTitle, sourceDate, outbound
   }
 
   if (kind === 'extension') {
-    const words = answer?.text ?? insight.action;
+    // Merged words are kept as plain text, so neither the card, the note, nor Edit shows markdown symbols.
+    const words = plainNoteText(answer?.text ?? insight.action);
     if (choice === 'merged') return <div className={box}>
       <p className={`flex items-center gap-1.5 ${heading}`}><Check className="h-3.5 w-3.5" /> Added below your sentence</p>
       {editing
@@ -2769,14 +2959,14 @@ function CardAction({ insight, kind, decision, sourceTitle, sourceDate, outbound
             <button type="button" onClick={(event) => { event.stopPropagation(); setEditing(false); setDraft(decision?.text ?? ''); }} className="text-xs text-[#777] hover:underline">Cancel</button>
           </div>
         </>
-        : <p className="mt-1 whitespace-pre-wrap text-[14px] leading-relaxed text-[#4d3569]">“{decision?.text ?? words}”</p>}
-      {!editing && <div className="mt-2 flex gap-3"><button type="button" onClick={(event) => { event.stopPropagation(); setEditing(true); }} className="text-xs font-medium text-[#7348a7] hover:underline">Edit</button><UndoButton onUndo={() => onChoose(null)} /></div>}
+        : <p className="mt-1 whitespace-pre-wrap text-[14px] leading-relaxed text-[#4d3569]">“{plainNoteText(decision?.text ?? words)}”</p>}
+      {!editing && <div className="mt-2 flex gap-3"><button type="button" onClick={(event) => { event.stopPropagation(); setDraft(plainNoteText(decision?.text ?? words)); setEditing(true); }} className="text-xs font-medium text-[#7348a7] hover:underline">Edit</button><UndoButton onUndo={() => onChoose(null)} /></div>}
     </div>;
     return <div className={`${box} flex items-center gap-3`}>
       <div className="min-w-0 flex-1">
         <p className={heading}>Merge adds to your note</p>
         <p className="mt-1 text-[14px] leading-relaxed text-[#4d3569]">“{words}”</p>
-        <p className="mt-1 text-[11px] text-[#9a7fbf]">Word for word, linked to {sourceDate}</p>
+        <p className="mt-1 text-[11px] text-[#9a7fbf]">Word for word{sharedBy ? ` from ${sharedBy}` : ''}, linked to {sourceDate}</p>
       </div>
       <IconChoice kind={kind} accept={false} label="Dismiss" onClick={() => onChoose('rejected')} />
       <button type="button" onClick={(event) => { event.stopPropagation(); onChoose('merged', words); }} className="shrink-0 rounded-md bg-[#8254b5] px-4 py-2 text-xs font-medium text-white hover:bg-[#70449f] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#8254b5] focus-visible:ring-offset-2">Merge</button>
@@ -2786,7 +2976,7 @@ function CardAction({ insight, kind, decision, sourceTitle, sourceDate, outbound
   if (kind === 'contradiction') {
     const options: { choice: CardChoice; label: string }[] = [
       { choice: 'today', label: 'Today stands' },
-      { choice: 'earlier', label: `${sourceTitle} holds` },
+      { choice: 'earlier', label: sharedBy ? `${sharedBy}’s view holds` : `${sourceTitle} holds` },
       { choice: 'both', label: 'Both are true' },
     ];
     return <div className={box}>
@@ -2811,13 +3001,13 @@ function CardAction({ insight, kind, decision, sourceTitle, sourceDate, outbound
 
   if (choice === 'confirmed') return <div className={box}>
     <p className={`flex items-center gap-1.5 ${heading}`}><Check className="h-3.5 w-3.5" /> Marked as a pattern</p>
-    <p className="mt-1 text-[14px] font-medium leading-relaxed text-[#4f3f0c]">{insight.action}</p>
+    <p className="mt-1 text-[14px] font-medium leading-relaxed text-[#4f3f0c]">{plainNoteText(insight.action)}</p>
     <div className="mt-2"><UndoButton onUndo={() => onChoose(null)} /></div>
   </div>;
   return <div className={`${box} flex items-center gap-3`}>
     <div className="min-w-0 flex-1">
       <p className={heading}>A pattern in your notes</p>
-      <p className="mt-1 text-[15px] font-semibold leading-relaxed text-[#4f3f0c]">{insight.action}</p>
+      <p className="mt-1 text-[15px] font-semibold leading-relaxed text-[#4f3f0c]">{plainNoteText(insight.action)}</p>
     </div>
     <IconChoice kind={kind} accept={false} label="Not a pattern" onClick={() => onChoose('rejected')} />
     <IconChoice kind={kind} accept label="Yes, a pattern" onClick={() => onChoose('confirmed')} />
@@ -2912,11 +3102,11 @@ function SuggestionCard({ insight, kind, decision, notesById, trigger, outbound 
       </div>
       {(trigger || insight.anchor) && <blockquote className="mt-3 border-l-2 border-[#ddd] pl-3 text-[13px] italic leading-relaxed text-[#777]">“{trigger
         ? <>{trigger.before}<span className={`rounded-sm px-0.5 not-italic text-[#444] ${HIGHLIGHT_STYLES[kind].idle}`}>{trigger.key}</span>{trigger.after}</>
-        : insight.anchor}”</blockquote>}
+        : plainNoteText(insight.anchor)}”</blockquote>}
       <p className={`mt-4 leading-relaxed text-[#222] ${compact ? 'text-[14px]' : 'text-[16px]'}`}><InsightSentence insight={insight} kind={kind} onOpenSource={onOpenSource} /></p>
-      {source && <p className="mt-2 text-[11px] text-[#999]">{outbound ? 'The earlier note this helps' : 'From your notes'}: “{sourceTitle}” · {sourceDate}</p>}
+      {source && <p className="mt-2 text-[11px] text-[#999]">{outbound ? 'The earlier note this helps' : source.shared_by ? `From ${source.shared_by}’s notes` : 'From your notes'}: “{sourceTitle}” · {sourceDate}</p>}
       {onChoose
-        ? <CardAction insight={insight} kind={kind} decision={decision} sourceTitle={sourceTitle} sourceDate={sourceDate} outbound={outbound} onChoose={onChoose} onOpenSource={onOpenSource} />
+        ? <CardAction insight={insight} kind={kind} decision={decision} sourceTitle={sourceTitle} sourceDate={sourceDate} sharedBy={source?.shared_by ?? null} outbound={outbound} onChoose={onChoose} onOpenSource={onOpenSource} />
         : <p className="mt-3 text-[11px] text-[#999]">Save the note to act on this.</p>}
       {cited.length > 0 && <div className="mt-4 flex flex-wrap items-center justify-center gap-x-3 gap-y-1 border-t border-[#ececef] pt-3 text-[11px] text-[#999]">
         <span>{outbound ? 'Where this applies' : 'Notes used'}</span>
@@ -3201,7 +3391,8 @@ function NoteEditor({ state, muses, notes, saving, error, onChange, onCreateMuse
   onChange: (state: NoteEditorState) => void; onCreateMuse: (title: string) => void;
   onClose: () => void; onSave: () => void; onFindRelevantNotes: () => void; onImport: () => void; onDelete?: () => void;
 }) {
-  const bodyRef = useRef<HTMLTextAreaElement>(null);
+  const bodyRef = useRef<NoteBodyEditorHandle>(null);
+  const [activeFormats, setActiveFormats] = useState<NoteFormat[]>([]);
   const speechRef = useRef<SpeechRecognitionLike | null>(null);
   const museMenuRef = useRef<HTMLDivElement>(null);
   const [dictating, setDictating] = useState(false);
@@ -3278,23 +3469,7 @@ function NoteEditor({ state, muses, notes, saving, error, onChange, onCreateMuse
     }
   };
 
-  const applyFormat = (kind: 'bold' | 'italic' | 'h1' | 'h2' | 'h3' | 'body' | 'bullet' | 'number') => {
-    const field = bodyRef.current;
-    if (!field) return;
-    const start = field.selectionStart; const end = field.selectionEnd;
-    const selection = state.body.slice(start, end);
-    let replacement = selection;
-    if (kind === 'bold') replacement = `**${selection || 'bold text'}**`;
-    if (kind === 'italic') replacement = `*${selection || 'italic text'}*`;
-    if (kind === 'h1') replacement = `# ${selection || 'Heading'}`;
-    if (kind === 'h2') replacement = `## ${selection || 'Heading'}`;
-    if (kind === 'h3') replacement = `### ${selection || 'Heading'}`;
-    if (kind === 'body') replacement = selection.replace(/^#{1,3}\s+/gm, '');
-    if (kind === 'bullet') replacement = (selection || 'List item').split('\n').map((line) => `• ${line.replace(/^[-•]\s*/, '')}`).join('\n');
-    if (kind === 'number') replacement = (selection || 'List item').split('\n').map((line, index) => `${index + 1}. ${line.replace(/^\d+\.\s*/, '')}`).join('\n');
-    onChange({ ...state, body: `${state.body.slice(0, start)}${replacement}${state.body.slice(end)}` });
-    requestAnimationFrame(() => { field.focus(); field.setSelectionRange(start, start + replacement.length); });
-  };
+  const applyFormat = (kind: NoteFormat) => bodyRef.current?.format(kind);
 
   const toggleDictation = () => {
     if (speechRef.current && dictating) { speechRef.current.stop(); return; }
@@ -3342,17 +3517,17 @@ function NoteEditor({ state, muses, notes, saving, error, onChange, onCreateMuse
         <div className="relative flex min-h-0 flex-1">
           <div className={`flex min-h-0 min-w-0 flex-1 flex-col ${domainCapture ? 'items-center px-8 pb-8 pt-[10vh]' : 'px-8 pb-5 pt-10 sm:px-16 sm:pt-12'}`}>
             <input value={state.title} onFocus={() => setEditingStarted(true)} onChange={(event) => onChange({ ...state, title: event.target.value })} onKeyDown={(event) => { if (event.key === 'Enter') { event.preventDefault(); setEditingStarted(true); bodyRef.current?.focus(); } }} placeholder={domainCapture ? 'Title' : 'What’s on your mind?'} aria-label="Note title" className={`w-full shrink-0 bg-transparent outline-none placeholder:text-[#555] ${domainCapture ? 'max-w-2xl text-xl font-semibold sm:text-2xl' : 'text-xl font-medium italic sm:text-2xl'}`} />
-            <textarea ref={bodyRef} value={state.body} onFocus={() => setEditingStarted(true)} onChange={(event) => onChange({ ...state, body: event.target.value })} placeholder={editingStarted ? '' : domainCapture ? 'Knowledge is what makes people special, and special people do special things, so make this one count.' : "For example: Someone made the point that we mostly don't choose our beliefs, we absorb them and backfill reasons after. Uncomfortable but I can't argue with it. Makes me wonder how much of what I think is actually mine."} aria-label="Note body" className={`mt-5 min-h-0 w-full flex-1 resize-none bg-transparent text-base leading-relaxed outline-none placeholder:text-[#aaa] ${domainCapture ? 'max-w-2xl sm:text-lg sm:leading-[1.65]' : ''}`} />
+            <NoteBodyEditor ref={bodyRef} value={state.body} onFocus={() => setEditingStarted(true)} onChange={(body) => onChange({ ...state, body })} placeholder={editingStarted ? '' : domainCapture ? 'Knowledge is what makes people special, and special people do special things, so make this one count.' : "For example: Someone made the point that we mostly don't choose our beliefs, we absorb them and backfill reasons after. Uncomfortable but I can't argue with it. Makes me wonder how much of what I think is actually mine."} ariaLabel="Note body" onActiveFormatsChange={setActiveFormats} wrapperClassName={`mt-5 min-h-0 w-full flex-1 overflow-y-auto ${domainCapture ? 'max-w-2xl' : ''}`} className={`min-h-full w-full bg-transparent text-base leading-relaxed ${domainCapture ? 'sm:text-lg sm:leading-[1.65]' : ''}`} />
           </div>
           {panelOpen && <RelevantNotesPanel notes={notes} relevance={relevance} loading={relevanceLoading} progress={relevanceProgress} error={relevanceError} stale={draftChangedSinceSearch} page={relevancePage} onPageChange={setRelevancePage} onRetry={() => void runRelevanceSearch()} onClose={() => setPanelOpen(false)} />}
         </div>
         <div className={`relative border-t border-[#eee] bg-[#f8f8fa] px-3 py-2 text-sm text-[#555] sm:px-5 ${domainCapture ? 'flex min-h-[62px] flex-col items-stretch gap-2 lg:flex-row lg:items-center lg:gap-1' : 'flex min-h-[58px] flex-wrap items-center gap-1'}`}>
           <div className={`${domainCapture ? 'flex w-full min-w-0 items-center gap-1 overflow-x-auto pb-1 lg:flex-1 lg:overflow-visible lg:pb-0' : 'contents'}`}>
             <button type="button" onClick={toggleDictation} aria-label={dictating ? 'Stop dictation' : 'Start dictation'} className={`mr-3 rounded p-2 hover:bg-white ${dictating ? 'text-red-600' : ''}`}><Mic className="h-4 w-4" /></button><span className="mr-3 h-7 w-px bg-[#ddd]" />
-            <button type="button" onClick={() => applyFormat('bold')} aria-label="Bold" className="rounded p-2 font-bold hover:bg-white"><Bold className="h-4 w-4" /></button>
-            <button type="button" onClick={() => applyFormat('italic')} aria-label="Italic" className="rounded p-2 italic hover:bg-white"><Italic className="h-4 w-4" /></button><span className="mx-2 h-7 w-px bg-[#ddd]" />
-            <button type="button" onClick={() => applyFormat('h1')} className="rounded px-2 py-1.5 font-semibold hover:bg-white">H1</button><button type="button" onClick={() => applyFormat('h2')} className="rounded px-2 py-1.5 font-semibold hover:bg-white">H2</button><button type="button" onClick={() => applyFormat('h3')} className="rounded px-2 py-1.5 font-semibold hover:bg-white">H3</button><button type="button" onClick={() => applyFormat('body')} className="rounded px-2 py-1.5 hover:bg-white">Body</button><span className="mx-2 hidden h-7 w-px bg-[#ddd] lg:block" />
-            <button type="button" onClick={() => applyFormat('bullet')} className="hidden items-center gap-1 rounded px-2 py-1.5 hover:bg-white sm:flex"><List className="h-4 w-4" /> Bullet list</button><button type="button" onClick={() => applyFormat('number')} className="hidden items-center gap-1 rounded px-2 py-1.5 hover:bg-white md:flex"><ListOrdered className="h-4 w-4" /> Numbered list</button>
+            <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applyFormat('bold')} aria-pressed={activeFormats.includes('bold')} aria-label="Bold" className={`rounded p-2 font-bold hover:bg-white ${activeFormats.includes('bold') ? 'bg-white text-[#477bea] shadow-sm' : ''}`}><Bold className="h-4 w-4" /></button>
+            <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applyFormat('italic')} aria-pressed={activeFormats.includes('italic')} aria-label="Italic" className={`rounded p-2 italic hover:bg-white ${activeFormats.includes('italic') ? 'bg-white text-[#477bea] shadow-sm' : ''}`}><Italic className="h-4 w-4" /></button><span className="mx-2 h-7 w-px bg-[#ddd]" />
+            <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applyFormat('h1')} className="rounded px-2 py-1.5 font-semibold hover:bg-white">H1</button><button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applyFormat('h2')} className="rounded px-2 py-1.5 font-semibold hover:bg-white">H2</button><button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applyFormat('h3')} className="rounded px-2 py-1.5 font-semibold hover:bg-white">H3</button><button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applyFormat('body')} className="rounded px-2 py-1.5 hover:bg-white">Body</button><span className="mx-2 hidden h-7 w-px bg-[#ddd] lg:block" />
+            <button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applyFormat('bullet')} className="hidden items-center gap-1 rounded px-2 py-1.5 hover:bg-white sm:flex"><List className="h-4 w-4" /> Bullet list</button><button type="button" onMouseDown={(event) => event.preventDefault()} onClick={() => applyFormat('number')} className="hidden items-center gap-1 rounded px-2 py-1.5 hover:bg-white md:flex"><ListOrdered className="h-4 w-4" /> Numbered list</button>
             <span className="mx-2 h-7 w-px bg-[#ddd]" />
           </div>
           <div className={`${domainCapture ? 'flex w-full items-center gap-2 lg:w-auto lg:gap-1' : 'contents'}`}>

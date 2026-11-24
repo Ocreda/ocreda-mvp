@@ -231,6 +231,45 @@ function json(body: unknown, status = 200): Response {
   });
 }
 
+/**
+ * Notes others shared with the person, from the vaults they use in retrieval
+ * (docs/shared-note-vaults-plan.md), each marked with who shared it. Empty
+ * before the vaults migration is applied, or when nothing is shared.
+ */
+async function loadSharedNotes(
+  supabase: ReturnType<typeof createClient>,
+  limit: number,
+  excludeNoteId: string | null,
+): Promise<NoteLike[]> {
+  if (limit <= 0) return [];
+  const { data: vaults, error: vaultsError } = await supabase
+    .from("vaults")
+    .select("id, name")
+    .eq("use_in_retrieval", true);
+  if (vaultsError || !vaults?.length) {
+    if (vaultsError) console.error("find-relevant-notes could not read vaults:", vaultsError.message);
+    return [];
+  }
+  const names = new Map((vaults as Array<{ id: string; name: string }>).map((vault) => [vault.id, vault.name]));
+  let query = supabase
+    .from("notes")
+    .select(`${BASE_NOTE_COLUMNS}, vault_id`)
+    .in("vault_id", Array.from(names.keys()))
+    .order("created_at", { ascending: false })
+    .limit(limit);
+  if (excludeNoteId) query = query.neq("id", excludeNoteId);
+  const { data, error } = await query;
+  if (error) {
+    console.error("find-relevant-notes could not read shared notes:", error.message);
+    return [];
+  }
+  return ((data ?? []) as Array<NoteLike & { vault_id: string }>).map(({ vault_id, ...note }) => ({
+    ...note,
+    category: null,
+    shared_by: names.get(vault_id) ?? "Someone",
+  }));
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
@@ -275,6 +314,7 @@ Deno.serve(async (req: Request) => {
         .select(columns)
         .eq("user_id", userId)
         .eq("is_sample", samples)
+        .is("vault_id", null)
         .order("created_at", { ascending: false })
         .limit(MAX_NOTES);
       if (excludeNoteId) query = query.neq("id", excludeNoteId);
@@ -285,6 +325,11 @@ Deno.serve(async (req: Request) => {
     // no category column, so fall back without it, as lib/notes-api.ts does.
     // The goal still applies; only the Domain's recent notes go missing.
     // Read alongside the notes, so it adds no time to the search.
+    // A note someone shared is never searched itself: it can only inform drafts.
+    if (excludeNoteId) {
+      const { data: draftNote } = await supabase.from("notes").select("vault_id").eq("id", excludeNoteId).maybeSingle();
+      if (draftNote?.vault_id) return json({ error: "A note someone shared with you is not searched itself." }, 400);
+    }
     const historyLoad = loadCardHistory(supabase).catch((error) => {
       console.error("find-relevant-notes could not read card choices:", errorMessage(error));
       return EMPTY_CARD_HISTORY;
@@ -293,7 +338,12 @@ Deno.serve(async (req: Request) => {
     if (loaded.error && isMissingCategoryColumn(loaded.error)) loaded = await loadNotes(BASE_NOTE_COLUMNS);
     if (loaded.error) throw new Error(`Loading notes failed: ${loaded.error.message}`);
 
-    const notes = (loaded.data ?? []) as unknown as NoteLike[];
+    const ownNotes = (loaded.data ?? []) as unknown as NoteLike[];
+    // Your own notes come first and are always searched. Notes others shared
+    // with you fill what is left of the budget, newest first, from the vaults
+    // used in retrieval, so a large vault never pushes your own notes out.
+    const sharedNotes = samples ? [] : await loadSharedNotes(supabase, MAX_NOTES - ownNotes.length, excludeNoteId);
+    const notes = [...ownNotes, ...sharedNotes];
     if (notes.length === 0) {
       return json({
         results: [],

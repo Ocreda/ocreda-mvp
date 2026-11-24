@@ -59,6 +59,8 @@ Deno.serve(async (req: Request) => {
       .select("id, raw_text, summary, target_date, time_of_day")
       .eq("user_id", user_id)
       .eq("is_sample", samples === true)
+      // Notes others shared with them are only for drafts' searches.
+      .is("vault_id", null)
       .order("created_at", { ascending: false })
       .limit(300);
 

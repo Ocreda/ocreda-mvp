@@ -64,12 +64,86 @@ function newNote(rawText: string, category: string | null, isSample = getSampleM
   };
 }
 
-/** Only one set at a time, as on the server: the sample notes while exploring them, otherwise your own. */
+/**
+ * Only one set at a time, as on the server: the sample notes while exploring
+ * them, otherwise your own. Notes shared with you live in vaults, apart.
+ */
 export function localGetNotes(): Note[] {
   const samples = getSampleMode(LOCAL_USER_ID);
   return readAll()
-    .filter((note) => Boolean(note.is_sample) === samples)
+    .filter((note) => Boolean(note.is_sample) === samples && !note.vault_id)
     .sort((a, b) => b.created_at.localeCompare(a.created_at));
+}
+
+// ── Vaults: notes shared with you, one vault per person who shared ───────────
+
+export type LocalVault = {
+  id: string;
+  /** Who shared. Local mode has one account, so links name the sharer instead. */
+  sharerKey: string;
+  name: string;
+  useInRetrieval: boolean;
+  linkId: string | null;
+  linkCreatedAt: string | null;
+  acceptedAt: string;
+};
+
+const VAULTS_KEY = 'ocreda-local-vaults';
+
+export function localReadVaults(): LocalVault[] {
+  if (typeof window === 'undefined') return [];
+  try {
+    const parsed = JSON.parse(localStorage.getItem(VAULTS_KEY) ?? '[]');
+    return Array.isArray(parsed) ? (parsed as LocalVault[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeVaults(vaults: LocalVault[]): void {
+  localStorage.setItem(VAULTS_KEY, JSON.stringify(vaults));
+}
+
+/** Every vault's notes, newest first, each marked with who shared it. */
+export function localVaultNotes(): Note[] {
+  const names = new Map(localReadVaults().map((vault) => [vault.id, vault.name]));
+  return readAll()
+    .filter((note) => note.vault_id && names.has(note.vault_id))
+    .map((note) => ({ ...note, shared_by: names.get(note.vault_id!) ?? null, category: null }))
+    .sort((a, b) => b.created_at.localeCompare(a.created_at));
+}
+
+export function localSetVaultInRetrieval(vaultId: string, on: boolean): void {
+  writeVaults(localReadVaults().map((vault) => vault.id === vaultId ? { ...vault, useInRetrieval: on } : vault));
+}
+
+export function localRemoveVault(vaultId: string): void {
+  writeVaults(localReadVaults().filter((vault) => vault.id !== vaultId));
+  writeAll(readAll().filter((note) => note.vault_id !== vaultId));
+}
+
+/** As accept_shared_link does on the server: added, updated, already, or older. */
+export function localAcceptIntoVault(link: { id: string; createdAt: string; sharerKey: string; sharerName: string; notes: Array<{ rawText: string; notedAt: string }> }): { vaultId: string; vaultName: string; status: 'added' | 'updated' | 'already' | 'older'; notes: number } {
+  const vaults = localReadVaults();
+  const existing = vaults.find((vault) => vault.sharerKey === link.sharerKey);
+  if (existing && existing.linkId === link.id) return { vaultId: existing.id, vaultName: existing.name, status: 'already', notes: 0 };
+  if (existing && existing.linkCreatedAt && existing.linkCreatedAt > link.createdAt) return { vaultId: existing.id, vaultName: existing.name, status: 'older', notes: 0 };
+  const vault: LocalVault = existing
+    ? { ...existing, name: link.sharerName, linkId: link.id, linkCreatedAt: link.createdAt, acceptedAt: new Date().toISOString() }
+    : { id: crypto.randomUUID(), sharerKey: link.sharerKey, name: link.sharerName, useInRetrieval: true, linkId: link.id, linkCreatedAt: link.createdAt, acceptedAt: new Date().toISOString() };
+  writeVaults([...vaults.filter((item) => item.id !== vault.id), vault]);
+  const texts = new Set(link.notes.map((note) => note.rawText));
+  // Notes no longer shared go; unchanged ones keep their id.
+  const kept = readAll().filter((note) => note.vault_id !== vault.id || texts.has(note.raw_text));
+  const have = new Set(kept.filter((note) => note.vault_id === vault.id).map((note) => note.raw_text));
+  const added: Note[] = [];
+  link.notes.forEach((shared) => {
+    if (have.has(shared.rawText)) return;
+    have.add(shared.rawText);
+    added.push({ ...newNote(shared.rawText, null, false), vault_id: vault.id, created_at: shared.notedAt });
+  });
+  writeAll([...added, ...kept]);
+  return { vaultId: vault.id, vaultName: vault.name, status: existing ? 'updated' : 'added', notes: added.length };
 }
 
 /** Saves the sample vault, with the dates it should appear to have been written on. */
@@ -103,6 +177,7 @@ export function localUpdateNote(noteId: string, rawText: string, category?: stri
   const notes = readAll();
   const index = notes.findIndex((note) => note.id === noteId);
   if (index === -1) throw new Error('Note not found');
+  if (notes[index].vault_id && rawText !== notes[index].raw_text) throw new Error('Shared notes cannot be changed');
   const updated: Note = {
     ...notes[index],
     raw_text: rawText,
@@ -153,7 +228,10 @@ export async function localFindRelevantNotes(
   domain?: DomainGoal | null,
   signal?: AbortSignal,
 ): Promise<RelevantNotesResponse> {
-  const notes = localGetNotes()
+  // Your own notes first, then the vaults you use in retrieval, as on the server.
+  const inRetrieval = new Set(localReadVaults().filter((vault) => vault.useInRetrieval).map((vault) => vault.id));
+  const shared = localVaultNotes().filter((note) => note.vault_id && inRetrieval.has(note.vault_id));
+  const notes = [...localGetNotes(), ...(getSampleMode(LOCAL_USER_ID) ? [] : shared)]
     .filter((note) => note.id !== excludeNoteId)
     .map((note) => ({
       id: note.id,
@@ -161,6 +239,7 @@ export async function localFindRelevantNotes(
       summary: note.summary,
       created_at: note.created_at,
       category: note.category,
+      shared_by: note.shared_by ?? null,
     }));
 
   const response = await fetch('/api/find-relevant-notes', {

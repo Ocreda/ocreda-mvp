@@ -12,7 +12,9 @@
     "typecheck": "tsc --noEmit",
     "build:functions": "tsc supabase/functions/_shared/relevance.ts supabase/functions/_shared/gemini.ts --outDir .relevance-build --module commonjs --target es2020 --skipLibCheck",
     "try:relevance": "npm run build:functions && node scripts/try-relevance.cjs",
-    "test:relevance": "npm run build:functions && node scripts/relevance.test.cjs"
+    "test:relevance": "npm run build:functions && node scripts/relevance.test.cjs",
+    "build:note-markdown": "tsc lib/note-markdown.ts lib/note-editor-extensions.ts lib/sample-vault-data.ts --outDir .note-markdown-build --module commonjs --target es2020 --moduleResolution node --esModuleInterop --skipLibCheck",
+    "test:note-markdown": "npm run build:note-markdown && node scripts/note-markdown-roundtrip.test.cjs"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.0",
@@ -46,6 +48,16 @@
     "@radix-ui/react-tooltip": "^1.1.2",
     "@supabase/ssr": "^0.12.3",
     "@supabase/supabase-js": "^2.109.0",
+    "@tiptap/core": "2.27.2",
+    "@tiptap/extension-bold": "2.27.2",
+    "@tiptap/extension-heading": "2.27.2",
+    "@tiptap/extension-italic": "2.27.2",
+    "@tiptap/extension-list-item": "2.27.2",
+    "@tiptap/extension-ordered-list": "2.27.2",
+    "@tiptap/extension-placeholder": "2.27.2",
+    "@tiptap/pm": "2.27.2",
+    "@tiptap/react": "2.27.2",
+    "@tiptap/starter-kit": "2.27.2",
     "@types/node": "20.6.2",
     "@types/react": "18.2.22",
     "@types/react-dom": "18.2.7",

@@ -12,6 +12,10 @@ export interface Note {
   created_at: string;
   /** Part of the sample vault, or written while exploring it. */
   is_sample?: boolean;
+  /** Set on a note someone shared with you: the vault it is in. Your own notes have none. */
+  vault_id?: string | null;
+  /** Who shared the note, for showing and for card wording. Only on shared notes. */
+  shared_by?: string | null;
 }
 
 export interface NoteImportInput {

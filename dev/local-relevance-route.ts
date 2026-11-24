@@ -126,6 +126,8 @@ export async function POST(request: Request) {
       summary: note.summary ?? null,
       created_at: note.created_at ?? new Date().toISOString(),
       category: typeof note.category === 'string' ? note.category : null,
+      // Notes someone shared with the person: they inform the draft but are never marked.
+      shared_by: typeof note.shared_by === 'string' && note.shared_by.trim() ? note.shared_by.trim().slice(0, 80) : null,
     }));
   const goalContext = readGoalContext(body?.domain);
   const tier = readModelTier(body?.model_tier);

@@ -145,24 +145,45 @@ export function getLocalDateString(date: Date = new Date()): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 }
 
+/** Before the vaults migration is applied there is no vault_id column, and every note is the person's own. */
+let vaultColumnAvailable: boolean | null = null;
+
+function isMissingVaultColumn(error: SupabaseLikeError | null): boolean {
+  const message = error?.message?.toLowerCase() ?? '';
+  return message.includes('vault_id') && (error?.code === '42703' || message.includes('does not exist') || message.includes('schema cache'));
+}
+
 export async function getNotes(): Promise<Note[]> {
   if (IS_LOCAL_MODE) return localGetNotes();  // DEV-LOCAL-MODE
   const ownerId = await getAuthenticatedOwnerId();
-  // Only one set at a time: the sample notes while exploring them, otherwise the person's own.
+  // Only one set at a time: the sample notes while exploring them, otherwise
+  // the person's own. Notes shared with them are in vaults (lib/vaults-api.ts).
   const samples = getSampleMode(ownerId);
+  const select = async (fields: string) => {
+    const run = () => {
+      const query = supabase.from('notes').select(fields).eq('user_id', ownerId).eq('is_sample', samples);
+      return (vaultColumnAvailable === false ? query : query.is('vault_id', null)).order('created_at', { ascending: false });
+    };
+    let result = await run();
+    if (result.error && vaultColumnAvailable !== false && isMissingVaultColumn(result.error)) {
+      vaultColumnAvailable = false;
+      result = await run();
+    }
+    return result;
+  };
   if (categoryColumnsAvailable !== false) {
-    const result = await supabase.from('notes').select(CATEGORY_NOTE_FIELDS).eq('user_id', ownerId).eq('is_sample', samples).order('created_at', { ascending: false });
+    const result = await select(CATEGORY_NOTE_FIELDS);
     if (!result.error) {
       categoryColumnsAvailable = true;
-      return normalizeNotes(result.data as Array<Record<string, unknown>> | null);
+      return normalizeNotes(result.data as unknown as Array<Record<string, unknown>> | null);
     }
     if (!isMissingCategoryColumn(result.error)) throw result.error;
     categoryColumnsAvailable = false;
   }
 
-  const { data, error } = await supabase.from('notes').select(LEGACY_NOTE_FIELDS).eq('user_id', ownerId).eq('is_sample', samples).order('created_at', { ascending: false });
+  const { data, error } = await select(LEGACY_NOTE_FIELDS);
   if (error) throw error;
-  return normalizeNotes(data as Array<Record<string, unknown>> | null);
+  return normalizeNotes(data as unknown as Array<Record<string, unknown>> | null);
 }
 
 /** Save from the dedicated note editor without running question/note classification. */

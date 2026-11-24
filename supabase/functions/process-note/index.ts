@@ -40,12 +40,14 @@ Deno.serve(async (req: Request) => {
     // note id alone must never be enough to touch someone else's.
     const { data: newNote, error: newNoteErr } = await supabase
       .from("notes")
-      .select("id, raw_text, summary, is_sample")
+      .select("id, raw_text, summary, is_sample, vault_id")
       .eq("id", note_id)
       .eq("user_id", user_id)
       .maybeSingle();
 
     if (newNoteErr || !newNote) return json({ success: false, error: "Note not found" }, 404);
+    // Someone else's shared note is never processed on its own.
+    if (newNote.vault_id) return json({ success: true, relations_count: 0, skipped: "shared note" });
 
     const { data: allNotes } = await supabase
       .from("notes")
@@ -53,6 +55,8 @@ Deno.serve(async (req: Request) => {
       .eq("user_id", user_id)
       // A sample note is only ever connected to sample notes, and an own note to own notes.
       .eq("is_sample", newNote.is_sample === true)
+      // Shared notes get no connections: nothing is ever written onto them.
+      .is("vault_id", null)
       .neq("id", note_id)
       .limit(200);
 

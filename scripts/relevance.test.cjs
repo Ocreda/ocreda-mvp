@@ -1182,6 +1182,25 @@ test('a finished search reports its funnel', async () => {
   assert.strictEqual(funnel.cards, null, 'no insight step was given');
 });
 
+test("someone else's note is named in both prompts, and cards are told not to call it theirs", () => {
+  const shared = { ...note('alice-note'), shared_by: 'Alice' };
+  const agents = buildPrompt('a draft about pricing', [note('mine'), shared]);
+  assert.ok(agents.includes('ID: alice-note\nShared by: Alice'));
+  assert.ok(!agents.includes('ID: mine\nShared by'));
+  assert.ok(agents.includes('name that person'));
+  const insight = buildInsightPrompt({ draft: 'd', context: { domain: null, goal: 'g' }, recentNotes: [], matches: [{ note: shared, result: hit('alice-note', 0.9) }, { note: note('mine'), result: hit('mine', 0.8) }] });
+  assert.ok(insight.includes('Written by: Alice (someone else, who shared this note with them)'));
+  assert.ok(insight.includes("SOMEONE ELSE'S NOTES"));
+  assert.ok(insight.includes('(Alice)'));
+});
+
+test('prompts without shared notes are unchanged by the shared-note rules', () => {
+  assert.ok(!buildPrompt('a draft', [note('mine')]).includes('Shared by'));
+  const insight = buildInsightPrompt({ draft: 'd', context: { domain: null, goal: 'g' }, recentNotes: [], matches: [{ note: note('mine'), result: hit('mine', 0.9) }] });
+  assert.ok(!insight.includes("SOMEONE ELSE'S NOTES"));
+  assert.ok(!insight.includes('Written by:'));
+});
+
 // ------------------------------------------------------------ card rules
 
 const match = (over = {}) => ({
@@ -1239,6 +1258,36 @@ test('rule 1: a solution idea gets no inbound solves or helps, but keeps its out
   });
   assert.deepStrictEqual(out.results.map((r) => r.note_id), ['evidence', 'old-problem', 'fix-for-situation']);
   assert.strictEqual(out.dropped.help_for_solution, 2);
+});
+
+test('rule 5: nothing is ever marked on a note someone shared; it can only inform the draft', () => {
+  const out = rules({
+    notes: [fullNote('mine', 'My old problem'), { ...fullNote('theirs', 'Their old problem'), shared_by: 'Alice' }],
+    results: [
+      match({ note_id: 'theirs', direction: 'outbound' }),
+      match({ note_id: 'mine', direction: 'outbound' }),
+      match({ note_id: 'theirs-advice', direction: 'inbound', relation_type: 'supports' }),
+    ],
+  });
+  assert.deepStrictEqual(out.results.map((r) => r.note_id), ['mine', 'theirs-advice']);
+  assert.strictEqual(out.dropped.onto_shared, 1);
+});
+
+test('rule 5: "you solved this before" is never about a shared note', () => {
+  const history = {
+    ...EMPTY_CARD_HISTORY,
+    settled: [{ choice: 'solved', problem_note_id: 'theirs', problem_text: 'Their old problem', by_note_id: 'fix', answer_text: 'the fix' }],
+  };
+  const run = (problem) => rules({
+    history,
+    notes: [problem, fullNote('fix', 'the fix')],
+    results: [match({ note_id: 'theirs', relation_type: 'supports', matched_text: 'Their old problem' })],
+  });
+  // The same match on a note of their own brings the solver; on a shared note it does not.
+  assert.strictEqual(run(fullNote('theirs', 'Their old problem')).added_solvers, 1);
+  const shared = run({ ...fullNote('theirs', 'Their old problem'), shared_by: 'Alice' });
+  assert.deepStrictEqual(shared.results.map((r) => r.note_id), ['theirs']);
+  assert.strictEqual(shared.added_solvers, 0);
 });
 
 test('rule 1: a match on the whole draft is held back only when every idea is a solution', () => {
@@ -1422,7 +1471,7 @@ test('a search applies the card rules before the insight call and reports them i
     onFunnel: (value) => { funnel = value; },
   });
   assert.deepStrictEqual(insightSaw, ['b']);
-  assert.deepStrictEqual(funnel.dropped_by_rules, { help_for_solution: 1, already_settled: 0, turned_down: 0 });
+  assert.deepStrictEqual(funnel.dropped_by_rules, { help_for_solution: 1, already_settled: 0, turned_down: 0, onto_shared: 0 });
   assert.strictEqual(funnel.added_solvers, 0);
 });
 
