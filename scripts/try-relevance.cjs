@@ -311,6 +311,9 @@ async function main() {
     console.log(wrap(`anchor:  ${insight.anchor ? `"${insight.anchor}"` : '(quote not found in draft - no highlight)'}`, 72, '  '));
     console.log(wrap(`insight: ${insight.text}`, 72, '  '));
     console.log(wrap(`action:  ${insight.action}`, 72, '  '));
+    if (insight.solution) console.log(wrap(`headline: ${insight.solution}`, 72, '  '));
+    const fill = (line) => line.replace(/\{(\d+)\}/g, (_m, n) => `'${insight.quotes[Number(n) - 1]?.text ?? '?'}'`);
+    for (const entry of insight.evidence ?? []) console.log(wrap(`[${entry.heading}] ${fill(entry.text)}  (${entry.note_id})`, 72, '    '));
     console.log(`  cites    ${insight.note_ids.map((id) => `${id} ${titleOf(textById.get(id))}`).join('; ')}`);
   });
   if (!outcome.insights.length) console.log('  (none - nothing in the notes would change the next step)');

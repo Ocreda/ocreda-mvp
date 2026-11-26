@@ -5,7 +5,7 @@ import { inlineRuns, LINE_MARKER, plainNoteText, previewNoteText, stripInlineMar
 
 import Link from 'next/link';
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ArrowLeft, Bold, Check, ChevronDown, ChevronLeft, ChevronRight, Filter, FolderPlus, Grid2X2, Italic, Layers3, List, ListOrdered, Loader as Loader2, Mic, MoreHorizontal, PanelRightOpen, Pin, Plus, RefreshCw, Rows3, ScanSearch, Search, Share2, Trash2, Upload, X } from 'lucide-react';
+import { ArrowLeft, Bold, Check, ChevronDown, ChevronLeft, ChevronRight, ExternalLink, Filter, FolderPlus, Grid2X2, Italic, Layers3, List, ListOrdered, Loader as Loader2, Mic, MoreHorizontal, PanelRightOpen, Pin, Plus, RefreshCw, Rows3, ScanSearch, Search, Share2, Trash2, Upload, X } from 'lucide-react';
 import type { RelevanceProgress } from '@/lib/types';
 import NoteImporter, { ImportDomainDraft, ImportNoteDraft } from '@/components/NoteImporter';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
@@ -25,6 +25,7 @@ import { setSampleMode, useSampleMode, workspaceScope } from '@/lib/sample-mode'
 import { isSampleGuide, loadSampleVault, SampleVault } from '@/lib/sample-vault';
 import { copyNotesToPublic } from '@/lib/sharing-api';
 import { listVaults, removeVault, setVaultInRetrieval, Vault } from '@/lib/vaults-api';
+import { FeedbackButton } from '@/components/FeedbackButton';
 
 type MuseMeta = { title: string; description: string; createdAt: string };
 type ProjectPage = { id: string; title: string; content: string; sourceNoteIds: string[]; createdAt: string; updatedAt: string };
@@ -670,7 +671,25 @@ export default function OcredaHome() {
     setShowUnsorted(false);
     setView('muses');
   }, []);
-  const openNewNote = (muse = ORPHANS_MUSE) => { setError(''); setNoteEditor({ note: null, title: '', body: '', muse, context: 'domain' }); };
+  /**
+   * The Domain a new note goes to unless one is picked: the last one used,
+   * meaning the Domain of the note most recently written into or moved into a
+   * real Domain (decided Nov 25). Read from the notes, so it holds on every
+   * device. Orphans only when no note is in a Domain that still exists.
+   */
+  const lastUsedDomain = useMemo(() => {
+    const existing = new Map(muses.map((muse) => [muse.title.toLowerCase(), muse.title]));
+    let latest: { title: string; at: string } | null = null;
+    for (const note of notes) {
+      const domain = cleanCategory(note.category);
+      const title = domain ? existing.get(domain.toLowerCase()) : undefined;
+      if (!title || title.toLowerCase() === ORPHANS_MUSE.toLowerCase()) continue;
+      const at = [note.created_at, note.category_updated_at ?? ''].sort().pop() ?? note.created_at;
+      if (!latest || at > latest.at) latest = { title, at };
+    }
+    return latest?.title ?? ORPHANS_MUSE;
+  }, [muses, notes]);
+  const openNewNote = (muse = lastUsedDomain) => { setError(''); setNoteEditor({ note: null, title: '', body: '', muse, context: 'domain' }); };
   const openExistingNote = (note: Note, autoSearch = true, fromNoteId: string | null = null) => {
     setError('');
     // A shared note opens read-only, with no search of its own.
@@ -968,11 +987,11 @@ export default function OcredaHome() {
           : activeVault ? <VaultDetail vault={activeVault} busy={saving} onClose={() => setActiveVaultId(null)} onOpenNote={(note) => setActiveSharedNoteId(note.id)} onToggleRetrieval={() => void toggleVaultRetrieval(activeVault)} onRemove={() => void deleteVault(activeVault)} />
           : activeMuse || showUnsorted ? <MuseDetail title={showUnsorted ? ORPHANS_MUSE : activeMuse ?? ''} notes={showUnsorted ? unsortedNotes : notesByMuse.get(activeMuse ?? '') ?? []} isUnsorted={showUnsorted} busy={saving} onClose={closeLibrary} onAddNote={() => openNewNote(showUnsorted ? ORPHANS_MUSE : activeMuse ?? ORPHANS_MUSE)} onOpenNote={openExistingNote} onEdit={() => { const meta = muses.find((item) => item.title === activeMuse); if (meta) setMuseEditor({ originalTitle: meta.title, title: meta.title, description: meta.description }); }} onDelete={() => { if (activeMuse) void removeMuse(activeMuse); }} onShare={sampleMode || showUnsorted ? undefined : () => void shareNotes(notesByMuse.get(activeMuse ?? '') ?? [])} />
           : view === 'muses' ? <MuseGrid muses={muses} projects={projects} notes={notes} notesByMuse={notesByMuse} busy={saving} onClose={closeLibrary} onAddNote={(muse) => openNewNote(muse ?? ORPHANS_MUSE)} onAddMuse={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onEditMuse={(muse) => setMuseEditor({ originalTitle: muse.title, title: muse.title, description: muse.description })} onDeleteMuse={(title) => void removeMuse(title)} onOpenNote={openExistingNote} />
-          : <CortexHome vaults={vaults} onOpenVault={(vault) => setActiveVaultId(vault.id)} onToggleVaultRetrieval={(vault) => void toggleVaultRetrieval(vault)} onRemoveVault={(vault) => void deleteVault(vault)} projects={projects} muses={muses} pinnedMuseTitles={pinnedMuseTitles} notes={notes} notesByMuse={notesByMuse} userEmail={user?.email ?? ''} busy={saving} onOpenMuses={() => setView('muses')} onOpenMuse={openMuse} onTogglePin={togglePinnedMuse} onAddMuse={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onAddNote={() => openNewNote()} onOpenImport={() => setImportOpen(true)} onOpenPage={(project, page) => { setActiveProjectId(project.id); setActivePageId(page.id); }} onOpenNote={openExistingNote} />}
+          : <CortexHome vaults={vaults} onOpenVault={(vault) => setActiveVaultId(vault.id)} onToggleVaultRetrieval={(vault) => void toggleVaultRetrieval(vault)} onRemoveVault={(vault) => void deleteVault(vault)} projects={projects} muses={muses} pinnedMuseTitles={pinnedMuseTitles} notes={notes} notesByMuse={notesByMuse} userEmail={user?.email ?? ''} busy={saving} onOpenMuses={() => setView('muses')} onOpenMuse={openMuse} onTogglePin={togglePinnedMuse} onAddMuse={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onAddNote={() => openNewNote()} onOpenImport={() => setImportOpen(true)} onOpenPage={(project, page) => { setActiveProjectId(project.id); setActivePageId(page.id); }} onOpenNote={openExistingNote} onMoveNote={(noteId, domain) => void changeReadingNoteDomain(noteId, domain)} />}
         {notice && !error && <div role="status" aria-live="polite" className="fixed bottom-5 left-1/2 z-40 max-w-[90vw] -translate-x-1/2 rounded-lg bg-[#202020] px-4 py-3 text-sm text-white shadow-xl">{notice}<button type="button" onClick={() => setNotice('')} aria-label="Dismiss" className="ml-4"><X className="inline h-4 w-4" /></button></div>}
         {error && !noteEditor && !museEditor && !projectEditor && <div role="alert" className="fixed bottom-5 left-1/2 z-40 max-w-[90vw] -translate-x-1/2 rounded-lg bg-[#202020] px-4 py-3 text-sm text-white shadow-xl">{error}<button type="button" onClick={() => setError('')} aria-label="Dismiss error" className="ml-4"><X className="inline h-4 w-4" /></button></div>}
       </section>
-      {activeNote && <NoteReadingWorkspace key={activeNote.id} note={activeNote} previousNote={previousNote} allNotes={notes} sharedNotes={sharedNotes} hasSearchableShared={hasSearchableShared} muses={muses} projects={projects} saving={saving} userId={scope ?? 'local'} initialRetrievalMode={activeNoteRetrievalMode} autoSearch={activeNoteAutoSearch} onClose={() => { setActiveNoteId(null); setPreviousNoteId(null); }} onReturnToPrevious={() => { if (previousNote) { setActiveNoteAutoSearch(false); setActiveNoteId(previousNote.id); setPreviousNoteId(null); } }} onAddNote={() => { setActiveNoteId(null); setPreviousNoteId(null); openNewNote(cleanCategory(activeNote.category) ?? ORPHANS_MUSE); }} onOpenNote={(note, autoSearch) => openExistingNote(note, autoSearch, activeNote.id)} onOpenPage={(project, page) => { setActiveNoteId(null); setPreviousNoteId(null); setActiveProjectId(project.id); setActivePageId(page.id); }} onUpdate={updateReadingNote} onChangeDomain={(category) => void changeReadingNoteDomain(activeNote.id, category)} onCreateDomain={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onDelete={removeReadingNote} onShare={shareNote} onSetDomainGoal={setDomainGoal} />}
+      {activeNote && <NoteReadingWorkspace key={activeNote.id} note={activeNote} previousNote={previousNote} allNotes={notes} sharedNotes={sharedNotes} hasSearchableShared={hasSearchableShared} muses={muses} projects={projects} saving={saving} userId={scope ?? 'local'} initialRetrievalMode={activeNoteRetrievalMode} autoSearch={activeNoteAutoSearch} onClose={() => { setActiveNoteId(null); setPreviousNoteId(null); }} onReturnToPrevious={() => { if (previousNote) { setActiveNoteAutoSearch(false); setActiveNoteId(previousNote.id); setPreviousNoteId(null); } }} onAddNote={() => { setActiveNoteId(null); setPreviousNoteId(null); openNewNote(cleanCategory(activeNote.category) ?? ORPHANS_MUSE); }} onOpenNote={(note, autoSearch) => openExistingNote(note, autoSearch, activeNote.id)} onOpenPage={(project, page) => { setActiveNoteId(null); setPreviousNoteId(null); setActiveProjectId(project.id); setActivePageId(page.id); }} onUpdate={updateReadingNote} onChangeDomain={(category) => void changeReadingNoteDomain(activeNote.id, category)} onCreateDomain={() => setMuseEditor({ originalTitle: null, title: '', description: '' })} onDelete={removeReadingNote} onShare={shareNote} onSetDomainGoal={setDomainGoal} onImport={() => { setActiveNoteId(null); setPreviousNoteId(null); setImportError(''); setImportOpen(true); }} />}
       {activeSharedNote && <SharedNoteView note={activeSharedNote} vault={vaults.find((vault) => vault.id === activeSharedNote.vault_id) ?? null} onClose={() => setActiveSharedNoteId(null)} />}
       {shareNotice && <div role="status" aria-live="polite" className="fixed bottom-5 left-1/2 z-[95] flex max-w-[90vw] -translate-x-1/2 items-center gap-3 rounded-lg bg-[#202020] px-4 py-3 text-sm text-white shadow-xl"><span>{shareNotice}</span><Link href="/sharing" className="shrink-0 font-medium text-[#a8c4ff] hover:underline">Make a link</Link><button type="button" onClick={() => setShareNotice('')} aria-label="Dismiss"><X className="h-4 w-4" /></button></div>}
       {noteEditor && <NoteEditor state={noteEditor} muses={muses} notes={notes} saving={saving} error={error} onChange={setNoteEditor} onCreateMuse={createMuseFromEditor} onClose={() => { setNoteEditor(null); setError(''); }} onSave={() => void saveNote()} onFindRelevantNotes={() => void saveNote(true)} onImport={() => { setImportError(''); setImportOpen(true); }} onDelete={noteEditor.note ? () => void removeNote() : undefined} />}
@@ -1027,7 +1046,7 @@ function BetaAndAvatar({ email, feedback = false, onOpenImport }: { email: strin
     <div className="flex items-center gap-4">
       <div className="inline-flex overflow-hidden rounded-md border border-[#a8c4ff] text-sm">
         <span className="bg-[#edf3ff] px-4 py-1.5 text-[#477bea]">Beta</span>
-        {feedback && <a href="mailto:feedback@ocreda.com" className="hidden border-l border-[#a8c4ff] px-3 py-1.5 text-[#252525] hover:bg-[#f5f7fb] sm:block">Send feedback</a>}
+        {feedback && <FeedbackButton className="hidden border-l border-[#a8c4ff] sm:block" />}
       </div>
       <Avatar email={email} onOpenImport={onOpenImport} />
     </div>
@@ -1085,13 +1104,136 @@ function EmptyWorkspace({ displayName, userEmail, existingDomains, onAddNote, on
   );
 }
 
-function CortexHome({ vaults, onOpenVault, onToggleVaultRetrieval, onRemoveVault, projects, muses, pinnedMuseTitles, notes, notesByMuse, userEmail, busy, onOpenMuses, onOpenMuse, onTogglePin, onAddMuse, onAddNote, onOpenImport, onOpenPage, onOpenNote }: {
+/**
+ * Writing a note is the main thing people do, so it has one labelled button
+ * in the same corner of Home and of every Domain (decided Nov 25).
+ */
+function NewNoteButton({ onClick, label, className }: { onClick: () => void; label: string; className: string }) {
+  return (
+    <button type="button" onClick={onClick} aria-label={label} title={label} className={`absolute z-30 flex h-14 items-center gap-2 rounded-full bg-[#477bea] pl-5 pr-6 text-[15px] font-medium text-white shadow-[0_8px_24px_rgba(71,123,234,0.45)] transition hover:-translate-y-0.5 hover:bg-[#3d6ed7] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] focus-visible:ring-offset-2 ${className}`}>
+      <Plus className="h-5 w-5" /> New note
+    </button>
+  );
+}
+
+/** A note with no Domain yet: none at all, or still in Orphans. */
+function isUnsortedNote(note: Note): boolean {
+  const category = cleanCategory(note.category);
+  return !category || category.toLowerCase() === ORPHANS_MUSE.toLowerCase();
+}
+
+/** When something last happened in a note: written, or moved into its Domain. */
+function noteActivity(note: Note): string {
+  const moved = note.category_updated_at ?? '';
+  return moved > note.created_at ? moved : note.created_at;
+}
+
+function shortNoteDate(value: string): string {
+  const date = new Date(value);
+  const today = localDateKey(new Date().toISOString());
+  if (localDateKey(value) === today) return new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit' }).format(date);
+  const sameYear = date.getFullYear() === new Date().getFullYear();
+  return new Intl.DateTimeFormat('en-US', sameYear ? { month: 'short', day: 'numeric' } : { month: 'short', day: 'numeric', year: 'numeric' }).format(date);
+}
+
+/** The lists behind the Home bar's two halves, in a sheet like the note's suggestions. */
+function HomeBarSheet({ kind, muses, notes, notesByMuse, busy, onClose, onOpenMuse, onOpenNote, onManageDomains, onMoveNote }: {
+  kind: 'domains' | 'notes'; muses: MuseMeta[]; notes: Note[]; notesByMuse: Map<string, Note[]>; busy: boolean;
+  onClose: () => void; onOpenMuse: (title: string) => void; onOpenNote: (note: Note) => void; onManageDomains: () => void;
+  onMoveNote: (noteId: string, domain: string) => void;
+}) {
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const realDomains = muses.filter((muse) => muse.title.toLowerCase() !== ORPHANS_MUSE.toLowerCase());
+  const domainRows = realDomains
+    .map((muse) => {
+      const items = notesByMuse.get(muse.title) ?? [];
+      const last = items.reduce((latest, note) => { const at = noteActivity(note); return at > latest ? at : latest; }, '');
+      return { muse, count: items.length, last };
+    })
+    // Most recently used first; Domains with no notes yet go last, newest first.
+    .sort((a, b) => (b.last || '').localeCompare(a.last || '') || b.muse.createdAt.localeCompare(a.muse.createdAt));
+
+  const unsorted = notes.filter(isUnsortedNote).sort((a, b) => b.created_at.localeCompare(a.created_at));
+  const sorted = notes.filter((note) => !isUnsortedNote(note)).sort((a, b) => b.created_at.localeCompare(a.created_at));
+  const todayKey = localDateKey(new Date().toISOString());
+  const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const groups: { label: string; items: Note[] }[] = [
+    { label: 'Today', items: sorted.filter((note) => localDateKey(note.created_at) === todayKey) },
+    { label: 'This week', items: sorted.filter((note) => localDateKey(note.created_at) !== todayKey && note.created_at >= weekAgo) },
+    { label: 'Earlier', items: sorted.filter((note) => note.created_at < weekAgo) },
+  ].filter((group) => group.items.length);
+
+  const noteRow = (note: Note) => (
+    <button type="button" onClick={() => onOpenNote(note)} className="flex w-full min-w-0 flex-col gap-0.5 rounded-lg px-3 py-2.5 text-left hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">
+      <span className="flex min-w-0 items-baseline gap-3"><span className="min-w-0 flex-1 truncate text-sm font-medium text-[#222]">{noteLabel(note)}</span><span className="shrink-0 text-xs text-[#999]">{shortNoteDate(note.created_at)}</span></span>
+      <span className="truncate text-xs text-[#8d8d92]">{cleanCategory(note.category) || ORPHANS_MUSE}{notePreview(note) && notePreview(note) !== noteLabel(note) ? ` · ${notePreview(note)}` : ''}</span>
+    </button>
+  );
+
+  return (
+    <div className="fixed inset-0 z-50">
+      <button type="button" onClick={onClose} aria-label="Close" tabIndex={-1} className="absolute inset-0 h-full w-full cursor-default bg-black/20" />
+      <section role="dialog" aria-modal="true" aria-label={kind === 'domains' ? 'Your Domains' : 'All notes'} className="absolute inset-x-0 bottom-0 mx-auto flex h-[72%] w-full max-w-[640px] flex-col overflow-hidden rounded-t-[20px] bg-[#F7F7F8] shadow-[0_-10px_30px_rgba(10,10,20,0.18)]">
+        <button type="button" {...tapOrSwipe(onClose)} aria-label="Close list" title="Close" className="flex h-10 shrink-0 select-none items-center justify-center"><span className="h-[5px] w-10 rounded-full bg-[#C9C9CF]" aria-hidden="true" /></button>
+        <h2 className="shrink-0 px-6 pb-2 text-sm font-semibold text-[#222]">{kind === 'domains' ? `${realDomains.length} ${realDomains.length === 1 ? 'Domain' : 'Domains'}` : `${notes.length} ${notes.length === 1 ? 'Note' : 'Notes'}`}</h2>
+        <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-8">
+          {kind === 'domains' ? <>
+            {domainRows.length === 0 && <p className="px-3 py-6 text-sm text-[#8d8d92]">No Domains yet.</p>}
+            <ul>
+              {domainRows.map(({ muse, count, last }) => <li key={muse.title}>
+                <button type="button" onClick={() => onOpenMuse(muse.title)} className="flex w-full min-w-0 items-center gap-3 rounded-lg px-3 py-3 text-left hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">
+                  <Layers3 className="h-4 w-4 shrink-0 text-[#477bea]" />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-medium text-[#222]">{muse.title}</span>
+                    <span className="block truncate text-xs text-[#8d8d92]">{count} {count === 1 ? 'note' : 'notes'}{last ? ` · last used ${shortNoteDate(last)}` : ''}</span>
+                  </span>
+                  <ChevronRight className="h-4 w-4 shrink-0 text-[#bbb]" />
+                </button>
+              </li>)}
+            </ul>
+            <button type="button" onClick={onManageDomains} className="mt-3 px-3 text-sm text-[#477bea] hover:text-[#315fc5]">Manage Domains</button>
+          </> : <>
+            {unsorted.length > 0 && <section aria-label="Notes that need a Domain" className="mb-4 rounded-xl border border-[#f3d3b4] bg-[#fff7ef] p-2">
+              <h3 className="px-3 pb-1 pt-2 text-xs font-semibold text-[#b4570f]">{unsorted.length} {unsorted.length === 1 ? 'note needs' : 'notes need'} a Domain</h3>
+              <ul>
+                {unsorted.map((note) => <li key={note.id} className="flex min-w-0 items-center gap-2">
+                  <div className="min-w-0 flex-1">{noteRow(note)}</div>
+                  {realDomains.length > 0 && <select aria-label={`Move “${noteLabel(note)}” to a Domain`} value="" disabled={busy} onChange={(event) => { if (event.target.value) onMoveNote(note.id, event.target.value); }} className="h-9 max-w-[42%] shrink-0 rounded-md border border-[#e0e0e0] bg-white px-2 text-xs text-[#477bea] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] disabled:opacity-50">
+                    <option value="">Move to…</option>
+                    {realDomains.map((muse) => <option key={muse.title} value={muse.title}>{muse.title}</option>)}
+                  </select>}
+                </li>)}
+              </ul>
+            </section>}
+            {groups.map((group) => <section key={group.label} aria-label={group.label} className="mb-3">
+              <h3 className="px-3 pb-1 pt-2 text-xs font-normal text-[#8d8d92]">{group.label}</h3>
+              <ul>{group.items.map((note) => <li key={note.id}>{noteRow(note)}</li>)}</ul>
+            </section>)}
+            {notes.length === 0 && <p className="px-3 py-6 text-sm text-[#8d8d92]">No notes yet.</p>}
+          </>}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function CortexHome({ vaults, onOpenVault, onToggleVaultRetrieval, onRemoveVault, projects, muses, pinnedMuseTitles, notes, notesByMuse, userEmail, busy, onOpenMuses, onOpenMuse, onTogglePin, onAddMuse, onAddNote, onOpenImport, onOpenPage, onOpenNote, onMoveNote }: {
   vaults: Vault[]; onOpenVault: (vault: Vault) => void; onToggleVaultRetrieval: (vault: Vault) => void; onRemoveVault: (vault: Vault) => void;
   projects: CortexProject[]; muses: MuseMeta[]; pinnedMuseTitles: string[]; notes: Note[]; notesByMuse: Map<string, Note[]>; userEmail: string; busy: boolean;
   onOpenMuses: () => void; onOpenMuse: (title: string) => void; onTogglePin: (title: string) => void; onAddMuse: () => void; onAddNote: () => void; onOpenImport: () => void;
   onOpenPage: (project: CortexProject, page: ProjectPage) => void; onOpenNote: (note: Note) => void;
+  onMoveNote: (noteId: string, domain: string) => void;
 }) {
   const [searchOpen, setSearchOpen] = useState(false);
+  const [barSheet, setBarSheet] = useState<'domains' | 'notes' | null>(null);
+  const unsortedCount = notes.filter(isUnsortedNote).length;
+  // Orphans is counted as unsorted notes, not as a Domain.
+  const domainCount = muses.filter((muse) => muse.title.toLowerCase() !== ORPHANS_MUSE.toLowerCase()).length;
   const pinnedMuses = pinnedMuseTitles.map((title) => muses.find((muse) => muse.title.toLowerCase() === title.toLowerCase())).filter((muse): muse is MuseMeta => Boolean(muse));
   const unpinnedMuses = muses.filter((muse) => !pinnedMuseTitles.some((title) => title.toLowerCase() === muse.title.toLowerCase()));
 
@@ -1099,7 +1241,6 @@ function CortexHome({ vaults, onOpenVault, onToggleVaultRetrieval, onRemoveVault
     <div className="relative flex h-full min-h-0 flex-col overflow-hidden bg-white">
       <header className="relative z-20 flex h-[88px] shrink-0 items-center border-b border-[#eeeeef] px-5 sm:px-8">
         <div className="flex items-center gap-2 text-[#222]">
-          <button type="button" onClick={onAddNote} className="flex h-10 items-center gap-2 rounded-md px-2 text-sm hover:bg-[#f5f5f6]" title="Add a note"><span className="flex h-7 w-16 items-center justify-center rounded-md bg-[#477bea] text-white"><Plus className="h-4 w-4" /></span><span className="hidden sm:inline">Add a note</span></button>
           <button type="button" onClick={() => setSearchOpen(true)} aria-label="Search notes, pages, and Domains" title="Search notes, pages, and Domains" className="flex h-10 w-10 items-center justify-center rounded-md hover:bg-[#f5f5f6]"><Search className="h-5 w-5" /></button>
           <button type="button" onClick={onOpenImport} aria-label="Import notes" title="Import notes" className="flex h-10 w-10 items-center justify-center rounded-md hover:bg-[#f5f5f6]"><Upload className="h-5 w-5" /></button>
         </div>
@@ -1107,7 +1248,7 @@ function CortexHome({ vaults, onOpenVault, onToggleVaultRetrieval, onRemoveVault
         <div className="ml-auto"><BetaAndAvatar email={userEmail} feedback onOpenImport={onOpenImport} /></div>
       </header>
 
-      <main className="min-h-0 flex-1 overflow-y-auto px-5 pb-28 pt-10 sm:px-10 lg:px-16">
+      <main className="min-h-0 flex-1 overflow-y-auto px-5 pb-40 pt-10 md:pb-28 sm:px-10 lg:px-16">
         {pinnedMuses.length > 0 && <section className="mx-auto mb-14 w-full max-w-[1450px]" aria-label="Pinned Domains">
           <h2 className="mb-6 text-sm font-normal text-[#8d8d92]">Pinned Domains</h2>
           <div className="grid grid-cols-1 gap-x-12 gap-y-10 sm:grid-cols-2 lg:grid-cols-3">
@@ -1121,7 +1262,6 @@ function CortexHome({ vaults, onOpenVault, onToggleVaultRetrieval, onRemoveVault
           </div>
           <div className="grid grid-cols-1 gap-x-12 gap-y-10 sm:grid-cols-2 lg:grid-cols-3">
             {unpinnedMuses.map((muse) => <MuseHomeCard key={muse.title} muse={muse} notes={notesByMuse.get(muse.title) ?? []} pinned={false} onClick={() => onOpenMuse(muse.title)} onTogglePin={() => onTogglePin(muse.title)} />)}
-            <button type="button" onClick={onAddMuse} aria-label="Add a Domain" title="Add a Domain" className="flex h-[286px] items-center justify-center rounded-md border border-dashed border-[#dfe3ec] text-[#477bea] transition hover:border-[#8fb1ff] hover:bg-[#f8f9fc]"><FolderPlus className="h-9 w-9 stroke-[1.6]" /></button>
           </div>
         </section>
         {vaults.length > 0 && <section className="mx-auto mt-14 w-full max-w-[1450px]" aria-label="Shared with me">
@@ -1135,10 +1275,22 @@ function CortexHome({ vaults, onOpenVault, onToggleVaultRetrieval, onRemoveVault
         </section>}
       </main>
 
-      <button type="button" onClick={onOpenMuses} aria-label="Open Domains and notes" className="absolute bottom-0 left-1/2 z-20 flex h-16 w-[min(88vw,420px)] -translate-x-1/2 items-center justify-center gap-10 rounded-t-[52px] border border-b-0 border-[#e0e0e0] bg-white px-8 text-xs text-[#777] shadow-[0_-4px_16px_rgba(0,0,0,0.10)] transition hover:h-[70px] hover:text-[#222] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">
-        <span className="flex items-center gap-2"><Layers3 className="h-4 w-4 text-[#477bea]" /> {muses.length} {muses.length === 1 ? 'Domain' : 'Domains'}</span>
-        <span>{notes.length} {notes.length === 1 ? 'Note' : 'Notes'}</span>
-      </button>
+      {/* Each half opens its own list (decided Nov 25); the Notes half also counts notes still waiting for a Domain. */}
+      <div className="absolute bottom-0 left-1/2 z-20 flex h-16 w-[min(88vw,420px)] -translate-x-1/2 items-stretch overflow-hidden rounded-t-[52px] border border-b-0 border-[#e0e0e0] bg-white text-xs text-[#777] shadow-[0_-4px_16px_rgba(0,0,0,0.10)] transition hover:h-[70px]">
+        <button type="button" onClick={() => setBarSheet('domains')} aria-label={`Open your ${domainCount} Domains`} className="flex flex-1 items-center justify-center gap-2 pl-6 hover:text-[#222] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[#477bea]">
+          <Layers3 className="h-4 w-4 text-[#477bea]" /> {domainCount} {domainCount === 1 ? 'Domain' : 'Domains'}
+        </button>
+        <span className="my-4 w-px bg-[#ececef]" aria-hidden="true" />
+        <button type="button" onClick={() => setBarSheet('notes')} aria-label={`Open all ${notes.length} notes${unsortedCount ? `, ${unsortedCount} ${unsortedCount === 1 ? 'needs' : 'need'} a Domain` : ''}`} className="flex flex-1 items-center justify-center gap-1.5 pr-6 hover:text-[#222] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[#477bea]">
+          <span>{notes.length} {notes.length === 1 ? 'Note' : 'Notes'}</span>
+          {unsortedCount > 0 && <span className="flex items-center gap-1 text-[#b4570f]"><span aria-hidden="true">·</span><span className="h-1.5 w-1.5 rounded-full bg-[#e8892f]" aria-hidden="true" />{unsortedCount} unsorted</span>}
+        </button>
+      </div>
+
+      {/* On a phone the bar spans the width, so the button sits just above it. */}
+      <NewNoteButton onClick={onAddNote} label="Write a new note" className="bottom-[84px] right-4 md:bottom-6 md:right-8" />
+
+      {barSheet && <HomeBarSheet kind={barSheet} muses={muses} notes={notes} notesByMuse={notesByMuse} busy={busy} onClose={() => setBarSheet(null)} onOpenMuse={(title) => { setBarSheet(null); onOpenMuse(title); }} onOpenNote={(note) => { setBarSheet(null); onOpenNote(note); }} onManageDomains={() => { setBarSheet(null); onOpenMuses(); }} onMoveNote={onMoveNote} />}
 
       {searchOpen && <KnowledgeSearchOverlay request={{ query: '' }} notes={notes} sharedNotes={vaults.flatMap((vault) => vault.notes)} muses={muses} projects={projects} hideProjectColumn onClose={() => setSearchOpen(false)} onOpenPage={(project, page) => { setSearchOpen(false); onOpenPage(project, page); }} onOpenNote={(note) => { setSearchOpen(false); onOpenNote(note); }} />}
     </div>
@@ -1378,40 +1530,37 @@ function MuseDetail({ title, notes, isUnsorted, busy, onClose, onAddNote, onOpen
   const [menuOpen, setMenuOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState('');
-  const [newestFirst, setNewestFirst] = useState(true);
   const [compact, setCompact] = useState(false);
+  // Always newest first: older notes are a scroll away (sort button removed Nov 25).
   const visibleNotes = useMemo(() => {
     const normalized = query.trim().toLowerCase();
     const filtered = normalized ? notes.filter((note) => note.raw_text.toLowerCase().includes(normalized)) : notes;
-    return [...filtered].sort((left, right) => newestFirst
-      ? right.created_at.localeCompare(left.created_at)
-      : left.created_at.localeCompare(right.created_at));
-  }, [newestFirst, notes, query]);
+    return [...filtered].sort((left, right) => right.created_at.localeCompare(left.created_at));
+  }, [notes, query]);
 
   return (
     <div className="relative flex h-full min-h-0 flex-col overflow-hidden bg-[#bdbdbd] p-3 sm:p-5">
       <header className="relative flex h-16 shrink-0 items-center px-1 text-white sm:px-2">
         <div className="flex items-center gap-1">
-          <button type="button" onClick={onAddNote} aria-label={`Add a note to ${title}`} title="Add a note" className="mr-2 flex h-8 w-24 items-center justify-center rounded-md bg-[#477bea] shadow-sm hover:bg-[#3d6ed7]"><Plus className="h-5 w-5" /></button>
           <button type="button" onClick={() => { setSearchOpen((open) => !open); if (searchOpen) setQuery(''); }} aria-label="Search this Domain" title="Search this Domain" className="flex h-10 w-10 items-center justify-center rounded-md hover:bg-white/10"><Search className="h-5 w-5" /></button>
-          <button type="button" onClick={() => setNewestFirst((value) => !value)} aria-label={newestFirst ? 'Show oldest notes first' : 'Show newest notes first'} title={newestFirst ? 'Newest first' : 'Oldest first'} aria-pressed={!newestFirst} className="flex h-10 w-10 items-center justify-center rounded-md hover:bg-white/10"><Filter className="h-5 w-5" /></button>
-          <button type="button" onClick={() => setCompact((value) => !value)} aria-label={compact ? 'Use spacious card view' : 'Use compact card view'} title={compact ? 'Spacious cards' : 'Compact cards'} aria-pressed={compact} className="flex h-10 w-10 items-center justify-center rounded-md hover:bg-white/10"><Grid2X2 className="h-5 w-5" /></button>
+          {/* Compact only changes the widest layout (four columns instead of three), so it is shown only there. */}
+          <button type="button" onClick={() => setCompact((value) => !value)} aria-label={compact ? 'Use spacious card view' : 'Use compact card view'} title={compact ? 'Spacious cards' : 'Compact cards'} aria-pressed={compact} className="hidden h-10 w-10 items-center justify-center rounded-md hover:bg-white/10 xl:flex"><Grid2X2 className="h-5 w-5" /></button>
         </div>
         <h1 className="pointer-events-none absolute left-1/2 hidden max-w-[40vw] -translate-x-1/2 truncate text-sm font-normal text-white/90 sm:block">{title}</h1>
         <button type="button" onClick={onClose} aria-label="Close Domain and return home" title="Close Domain and return home" className="ml-auto flex h-10 w-10 items-center justify-center rounded-md text-white drop-shadow hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"><X className="h-6 w-6" /></button>
       </header>
 
-      <section className="relative min-h-0 flex-1 overflow-y-auto rounded-[28px] bg-white px-5 pb-16 pt-9 shadow-[0_14px_40px_rgba(0,0,0,0.12)] sm:px-10 lg:px-16">
+      <section className="relative min-h-0 flex-1 overflow-y-auto rounded-[28px] bg-white px-5 pb-28 pt-9 shadow-[0_14px_40px_rgba(0,0,0,0.12)] sm:px-10 lg:px-16">
       <p className="text-center text-sm font-normal text-[#b2b2b7]">{visibleNotes.length} {visibleNotes.length === 1 ? 'entry' : 'entries'}</p>
       {searchOpen && <label className="mx-auto mt-6 flex h-11 w-full max-w-md items-center rounded-xl bg-[#f7f7f9] px-4 shadow-sm"><Search className="mr-3 h-4 w-4 text-[#aaa]" /><input autoFocus value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${title}`} className="min-w-0 flex-1 bg-transparent text-sm text-[#222] outline-none placeholder:text-[#aaa]" /></label>}
       {!isUnsorted && <div className="absolute right-5 top-4 sm:right-8"><button type="button" onClick={() => setMenuOpen((value) => !value)} aria-label="Domain options" aria-expanded={menuOpen} className="flex h-10 w-10 items-center justify-center rounded-md text-[#222] hover:bg-[#f4f4f4]"><MoreHorizontal className="h-5 w-5" /></button>{menuOpen && <div className="absolute right-0 top-11 z-10 w-60 overflow-hidden rounded-lg border border-[#ddd] bg-white py-1 text-sm shadow-xl"><button type="button" onClick={() => { setMenuOpen(false); onEdit(); }} className="block w-full px-4 py-2.5 text-left hover:bg-[#f5f5f5]">Edit Domain</button>{onShare && notes.length > 0 && <button type="button" disabled={busy} onClick={() => { setMenuOpen(false); onShare(); }} className="block w-full px-4 py-2.5 text-left hover:bg-[#f5f5f5]">Copy all {notes.length} to public notes</button>}<button type="button" disabled={busy} onClick={() => { setMenuOpen(false); onDelete(); }} className="block w-full px-4 py-2.5 text-left text-red-600 hover:bg-red-50">Delete Domain</button></div>}</div>}
       <div className={`mx-auto mt-14 grid max-w-[1510px] grid-cols-1 gap-8 sm:grid-cols-2 lg:gap-x-12 lg:gap-y-10 ${compact ? 'xl:grid-cols-4' : 'xl:grid-cols-3'}`}>
         {visibleNotes.map((note) => { const content = splitNote(note); return <button key={note.id} type="button" onClick={() => onOpenNote(note)} title={content.title || undefined} className="flex h-[360px] min-w-0 flex-col overflow-hidden rounded-lg border border-[#e3e3e5] bg-white p-7 text-left shadow-[0_2px_8px_rgba(0,0,0,0.1)] transition hover:-translate-y-0.5 hover:border-[#7ca2ff] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">{content.hasTitle && <strong className="line-clamp-2 shrink-0 text-base leading-snug text-[#151515]">{defaultNoteTitle(content.title)}</strong>}<span className="mt-4 block min-h-0 flex-1 overflow-hidden"><span className="line-clamp-[8] whitespace-pre-wrap text-[15px] leading-[1.55] text-[#777]">{content.body ? previewNoteText(content.body) : notePreview(note)}</span></span><span className="mt-4 shrink-0 text-right text-xs text-[#aaa]">{formatDate(note.created_at)}</span></button>; })}
-        <button type="button" onClick={onAddNote} aria-label={`Add a note to ${title}`} className="relative flex h-[360px] items-start rounded-lg border border-[#e1e1e3] bg-white p-8 text-[#477bea] shadow-[0_3px_12px_rgba(0,0,0,0.15)] transition hover:-translate-y-0.5 hover:border-[#a9c0f5] hover:shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]"><span className="flex items-center gap-2"><Plus className="h-5 w-5" /> Add</span><span className="absolute inset-x-5 bottom-6 text-center text-sm italic text-[#b4b4b8]">You can always add more</span></button>
       </div>
       {!visibleNotes.length && query.trim() && <p className="mt-8 text-center text-sm text-[#999]">No notes contain “{query.trim()}”.</p>}
       {!notes.length && <p className="mt-8 text-center text-sm text-[#999]">This Domain is ready for its first note.</p>}
       </section>
+      <NewNoteButton onClick={onAddNote} label={`Write a new note in ${title}`} className="bottom-6 right-6 sm:bottom-9 sm:right-10" />
     </div>
   );
 }
@@ -1695,8 +1844,10 @@ function RelatedNotePanel({ note, relevance, focusText = '', onClose, onOpenFull
   </div>;
 }
 
-function NoteReadingWorkspace({ note, previousNote, allNotes, sharedNotes = [], hasSearchableShared = false, muses, projects, saving, userId, initialRetrievalMode, autoSearch, onClose, onReturnToPrevious, onAddNote, onOpenNote, onOpenPage, onUpdate, onChangeDomain, onCreateDomain, onDelete, onShare, onSetDomainGoal }: {
+function NoteReadingWorkspace({ note, previousNote, allNotes, sharedNotes = [], hasSearchableShared = false, muses, projects, saving, userId, initialRetrievalMode, autoSearch, onClose, onReturnToPrevious, onAddNote, onOpenNote, onOpenPage, onUpdate, onChangeDomain, onCreateDomain, onDelete, onShare, onSetDomainGoal, onImport }: {
   note: Note; previousNote: Note | null; allNotes: Note[]; muses: MuseMeta[]; projects: CortexProject[]; saving: boolean; userId: string; initialRetrievalMode: 'similar' | 'relevant'; autoSearch: boolean;
+  /** Leaves the note and opens the importer, offered when a search finds nothing. */
+  onImport?: () => void;
   /** Notes others shared with you. Searches may cite them, so cards and links look them up here too. */
   sharedNotes?: Note[];
   /** Whether a search reads any shared notes, so a note can be searched with none of your own beside it. */
@@ -1716,6 +1867,16 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, sharedNotes = [], 
   // Mobile starts with the note itself; desktop has room to show suggestions
   // alongside it immediately.
   const [summaryOpen, setSummaryOpen] = useState(false);
+  // Below the width where the note and the panel fit side by side, the design's
+  // phone layout applies: the panel is a sheet that rises over the note.
+  const narrowScreen = useNarrowScreen();
+  // The design's view keeps the panel closed until a passage is clicked, and
+  // shows one card at a time; the classic view lists them all.
+  const [suggestionsView, setSuggestionsView] = useState<NoteSuggestionsView>(() => readNoteSuggestionsView());
+  const designView = suggestionsView === 'design';
+  const [activeCardId, setActiveCardId] = useState<string | null>(null);
+  // A chosen card whose result is open under its passage.
+  const [dropCardId, setDropCardId] = useState<string | null>(null);
   const [panelNoteId, setPanelNoteId] = useState<string | null>(null);
   const [panelRelevance, setPanelRelevance] = useState<RelevanceResult | null>(null);
   // Words a card quoted from the note open in the side panel, to show them in place.
@@ -1732,6 +1893,8 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, sharedNotes = [], 
   // Avoid briefly showing "Not searched yet" before an automatic search starts.
   const [retrievalLoading, setRetrievalLoading] = useState(autoSearch && !isGuide && !requiresDomain);
   const [retrievalProgress, setRetrievalProgress] = useState<RelevanceProgress | null>(null);
+  // Counts searches that finished while the note was open (not saved ones shown on opening).
+  const [searchesFinished, setSearchesFinished] = useState(0);
   const [retrievalError, setRetrievalError] = useState('');
   const [retrievalAttempt, setRetrievalAttempt] = useState(0);
   const [retrievalMode, setRetrievalMode] = useState(initialRetrievalMode);
@@ -1755,7 +1918,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, sharedNotes = [], 
   const noteChanged = Boolean(rawText) && rawText !== note.raw_text.trim() && rawText !== unchangedText;
 
   useEffect(() => {
-    if (window.matchMedia('(min-width: 1280px)').matches) setSummaryOpen(true);
+    if (readNoteSuggestionsView() === 'classic' && window.matchMedia('(min-width: 1280px)').matches) setSummaryOpen(true);
   }, []);
 
   useEffect(() => {
@@ -1861,7 +2024,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, sharedNotes = [], 
           // next time without searching again. A failed insight step is not
           // saved, so opening the note again retries it.
           if (!response.insight_failed) persistSavedRetrieval(userId, requestNote, inputs.goalText, retrievalMode, response, requestSignature);
-          if (active) setRetrieval(response);
+          if (active) { setRetrieval(response); setSearchesFinished((count) => count + 1); }
         })
         .catch((err) => {
           // Cancelling is expected when the reader leaves or searches again; it is not an error.
@@ -1949,13 +2112,18 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, sharedNotes = [], 
    * earlier search, so what they chose stays on the note after a new one.
    */
   const cards = useMemo(() => {
-    const current = (retrieval?.insights ?? []).map((item) => ({ id: insightActionId(item, relationOf(item)), item }));
+    // A solution this note already handed to an earlier note lives on that
+    // note now, so its card leaves this one; only that note can undo it.
+    const handed = incomingDecisions.filter((decision) => isHandedFrom(decision, note.id));
+    const wasHanded = (item: NoteInsight) => item.direction === 'outbound' && Boolean(item.problem)
+      && handed.some((decision) => decision.fromNoteId === item.problem!.note_id && decision.insight.anchor === item.problem!.text);
+    const current = (retrieval?.insights ?? []).filter((item) => !wasHanded(item)).map((item) => ({ id: insightActionId(item, relationOf(item)), item }));
     const currentIds = new Set(current.map((card) => card.id));
     const earlier = Object.entries(decisions)
-      .filter(([id, decision]) => !currentIds.has(id) && decision.choice !== 'rejected')
+      .filter(([id, decision]) => !currentIds.has(id) && decision.choice !== 'rejected' && !wasHanded(decision.insight))
       .map(([id, decision]) => ({ id, item: decision.insight }));
     return [...current, ...earlier];
-  }, [decisions, relationOf, retrieval]);
+  }, [decisions, incomingDecisions, note.id, relationOf, retrieval]);
   const insights = useMemo(() => cards.map((card) => card.item), [cards]);
   const insight = insights[Math.min(selectedInsightIndex, insights.length - 1)] ?? null;
   /**
@@ -2017,10 +2185,11 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, sharedNotes = [], 
         const sentenceEnd = Math.min(sentenceEndAfter(displayedBody, span.end), limit);
         const lineEnd = Math.min(lineEndAfter(displayedBody, span.end), limit);
         const choice = view.decision?.choice;
-        // When this note answered an earlier one, the box goes on that note; here a chip points to it.
-        // The same goes for a lesson marked as helping an earlier note: the help is this note.
-        const answeredElsewhere = !view.fromNoteId && (choice === 'solved' || choice === 'helped') && view.item.direction === 'outbound';
-        if ((choice === 'solved' || choice === 'helped') && !answeredElsewhere) overlays.push({ type: 'block', at: lineEnd, view });
+        // When this note answered an earlier one, or helped it, the answer is
+        // shown on that note. This note already holds the answer in its own
+        // words, so it is left unmarked (decided Nov 24): a mark here only confused.
+        if (marksOtherNote(view, view.item.note_ids.every((id) => relevanceByNoteId.get(id)?.direction === 'outbound'))) continue;
+        if (choice === 'solved' || choice === 'helped') overlays.push({ type: 'block', at: lineEnd, view });
         else if (choice === 'merged') overlays.push({ type: 'chip', at: sentenceEnd, view }, { type: 'block', at: lineEnd, view });
         else overlays.push({ type: 'chip', at: sentenceEnd, view });
       }
@@ -2028,16 +2197,41 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, sharedNotes = [], 
     highlights.sort((x, y) => x.start - y.start);
     overlays.sort((x, y) => x.at - y.at || (x.type === 'chip' ? -1 : 1));
     return { views, shown, highlights, overlays };
-  }, [cards, decisions, displayedBody, editing, incomingDecisions, insightPlacements, noteSections, relationOf]);
+  }, [cards, decisions, displayedBody, editing, incomingDecisions, insightPlacements, noteSections, relationOf, relevanceByNoteId]);
   const { highlights, overlays } = cardLayout;
 
   useEffect(() => {
     let active = true;
     loadCardDecisions(note.id)
-      .then((loaded) => {
+      .then(async (loaded) => {
+        const own = { ...loaded.own };
+        let incoming = [...loaded.incoming];
+        // A Solve saved the earlier way sits on the answering note, aimed at
+        // the earlier note. Whichever of the two opens first moves it onto the
+        // earlier note as that note's own solved card; it is shown either way.
+        for (const [cardId, decision] of Object.entries(loaded.own)) {
+          const handed = isOldHandedSolution(decision) ? handedSolutionCard(decision.insight, note.id) : null;
+          if (!handed) continue;
+          try {
+            await saveCardDecision(handed.problemNoteId, handed.id, handed.decision);
+            await saveCardDecision(note.id, cardId, null);
+            delete own[cardId];
+            incoming.push({ ...handed.decision, cardId: handed.id, fromNoteId: handed.problemNoteId });
+          } catch { /* Kept as it was; it moves the next time. */ }
+        }
+        for (const decision of loaded.incoming) {
+          const handed = isOldHandedSolution(decision) && decision.insight.problem?.note_id === note.id ? handedSolutionCard(decision.insight, decision.fromNoteId) : null;
+          if (!handed) continue;
+          try {
+            await saveCardDecision(note.id, handed.id, handed.decision);
+            await saveCardDecision(decision.fromNoteId, decision.cardId, null);
+            own[handed.id] = handed.decision;
+            incoming = incoming.filter((item) => item !== decision);
+          } catch { /* Kept as it was; it moves the next time. */ }
+        }
         if (!active) return;
-        setDecisions(loaded.own);
-        setIncomingDecisions(loaded.incoming);
+        setDecisions(own);
+        setIncomingDecisions(incoming);
       })
       .catch(() => { if (active) setSaveState('error'); });
     return () => { active = false; };
@@ -2049,8 +2243,18 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, sharedNotes = [], 
    */
   const decide = (view: (typeof cardLayout.views)[number], choice: CardChoice | null, text?: string) => {
     const previous = decisions[view.id];
-    // Solving an earlier note's problem also marks that earlier note.
-    const target = choice === 'solved' && view.item.direction === 'outbound' ? view.item.problem?.note_id : undefined;
+    // Solving an earlier note's problem hands the solution to that note: it is
+    // saved there as its own solved card, and the card leaves this note.
+    const handed = choice === 'solved' && view.item.direction === 'outbound' && !view.fromNoteId ? handedSolutionCard(view.item, note.id) : null;
+    if (handed) {
+      const marker: IncomingCardDecision = { ...handed.decision, cardId: handed.id, fromNoteId: handed.problemNoteId };
+      setIncomingDecisions((current) => [...current, marker]);
+      saveCardDecision(handed.problemNoteId, handed.id, handed.decision).catch(() => {
+        setIncomingDecisions((current) => current.filter((item) => item !== marker));
+        setSaveState('error');
+      });
+      return;
+    }
     const next: CardDecision | null = choice
       ? {
         choice,
@@ -2058,7 +2262,6 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, sharedNotes = [], 
         kind: choice === 'downgraded' ? 'helps' : view.kind,
         insight: view.item,
         ...(text !== undefined ? { text } : {}),
-        ...(target ? { targetNoteId: target } : {}),
       }
       : null;
     const apply = (decision: CardDecision | null | undefined) => setDecisions((current) => {
@@ -2130,6 +2333,219 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, sharedNotes = [], 
 
   /** The sentence of this note a card is about, with its key part picked out. */
   const triggerFor = (span: { start: number; end: number } | null) => span ? triggerSentence(displayedBody, span) : null;
+
+  /** Every card the design's panel steps through, in reading order; dismissed ones stay so they can be undone. */
+  const designCards = useMemo(() => {
+    const shown = new Set(cardLayout.shown);
+    return cardLayout.views
+      .filter((view) => shown.has(view) || view.decision?.choice === 'rejected')
+      .sort((a, b) => (a.section?.index ?? 0) - (b.section?.index ?? 0) || (a.span?.start ?? 0) - (b.span?.start ?? 0));
+  }, [cardLayout]);
+  const activeCard = designCards.find((view) => view.id === activeCardId) ?? null;
+  const relatedCount = relatedNotes.forWholeNote.length + noteSections.reduce((count, section) => count + relatedNotes.forSection(section.id).length, 0);
+  const insightFailed = Boolean(retrieval?.insight_failed);
+  // When a note has cards, the notes the search matched without one, and word
+  // that the suggestions did not finish, come after them as a last page.
+  const hasRelatedPage = designCards.length > 0 && (relatedCount > 0 || insightFailed);
+  const designPages = hasRelatedPage ? [...designCards.map((view) => view.id), RELATED_PAGE] : designCards.map((view) => view.id);
+  const onRelatedPage = hasRelatedPage && activeCardId === RELATED_PAGE;
+  const activePosition = designPages.indexOf(activeCardId ?? '');
+  const designPendingCount = designCards.filter((view) => isPendingCard(view.decision)).length;
+  const citedNotesOf = (view: CardView) => view.item.note_ids.map((id) => noteById.get(id)).filter((item): item is Note => item !== undefined);
+  // While a card is open, or a result under a passage, the rest of the note fades back.
+  // A card this note answered elsewhere has nothing here to focus on, so nothing fades.
+  // The phone layout: a bottom bar opens the panel as a sheet over the note.
+  const sheetMode = designView && narrowScreen;
+  // On a phone the note stays as it is under the sheet, as in the design.
+  const designFocus = sheetMode ? false : summaryOpen ? activeCard !== null && !marksOtherNote(activeCard, isOutbound(activeCard.item)) : dropCardId !== null;
+
+  const closeDesignReading = () => { setPanelNoteId(null); setPanelRelevance(null); setPanelFocus(''); };
+  const closeDesignPanel = () => { setSummaryOpen(false); setActiveCardId(null); closeDesignReading(); };
+  const openDesignCard = (cardId: string | null) => { setDropCardId(null); closeDesignReading(); setActiveCardId(cardId); setSummaryOpen(true); };
+  /** The panel button: the first card still waiting, or the first at all, or the empty state. */
+  const openDesignPanel = () => {
+    const live = designCards.filter((view) => view.decision?.choice !== 'rejected');
+    openDesignCard((live.find((view) => isPendingCard(view.decision)) ?? live[0])?.id ?? (hasRelatedPage ? RELATED_PAGE : null));
+  };
+  const stepDesignCard = (delta: number) => {
+    if (!designPages.length) return;
+    const next = designPages[(Math.max(activePosition, 0) + delta + designPages.length) % designPages.length];
+    closeDesignReading();
+    setActiveCardId(next);
+  };
+  /** A choice closes the panel and opens its result under the passage, as in the design. */
+  const chooseDesign = (view: CardView, choice: CardChoice | null, text?: string) => {
+    decide(view, choice, text);
+    if (!choice || choice === 'downgraded') return;
+    const outbound = isOutbound(view.item) || view.item.direction === 'outbound';
+    // A solution handed to an earlier note leaves this note entirely.
+    if (choice === 'solved' && outbound) { closeDesignPanel(); return; }
+    // On a phone the sheet stays on the card and shows what was chosen, as in the design.
+    if (sheetMode) return;
+    // Marking this note as helping an earlier one leaves nothing on it, so the
+    // panel stays on the card to say where it went, with Undo.
+    if (choice === 'helped' && outbound) return;
+    closeDesignPanel();
+    if (choice !== 'rejected') setDropCardId(view.id);
+  };
+
+  // A search that finishes while the panel shows nothing opens its first card.
+  // So does one that replaced the open card: a card's id comes from its
+  // wording, and a new search rewords it, so the old id finds nothing and the
+  // panel said "Nothing to act on" over cards it had (fixed Nov 26).
+  useEffect(() => {
+    if (!designView || !summaryOpen || panelNoteId) return;
+    if (activeCardId && designPages.includes(activeCardId)) return;
+    const first = designCards.find((view) => isPendingCard(view.decision));
+    if (first) setActiveCardId(first.id);
+    else if (activeCardId) setActiveCardId(designCards.find((view) => view.decision?.choice !== 'rejected')?.id ?? (hasRelatedPage ? RELATED_PAGE : null));
+    // Only a new search should move the panel on its own.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [retrieval]);
+
+  // On a computer, a search that just finished with something to show opens
+  // the side panel, so it is not missed (decided Nov 25). Phones keep the
+  // sheet down; their footer says what was found.
+  useEffect(() => {
+    if (!searchesFinished || sheetMode || summaryOpen || !window.matchMedia('(min-width: 1280px)').matches) return;
+    if (designView ? designCards.length > 0 || relatedCount > 0 : Boolean(retrieval?.results.length)) {
+      if (designView) openDesignPanel(); else setSummaryOpen(true);
+    }
+    // Only a newly finished search should open the panel.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchesFinished]);
+
+  /** What a running search says, with how far the readers have got. */
+  const searchingLabel = `Searching your notes${retrievalProgress?.agents_total ? ` · ${retrievalProgress.agents_done}/${retrievalProgress.agents_total}` : '…'}`;
+
+  /** Notes the search matched that no card used, by the part of the note they match, then the whole note. */
+  const relatedListsHeaded = (lead: 'Related' | 'Also related') => <>
+    {noteSections.map((section) => { const results = relatedNotes.forSection(section.id); return results.length ? <RelatedNotesList key={`part-${section.id}`} heading={noteSections.length > 1 ? `${lead} to part ${section.index + 1}` : lead} results={results} notesById={noteById} onOpen={showCitedNote} /> : null; })}
+    {relatedNotes.forWholeNote.length > 0 && <RelatedNotesList heading={`${lead} to the whole note`} results={relatedNotes.forWholeNote} notesById={noteById} onOpen={showCitedNote} />}
+  </>;
+  const relatedLists = relatedListsHeaded('Related');
+  /** Shown when the search found notes but stopped before writing suggestions from them. */
+  const failedNotice = insightFailed ? <div role="alert" className="rounded-xl border border-[#f0d9a8] bg-[#fff8e8] p-5">
+    <h3 className="text-sm font-semibold text-[#6f5100]">Suggestions did not finish</h3>
+    <p className="mt-1.5 text-[13px] leading-relaxed text-[#806b35]">{relatedCount
+      ? 'The search found related notes, listed below, but stopped before it could turn them into suggestions. Searching again usually finishes.'
+      : 'The search stopped before it could write suggestions, so this is not a sign your notes had nothing to offer. Searching again usually finishes.'}</p>
+    <button type="button" onClick={() => requestReretrieval('relevant')} disabled={retrievalLoading || requiresDomain} className="mt-3 flex min-h-[36px] items-center gap-1.5 rounded-lg border border-[#e3c98a] bg-white px-3 text-[13px] font-medium text-[#6f5100] hover:border-[#d4ad55] disabled:opacity-50"><RefreshCw className="h-3.5 w-3.5" /> Search again</button>
+  </div> : null;
+
+  /**
+   * What the phone's footer bar says: what the search found, by kind ("1
+   * insight · 2 related notes"), or plainly that there is nothing (decided Nov 25).
+   */
+  const footerSummary = (() => {
+    const insightCount = designCards.filter((view) => view.decision?.choice !== 'rejected').length;
+    const counted = [
+      insightCount ? `${insightCount} ${insightCount === 1 ? 'insight' : 'insights'}` : '',
+      relatedCount ? `${relatedCount} related ${relatedCount === 1 ? 'note' : 'notes'}` : '',
+    ].filter(Boolean).join(' · ');
+    if (counted) return counted;
+    if (insightFailed) return 'Suggestions did not finish';
+    if (retrievalError) return 'Could not search your notes';
+    return retrieval ? 'Nothing from your notes' : 'Not searched yet';
+  })();
+
+  /**
+   * On a phone, tapping the title or the note's text starts editing; there is
+   * no Edit button (decided Nov 25). A marked passage, a pill, a link or the
+   * Domain and date still do their own thing, and while the sheet is open a
+   * tap on the note only lowers it.
+   */
+  const tapToEdit = (event: React.MouseEvent) => {
+    if (!narrowScreen || editing) return;
+    if ((event.target as Element).closest('button, a, input, mark, [role="button"]')) return;
+    if (sheetMode && summaryOpen) { closeDesignPanel(); return; }
+    setEditing(true);
+    requestAnimationFrame(() => bodyRef.current?.focus());
+  };
+
+  const switchSuggestionsView = () => {
+    const next: NoteSuggestionsView = designView ? 'classic' : 'design';
+    writeNoteSuggestionsView(next);
+    setSuggestionsView(next);
+    setMenuOpen(false);
+    setActiveCardId(null);
+    setDropCardId(null);
+    closeDesignReading();
+    setSummaryOpen(next === 'classic' && window.matchMedia('(min-width: 1280px)').matches);
+  };
+
+  /**
+   * A section of the note as the design draws it. A section with a card gets a
+   * line in the card's colour; its chosen cards end it with a pill that opens
+   * what was chosen. Merged words and answers from later notes sit below it.
+   */
+  const renderDesignSection = (section: NoteSection) => {
+    const text = formattedBody ? <FormattedNoteBody text={section.text} /> : <span className="whitespace-pre-wrap break-words">{section.text}</span>;
+    // A card this note answered elsewhere leaves no mark here; it stays in the panel for Undo.
+    const here = designCards.filter((view) => view.section?.id === section.id && view.decision?.choice !== 'rejected' && !marksOtherNote(view, isOutbound(view.item)));
+    const selected = summaryOpen ? here.find((view) => view.id === activeCardId) : undefined;
+    const dropView = summaryOpen ? undefined : here.find((view) => view.id === dropCardId && isActedCard(view.decision));
+    const color = designFocus && !selected && !dropView ? '#C4C4CA' : '#2B2B2E';
+    const incomingHere = overlays.filter((overlay) => overlay.view.fromNoteId && overlay.type === 'block' && overlay.view.section?.id === section.id);
+    const below = <>
+      {here.filter((view) => view.decision?.choice === 'merged').map((view) => {
+        const tone = DESIGN_TONES.extension;
+        const source = designSourceOf(view.item, noteById);
+        return <div key={`added-${view.id}`} className="mt-3.5 flex flex-col gap-1.5 rounded-[10px] border px-[18px] py-3.5" style={{ background: tone.tint, borderColor: tone.soft }}>
+          <span className="text-[18px] leading-relaxed text-[#2B2B2E]">{plainNoteText(view.decision?.text ?? view.item.answer?.text ?? view.item.action)}</span>
+          {source.note && <button type="button" onClick={(event) => { event.stopPropagation(); showCitedNote(source.note!.id, view.item.answer?.text ?? ''); }} className="self-start text-[13px] text-[#6B6B70] hover:underline">From {source.sharedBy ? `${source.sharedBy}’s ` : ''}“{source.title}”{source.date ? ` · ${source.date}` : ''} ↗</button>}
+        </div>;
+      })}
+      {incomingHere.map(({ view }) => {
+        const tone = DESIGN_TONES.solution;
+        const from = view.fromNoteId ? noteById.get(view.fromNoteId) : undefined;
+        return <div key={`incoming-${view.id}`} className="mt-3.5 flex flex-col gap-1.5 rounded-[10px] border px-[18px] py-3.5" style={{ background: tone.tint, borderColor: tone.soft }}>
+          <span className="text-[18px] leading-relaxed text-[#2B2B2E]"><span className="mr-1.5 text-[13px] font-semibold" style={{ color: tone.ink }}>Solution</span>{plainNoteText(view.item.answer?.text ?? view.item.action)}</span>
+          {from && <button type="button" onClick={(event) => { event.stopPropagation(); showCitedNote(from.id, view.item.answer?.text ?? ''); }} className="self-start text-[13px] text-[#6B6B70] hover:underline">From “{noteLabel(from)}” · {formatDate(from.created_at)} ↗</button>}
+        </div>;
+      })}
+    </>;
+
+    if (!here.length) return <section key={section.id} id={`note-${section.id}`} aria-label={`Section ${section.index + 1}`} onClick={() => { if (summaryOpen) closeDesignPanel(); setDropCardId(null); }} className="cursor-text scroll-mt-20 pr-5 transition-colors" style={{ color }}>{text}{below}</section>;
+
+    const lead = selected ?? here.find((view) => isPendingCard(view.decision)) ?? here[0];
+    // The line and fill take the colour of the card that is open, if any.
+    const tone = DESIGN_TONES[(selected ?? dropView ?? lead).kind];
+    const allActed = here.every((view) => isActedCard(view.decision));
+    const lineWidth = selected || (allActed && !summaryOpen) ? 3 : 2;
+    const lineColor = selected ? tone.ink : summaryOpen ? tone.soft : allActed ? tone.ink : tone.soft;
+    const pick = () => {
+      // On a phone a chosen passage opens its card in the sheet, as in the design.
+      if (!summaryOpen && allActed && !sheetMode) { setDropCardId((id) => (id === lead.id ? null : lead.id)); return; }
+      if (selected) { closeDesignPanel(); return; }
+      openDesignCard(lead.id);
+    };
+    const blockStyle: React.CSSProperties = selected
+      ? sheetMode
+        // On a phone the open passage is a tinted box; there is no panel beside it to reach.
+        ? { background: tone.tint, borderRadius: 10, padding: '10px 12px 10px 0', margin: '-10px 0' }
+        : { background: tone.tint, borderRadius: '10px 0 0 10px', padding: '16px 0', margin: '-16px 0', boxShadow: `0 0 0 100vw ${tone.tint}`, clipPath: 'inset(0 -100vw 0 0)' }
+      : dropView ? { background: tone.tint, borderRadius: 10, padding: '14px 18px 14px 0', margin: '-14px 0 0' } : {};
+    return <section key={section.id} id={`note-${section.id}`} aria-label={`Section ${section.index + 1}`} className="-ml-5 scroll-mt-20">
+      <div role="button" tabIndex={0} aria-pressed={Boolean(selected)} title={selected ? 'Close what your notes say' : 'Show what your notes say'} onClick={pick} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); pick(); } }} className="flex cursor-pointer outline-none transition-colors focus-visible:ring-2 focus-visible:ring-[#477bea]/30" style={blockStyle}>
+        <span className="flex w-5 shrink-0 self-stretch" aria-hidden="true"><span className="rounded-sm transition-all" style={{ width: lineWidth, background: lineColor }} /></span>
+        <div className="min-w-0 flex-1 transition-colors" style={{ color }}>
+          {text}
+          {here.some((view) => isActedCard(view.decision)) && <span className="mt-1 inline-flex flex-wrap gap-1.5 align-[2px]">
+            {here.filter((view) => isActedCard(view.decision)).map((view) => {
+              const viewTone = DESIGN_TONES[view.kind];
+              const open = !summaryOpen && dropCardId === view.id;
+              return <button key={`pill-${view.id}`} type="button" onClick={(event) => { event.stopPropagation(); if (summaryOpen || sheetMode) openDesignCard(view.id); else setDropCardId((id) => (id === view.id ? null : view.id)); }} className="inline-flex max-w-full items-center gap-1 truncate whitespace-nowrap rounded-full px-[9px] text-xs font-semibold leading-5 hover:brightness-95 sm:max-w-[22rem]" style={{ background: viewTone.tint, color: viewTone.ink }}>
+                ✓ {designChoiceLabel(view.decision?.choice, designSourceOf(view.item, noteById))}{!summaryOpen && !sheetMode && <span aria-hidden="true">{open ? ' ▴' : ' ▾'}</span>}
+              </button>;
+            })}
+          </span>}
+        </div>
+      </div>
+      {dropView && <div className="ml-5"><DesignDrop view={dropView} notesById={noteById} outbound={isOutbound(dropView.item)} onUndo={() => { decide(dropView, designUndoChoice(dropView)); setDropCardId(null); }} onOpenSource={showCitedNote} /></div>}
+      <div className="ml-5">{below}</div>
+    </section>;
+  };
 
   const [dismissedGoalDomains, setDismissedGoalDomains] = useState(() => readGoalPromptDismissed(userId));
   const goalSuggestions = retrieval?.goal_suggestions ?? [];
@@ -2228,7 +2644,7 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, sharedNotes = [], 
     }
     const words = choice === 'merged'
       ? plainNoteText(view.decision?.text ?? item.answer?.text ?? item.action)
-      : choice === 'solved' ? plainNoteText(item.answer?.text ?? item.action)
+      : choice === 'solved' ? plainNoteText(item.solution || (item.answer?.text ?? item.action))
         : item.kind === 'helps' ? `Might help to ${plainNoteText(item.action)}` : `Might help: “${plainNoteText(item.answer?.text ?? item.action)}”`;
     return <span key={key} {...handlers} className={`my-2 block cursor-pointer rounded-lg border px-3 py-2 text-[15px] leading-relaxed hover:brightness-[0.99] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] ${choice === 'merged' ? 'border-y-0 border-r-0 border-l-[3px] border-[#c8acea] bg-[#fbf8ff] text-[#3d2a57]' : `border-dashed ${style.outline} text-[#2d2d2d]`}`}>
       {choice === 'solved' && <span className={`mr-1.5 text-[12px] font-semibold ${style.actionText}`}>Solution:</span>}
@@ -2355,8 +2771,9 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, sharedNotes = [], 
       <header className="relative flex min-h-14 shrink-0 items-center border-b border-[#ececef] px-2 sm:h-14 sm:border-0 sm:px-2">
         <div className="flex items-center gap-1 text-[#777] sm:gap-2">
           {previousNote ? <><button type="button" onClick={() => void returnToPrevious()} aria-label={`Back to ${noteLabel(previousNote)}`} title={`Back to ${noteLabel(previousNote)}`} className="flex h-11 w-11 items-center justify-center rounded-md hover:bg-[#f4f4f4] sm:h-9 sm:w-9"><ArrowLeft className="h-5 w-5" /></button><span className="mx-1 hidden h-7 w-px bg-[#e5e5e5] sm:block" /></> : <button type="button" onClick={() => void leaveWorkspace()} aria-label="Back to dashboard" title="Back to dashboard" className="flex h-11 w-11 items-center justify-center rounded-md hover:bg-[#f4f4f4] xl:hidden"><ArrowLeft className="h-5 w-5" /></button>}
-          <button type="button" onClick={onAddNote} aria-label="Add a note" title="Add a note" className="flex h-10 w-10 items-center justify-center rounded-md bg-[#477bea] text-white hover:bg-[#3d6ed7] sm:h-8 sm:w-8"><Plus className="h-5 w-5" /></button>
-          <button type="button" onClick={() => setSearchRequest({ query: '' })} aria-label="Search notes, pages, and Domains" title="Search notes, pages, and Domains" className="flex h-10 w-10 items-center justify-center rounded-md hover:bg-[#f4f4f4] sm:h-9 sm:w-9"><Search className="h-5 w-5" /></button>
+          {/* A note open on a phone keeps only the way back and the three dots (decided Nov 25). */}
+          <button type="button" onClick={onAddNote} aria-label="Add a note" title="Add a note" className={`${sheetMode ? 'hidden' : 'flex'} h-10 w-10 items-center justify-center rounded-md bg-[#477bea] text-white hover:bg-[#3d6ed7] sm:h-8 sm:w-8`}><Plus className="h-5 w-5" /></button>
+          <button type="button" onClick={() => setSearchRequest({ query: '' })} aria-label="Search notes, pages, and Domains" title="Search notes, pages, and Domains" className={`${sheetMode ? 'hidden' : 'flex'} h-10 w-10 items-center justify-center rounded-md hover:bg-[#f4f4f4] sm:h-9 sm:w-9`}><Search className="h-5 w-5" /></button>
         </div>
         <div className="absolute left-1/2 hidden -translate-x-1/2 text-sm xl:block"><NoteDomainPicker category={note.category} muses={muses} saving={saving} onChange={onChangeDomain} /></div>
         <div className="relative ml-auto flex items-center gap-1 text-[#777]">
@@ -2366,35 +2783,125 @@ function NoteReadingWorkspace({ note, previousNote, allNotes, sharedNotes = [], 
               {usedInNotes.map((item) => <button key={item.id} role="menuitem" type="button" onClick={() => { setUsedInMenuOpen(false); void leaveWorkspace(item, false); }} className="block w-full truncate px-4 py-2.5 text-left text-sm text-[#333] hover:bg-[#edf3ff] hover:text-[#315fc5]">{noteLabel(item)}</button>)}
             </div>}
           </div>}
-          <button type="button" disabled={retrievalLoading || isGuide || requiresDomain} onClick={() => requestReretrieval()} aria-label="Reload related notes" title={requiresDomain ? 'Choose a Domain before retrieval' : 'Reload related notes'} className="flex h-10 w-10 items-center justify-center rounded-md border border-[#dedede] bg-white shadow-sm hover:border-[#adc3ff] hover:text-[#477bea] disabled:cursor-wait disabled:opacity-50 sm:h-9 sm:w-9"><RefreshCw className={`h-4 w-4 ${retrievalLoading ? 'animate-spin' : ''}`} /></button>
           <button type="button" disabled={!newerNote} onClick={() => newerNote && void leaveWorkspace(newerNote, false)} aria-label="Newer note" title="Newer note" className="hidden h-9 w-9 items-center justify-center rounded-md hover:bg-[#f4f4f4] disabled:opacity-25 sm:flex"><ChevronLeft className="h-4 w-4" /></button>
           <button type="button" disabled={!olderNote} onClick={() => olderNote && void leaveWorkspace(olderNote, false)} aria-label="Older note" title="Older note" className="hidden h-9 w-9 items-center justify-center rounded-md hover:bg-[#f4f4f4] disabled:opacity-25 sm:flex"><ChevronRight className="h-4 w-4" /></button>
           <button type="button" onClick={() => setMenuOpen((open) => !open)} aria-label="Note options" aria-expanded={menuOpen} className="flex h-10 w-10 items-center justify-center rounded-md hover:bg-[#f4f4f4] sm:h-9 sm:w-9"><MoreHorizontal className="h-5 w-5" /></button>
-          {menuOpen && <div className="absolute right-0 top-11 z-30 w-56 overflow-hidden rounded-lg border border-[#ddd] bg-white py-1 text-sm shadow-xl">{!note.is_sample && <button type="button" disabled={saving} onClick={() => { setMenuOpen(false); void onShare(note); }} className="flex w-full items-center gap-2 px-4 py-2.5 text-left hover:bg-[#f5f5f5]"><Share2 className="h-4 w-4" /> Copy to public notes</button>}<button type="button" disabled={saving} onClick={() => { setMenuOpen(false); void onDelete(note); }} className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-red-600 hover:bg-red-50"><Trash2 className="h-4 w-4" /> Delete note</button></div>}
+          {menuOpen && <div className="absolute right-0 top-11 z-30 w-56 overflow-hidden rounded-lg border border-[#ddd] bg-white py-1 text-sm shadow-xl"><button type="button" onClick={switchSuggestionsView} className="flex w-full items-center gap-2 px-4 py-2.5 text-left hover:bg-[#f5f5f5]"><Layers3 className="h-4 w-4" /> {designView ? 'Classic suggestions view' : 'New suggestions view'}</button>{!note.is_sample && <button type="button" disabled={saving} onClick={() => { setMenuOpen(false); void onShare(note); }} className="flex w-full items-center gap-2 px-4 py-2.5 text-left hover:bg-[#f5f5f5]"><Share2 className="h-4 w-4" /> Copy to public notes</button>}<button type="button" disabled={saving} onClick={() => { setMenuOpen(false); void onDelete(note); }} className="flex w-full items-center gap-2 px-4 py-2.5 text-left text-red-600 hover:bg-red-50"><Trash2 className="h-4 w-4" /> Delete note</button></div>}
         </div>
       </header>
 
-      <div className={`grid min-h-0 flex-1 overflow-hidden bg-[#f7f7f9] sm:rounded-xl sm:border sm:border-[#d8d8d8] sm:shadow-[0_2px_9px_rgba(0,0,0,0.13)] ${summaryOpen ? 'xl:grid-cols-[minmax(0,1.08fr)_minmax(360px,.92fr)]' : 'grid-cols-1'}`}>
-        <section className={`relative min-h-0 min-w-0 flex-col overflow-hidden bg-white xl:flex ${summaryOpen ? 'hidden' : 'flex'}`}>
+      <div className={`relative grid min-h-0 flex-1 overflow-hidden bg-[#f7f7f9] sm:rounded-xl sm:border sm:border-[#d8d8d8] sm:shadow-[0_2px_9px_rgba(0,0,0,0.13)] ${summaryOpen && !sheetMode ? 'xl:grid-cols-[minmax(0,1.08fr)_minmax(360px,.92fr)]' : 'grid-cols-1'}`}>
+        {/* On a phone the note stays in view under the sheet. */}
+        <section className={`relative min-h-0 min-w-0 flex-col overflow-hidden bg-white xl:flex ${summaryOpen && !sheetMode ? 'hidden' : 'flex'}`}>
           <div className="absolute right-3 top-3 z-10 flex gap-2 sm:right-4">
-            {!editing && <button type="button" onClick={() => { setEditing(true); requestAnimationFrame(() => bodyRef.current?.focus()); }} className="h-10 rounded-md border border-[#dedede] bg-white px-3 text-xs font-medium text-[#555] shadow-sm hover:border-[#adc3ff] hover:text-[#477bea] xl:hidden">Edit</button>}
+            {/* While a search runs and the panel is closed, say so loudly: a coloured, moving button (decided Nov 25). */}
+            {retrievalLoading && !summaryOpen && !sheetMode ? <button type="button" onClick={() => (designView ? openDesignPanel() : setSummaryOpen(true))} aria-controls="note-suggestions-panel" className="ocreda-searching flex h-10 items-center gap-2 rounded-full bg-[#477bea] pl-3.5 pr-4 text-[13px] font-medium text-white shadow-[0_6px_18px_rgba(71,123,234,0.4)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] focus-visible:ring-offset-2">
+              <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" /><span role="status">{searchingLabel}</span>
+            </button>
+            : designView ? !summaryOpen && !sheetMode && <button type="button" onClick={openDesignPanel} aria-label="Show suggestions panel" title="Show suggestions panel" aria-controls="note-suggestions-panel" className="flex h-10 items-center gap-1.5 rounded-[10px] px-2.5 text-[#55555B] hover:bg-[#f4f4f4] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">
+              {retrievalLoading ? <Loader2 className="h-5 w-5 animate-spin text-[#477bea]" /> : <PanelRightOpen className="h-5 w-5 rotate-180" aria-hidden="true" />}
+              {!retrievalLoading && designPendingCount > 0 && <span className="text-xs font-medium">{designPendingCount}</span>}
+            </button> : <>
             <button type="button" onClick={() => setSummaryOpen((open) => !open)} aria-label={summaryOpen ? 'Hide suggestions' : 'Show suggestions'} title={summaryOpen ? 'Hide suggestions' : 'Show suggestions'} aria-controls="note-suggestions-panel" aria-expanded={summaryOpen} className="flex h-10 w-10 items-center justify-center rounded-md border border-[#dedede] bg-white text-[#555] shadow-sm hover:border-[#adc3ff] hover:text-[#477bea] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] sm:h-8 sm:w-8"><PanelRightOpen className={`h-4 w-4 ${summaryOpen ? '' : 'rotate-180'}`} aria-hidden="true" /></button>
             {!summaryOpen && <button type="button" onClick={() => setSummaryOpen(true)} aria-controls="note-suggestions-panel" className="rounded-md border border-[#dedede] bg-white px-3 py-1.5 text-xs text-[#555] shadow-sm hover:border-[#adc3ff] hover:text-[#477bea] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea]">Show suggestions</button>}
+            </>}
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto px-4 pb-24 pt-14 sm:px-12 sm:pt-12 xl:px-[8%]">
-            {editing ? <div className="mx-auto max-w-3xl"><input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} aria-label="Note title" placeholder={defaultNoteTitle(body) || 'Title (optional)'} className="w-full bg-transparent text-2xl font-semibold outline-none placeholder:font-normal placeholder:text-[#c4c4c6]" /><NoteBodyEditor ref={bodyRef} value={body} onChange={setBody} autoFocus ariaLabel="Note text" onActiveFormatsChange={setActiveFormats} wrapperClassName="mt-10" className="min-h-[520px] w-full bg-transparent text-base leading-[1.7]" /></div> : <article className="relative mx-auto max-w-3xl" onDoubleClick={() => { setEditing(true); requestAnimationFrame(() => bodyRef.current?.focus()); }} title="Double-click to edit">{(title.trim() || body.trim()) && <h1 className="break-words px-2 py-1 text-2xl font-semibold">{plainNoteText(title) || defaultNoteTitle(body)}</h1>}<div className="mt-2 flex flex-wrap gap-x-3 px-2 text-xs text-[#999]" onDoubleClick={(event) => event.stopPropagation()}><NoteDomainPicker category={note.category} muses={muses} saving={saving} onChange={onChangeDomain} showPrefix /><button type="button" onClick={openDate} className="hover:text-[#477bea]">{fullNoteDate(note.created_at)}</button></div>
-              <div className="mt-9 w-full rounded-md px-2 py-2 text-left text-base leading-[1.7]">
+          {/* Room at the bottom so the end of the note can scroll above the bar or the open sheet. */}
+          <div className={`min-h-0 flex-1 overflow-y-auto px-4 pt-14 sm:px-12 sm:pt-12 xl:px-[8%] ${sheetMode && summaryOpen ? 'pb-[66vh]' : 'pb-24'}`}>
+            {editing ? <div className="mx-auto max-w-3xl"><input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} aria-label="Note title" placeholder={defaultNoteTitle(body) || 'Title (optional)'} className="w-full bg-transparent text-2xl font-semibold outline-none placeholder:font-normal placeholder:text-[#c4c4c6]" /><NoteBodyEditor ref={bodyRef} value={body} onChange={setBody} autoFocus ariaLabel="Note text" onActiveFormatsChange={setActiveFormats} wrapperClassName="mt-10" className="min-h-[520px] w-full bg-transparent text-base leading-[1.7]" /></div> : <article className="relative mx-auto max-w-3xl" onDoubleClick={() => { setEditing(true); requestAnimationFrame(() => bodyRef.current?.focus()); }} onClick={tapToEdit} title={narrowScreen ? undefined : 'Double-click to edit'}>{(title.trim() || body.trim()) && <h1 className="break-words px-2 py-1 text-2xl font-semibold">{plainNoteText(title) || defaultNoteTitle(body)}</h1>}<div className="mt-2 flex flex-wrap gap-x-3 px-2 text-xs text-[#999]" onDoubleClick={(event) => event.stopPropagation()}><NoteDomainPicker category={note.category} muses={muses} saving={saving} onChange={onChangeDomain} showPrefix /><button type="button" onClick={openDate} className="hover:text-[#477bea]">{fullNoteDate(note.created_at)}</button></div>
+              {designView ? <div className="mt-9 flex w-full flex-col gap-[18px] px-2 py-2 text-left text-[17px] leading-[1.6] xl:gap-[22px] xl:text-[19px] xl:leading-[1.65]">
+                {noteSections.length ? noteSections.map(renderDesignSection) : <span className="text-left text-base text-[#999]">{narrowScreen ? 'Tap to start writing.' : 'Double-click to start writing.'}</span>}
+              </div> : <div className="mt-9 w-full rounded-md px-2 py-2 text-left text-base leading-[1.7]">
                 <div className="min-w-0 flex-1 space-y-7">
-                  {noteSections.length ? noteSections.map((section) => <section key={section.id} id={`note-${section.id}`} tabIndex={0} aria-label={`Section ${section.index + 1}`} aria-current={selectedSectionId === section.id ? 'true' : undefined} onClick={() => selectSection(section.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectSection(section.id); } }} className={`cursor-text scroll-mt-20 border-l-[3px] pl-4 outline-none transition hover:border-[#888] focus-visible:ring-2 focus-visible:ring-[#477bea]/30 ${selectedSectionId === section.id ? 'border-[#666]' : 'border-[#d2d2d5]'}`}>{renderSectionContent(section)}</section>) : <span className="text-left text-[#999]">Double-click to start writing.</span>}
+                  {noteSections.length ? noteSections.map((section) => <section key={section.id} id={`note-${section.id}`} tabIndex={0} aria-label={`Section ${section.index + 1}`} aria-current={selectedSectionId === section.id ? 'true' : undefined} onClick={() => selectSection(section.id)} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); selectSection(section.id); } }} className={`cursor-text scroll-mt-20 border-l-[3px] pl-4 outline-none transition hover:border-[#888] focus-visible:ring-2 focus-visible:ring-[#477bea]/30 ${selectedSectionId === section.id ? 'border-[#666]' : 'border-[#d2d2d5]'}`}>{renderSectionContent(section)}</section>) : <span className="text-left text-[#999]">{narrowScreen ? 'Tap to start writing.' : 'Double-click to start writing.'}</span>}
                 </div>
-              </div>
+              </div>}
             </article>}
           </div>
           <ReadingFormatBar onFormat={applyReadingFormat} onDone={finishEditing} editing={editing} active={activeFormats} />
           <span className="absolute bottom-3 right-5 text-[11px] text-[#999]">{saving || saveState === 'saving' ? 'Saving…' : saveState === 'saved' ? 'Saved' : saveState === 'error' ? 'Save failed' : ''}</span>
+          {/* The phone's way in: a bar along the bottom saying how many cards wait, as in the design. */}
+          {/* A tap or a swipe on it opens the sheet (decided Nov 25). */}
+          {/* While a search runs the bar turns blue with a moving sheen, so it is noticed (decided Nov 25). */}
+          {sheetMode && !summaryOpen && !editing && <button type="button" {...tapOrSwipe(openDesignPanel)} aria-label="Open what your notes say" aria-controls="note-suggestions-panel" className={`absolute inset-x-0 bottom-0 z-20 flex h-16 select-none flex-col items-center justify-start gap-2 rounded-t-[20px] pt-2.5 transition-colors duration-300 ${retrievalLoading ? 'ocreda-searching bg-[#477bea] shadow-[0_-6px_22px_rgba(71,123,234,0.45)]' : 'bg-[#F7F7F8] shadow-[0_-6px_20px_rgba(10,10,20,0.12)]'}`}>
+            <span className={`h-[5px] w-10 rounded-full ${retrievalLoading ? 'bg-white/60' : 'bg-[#C9C9CF]'}`} aria-hidden="true" />
+            <span role="status" className={`flex items-center gap-1.5 text-[13px] ${retrievalLoading ? 'font-medium text-white' : 'text-[#55555B]'}`}>{retrievalLoading ? <><Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" /> {searchingLabel}</> : footerSummary}</span>
+          </button>}
         </section>
 
-        {summaryOpen && <aside id="note-suggestions-panel" className="relative flex min-h-0 flex-col overflow-hidden bg-[#f7f7f9] xl:border-l xl:border-[#dedede]">
+        {summaryOpen && designView && <aside id="note-suggestions-panel" aria-label="What works for you" className={sheetMode
+          // On a phone the panel is a sheet over the lower part of the note.
+          ? 'absolute inset-x-0 bottom-0 z-20 flex h-[62%] min-h-0 flex-col overflow-hidden rounded-t-[20px] bg-[#F7F7F8] shadow-[0_-10px_30px_rgba(10,10,20,0.18)]'
+          : 'relative flex min-h-0 flex-col overflow-hidden border-l border-[#EEEEF0] bg-[#F7F7F8]'}>
+          {/* The sheet's one control (decided Nov 25): its grey bar lowers it back into the footer on a tap or a swipe. */}
+          {sheetMode && <button type="button" {...tapOrSwipe(closeDesignPanel)} aria-label="Collapse suggestions" title="Collapse" className="flex h-10 shrink-0 select-none items-center justify-center"><span className="h-[5px] w-10 rounded-full bg-[#C9C9CF]" aria-hidden="true" /></button>}
+          {panelNote ? (() => {
+            // Arrows step through the notes the open card rests on, each at the words it quoted.
+            const cited = activeCard ? citedNotesOf(activeCard) : [];
+            const list = cited.some((item) => item.id === panelNote.id) ? cited : [panelNote];
+            return <DesignReadingView
+              notes={list}
+              index={list.findIndex((item) => item.id === panelNote.id)}
+              focus={panelFocus}
+              relevanceFor={(noteId) => relevanceByNoteId.get(noteId)}
+              onIndex={(index) => { const next = list[index]; if (!next) return; setPanelNoteId(next.id); setPanelFocus(activeCard?.item.quotes?.find((quote) => quote.note_id === next.id)?.text ?? ''); }}
+              onClose={closeDesignReading}
+              onOpenFull={(item) => void leaveWorkspace(item, false)}
+            />;
+          })() : activeCard ? <DesignSuggestionPanel
+            key={activeCard.id}
+            view={activeCard}
+            position={activePosition}
+            total={designPages.length}
+            notesById={noteById}
+            outbound={isOutbound(activeCard.item)}
+            refreshing={retrievalLoading}
+            onPrev={() => stepDesignCard(-1)}
+            onNext={() => stepDesignCard(1)}
+            onRefresh={() => requestReretrieval()}
+            onHide={closeDesignPanel}
+            onChoose={(choice, text) => chooseDesign(activeCard, choice, text)}
+            onFindOther={() => requestReretrieval('relevant')}
+            onOpenSource={showCitedNote}
+            sheet={sheetMode}
+          /> : onRelatedPage ? <div className="flex min-h-0 flex-1 flex-col">
+            <DesignPanelBar position={activePosition} total={designPages.length} refreshing={retrievalLoading} onPrev={() => stepDesignCard(-1)} onNext={() => stepDesignCard(1)} onRefresh={() => requestReretrieval()} onHide={closeDesignPanel} sheet={sheetMode} />
+            <div className={`min-h-0 flex-1 overflow-y-auto ${sheetMode ? 'px-5 pb-6 pt-2' : 'px-6 pb-10 pt-4 sm:px-12'}`}>
+              <div className="max-w-[644px] space-y-4">
+                {failedNotice}
+                {relatedListsHeaded('Also related')}
+                {goalPrompt}
+              </div>
+            </div>
+          </div> : <div className="flex min-h-0 flex-1 flex-col">
+            {sheetMode ? <DesignPanelBar position={0} total={0} refreshing={retrievalLoading || isGuide || requiresDomain} onPrev={() => undefined} onNext={() => undefined} onRefresh={() => requestReretrieval()} onHide={closeDesignPanel} sheet /> : <div className="flex shrink-0 items-center justify-end gap-0.5 px-6 pt-4 sm:px-8">
+              {aiMode === 'basic' && <Link href="/profile" title="Searching with the cheaper Basic model. Change it in your profile." className="mr-auto rounded-md border border-[#f0d9a8] bg-[#fff8e8] px-2.5 py-1.5 text-xs text-[#8a6100] hover:border-[#e3b341]">Basic AI</Link>}
+              <button type="button" onClick={() => requestReretrieval()} disabled={retrievalLoading || isGuide || requiresDomain} aria-label="Refresh suggestions" title="Refresh suggestions" className="flex h-11 w-11 items-center justify-center rounded-xl text-[#55555B] hover:bg-white disabled:opacity-50"><RefreshCw className={`h-[18px] w-[18px] ${retrievalLoading ? 'animate-spin' : ''}`} /></button>
+              <button type="button" onClick={closeDesignPanel} aria-label="Hide suggestions panel" title="Hide suggestions panel" className="flex h-11 w-11 items-center justify-center rounded-xl text-[#55555B] hover:bg-white"><PanelRightOpen className="h-[18px] w-[18px]" /></button>
+            </div>}
+            <div className={`min-h-0 flex-1 overflow-y-auto ${sheetMode ? 'px-5 pb-6' : 'px-6 pb-10 sm:px-12'}`}>
+              <div className="max-w-[644px] space-y-4">
+                {retrievalLoading ? <div className="flex min-h-[360px] items-center justify-center gap-3 text-sm text-[#6B6B70]" role="status"><Loader2 className="h-5 w-5 animate-spin text-[#477bea]" /> Finding related notes{retrievalProgress?.agents_total ? ` · ${retrievalProgress.agents_done}/${retrievalProgress.agents_total}` : '…'}</div>
+                  : retrievalError ? <div className="flex min-h-[360px] flex-col items-center justify-center gap-3.5 text-center" role="alert"><span className="text-[15px] text-[#6B6B70]">{retrievalError}</span><button type="button" onClick={() => requestReretrieval('relevant')} className="flex min-h-[40px] items-center gap-2 rounded-[10px] border border-[#D6D6DB] bg-white px-3.5 text-sm font-medium text-[#2B2B2E]"><RefreshCw className="h-4 w-4" /> Try again</button></div>
+                  : isGuide && !retrieval ? <p className="py-16 text-center text-[15px] leading-relaxed text-[#6B6B70]">This note is a guide, so it isn&apos;t searched. Write a note about something you&apos;re stuck on, and the sample notes that help will show up here.</p>
+                  : !retrieval && (noteTooShortForRetrieval || !hasOtherNotes) ? <p className="py-16 text-center text-[15px] leading-relaxed text-[#6B6B70]">{noteTooShortForRetrieval ? `Write at least ${MIN_RELEVANCE_DRAFT_CHARS} characters, then find notes.` : 'Once you have another note, Ocreda can look for connections.'}</p>
+                  : <>
+                    {/* A run that stopped partway says so, rather than looking like one that found nothing. */}
+                    {insightFailed ? <div className="pt-6">{failedNotice}</div> : <div className="flex min-h-[320px] flex-col items-center justify-center gap-3.5 py-10 text-center">
+                      <span className="text-[15px] text-[#6B6B70]">{relatedCount ? 'Nothing to act on here, but these notes relate to it.' : 'Nothing from your notes here.'}</span>
+                      <button type="button" onClick={() => requestReretrieval('relevant')} disabled={requiresDomain} className="flex min-h-[40px] items-center gap-2 rounded-[10px] border border-[#D6D6DB] bg-white px-3.5 text-sm font-medium text-[#2B2B2E] hover:border-[#b9b9c0] disabled:opacity-50"><RefreshCw className="h-4 w-4" /> {retrieval ? 'Search again' : 'Find notes'}</button>
+                      {onImport && <span className="text-[13px] text-[#8A8A90]">or <button type="button" onClick={onImport} className="text-[#55555B] underline underline-offset-[3px]">import notes</button></span>}
+                    </div>}
+                    {!insights.length && retrieval?.summary && <section className="rounded-xl border border-[#EBD58A] bg-[#FDF7DE] p-5"><span className="text-[13px] font-semibold text-[#9A7400]">Insight</span><p className="mt-2 text-[15px] leading-relaxed text-[#3d3828]">{retrieval.summary}</p></section>}
+                    {relatedLists}
+                    {goalPrompt}
+                  </>}
+              </div>
+            </div>
+          </div>}
+        </aside>}
+
+        {summaryOpen && !designView && <aside id="note-suggestions-panel" className="relative flex min-h-0 flex-col overflow-hidden bg-[#f7f7f9] xl:border-l xl:border-[#dedede]">
           {panelNote ? <RelatedNotePanel
             note={panelNote}
             relevance={panelRelevance ?? relevanceByNoteId.get(panelNote.id)}
@@ -2705,6 +3212,33 @@ function isActedCard(decision?: CardDecision): boolean {
   return Boolean(decision && decision.choice !== 'downgraded' && decision.choice !== 'rejected');
 }
 
+/**
+ * Solve on a note that answers an earlier note's problem hands the solution to
+ * that earlier note (decided Nov 24). The earlier note gets a solved Solution
+ * card of its own, as if its own search had found the answer: this note's
+ * words as the answer, its own sentence as the problem. It is saved on the
+ * earlier note, and only that note can undo it; the card leaves this note.
+ * `targetNoteId` names the answering note, so that note can tell its card was handed on.
+ */
+function handedSolutionCard(item: NoteInsight, answerNoteId: string): { problemNoteId: string; id: string; decision: CardDecision } | null {
+  const problem = item.problem;
+  const answerText = (item.answer?.text || item.action || '').trim();
+  if (!problem?.note_id || !problem.text.trim() || !answerText) return null;
+  const answer = { note_id: answerNoteId, text: answerText };
+  const insight: NoteInsight = { anchor: problem.text, intent: item.intent, kind: 'solution', text: 'Another note of yours answers this: {1}', quotes: [answer], answer, ...(item.solution ? { solution: item.solution } : {}), action: answerText, note_ids: [answerNoteId] };
+  return { problemNoteId: problem.note_id, id: insightActionId(insight, 'solves'), decision: { choice: 'solved', kind: 'solution', insight, targetNoteId: answerNoteId } };
+}
+
+/** A Solve saved the earlier way: on the answering note, aimed at the earlier note's problem. */
+function isOldHandedSolution(decision: CardDecision): boolean {
+  return decision.choice === 'solved' && decision.insight.direction === 'outbound' && Boolean(decision.insight.problem?.note_id) && Boolean(decision.targetNoteId);
+}
+
+/** A solution this note handed to an earlier note, seen from this note: the card it came from leaves. */
+function isHandedFrom(decision: IncomingCardDecision, noteId: string): boolean {
+  return decision.choice === 'solved' && decision.kind === 'solution' && decision.insight.answer?.note_id === noteId && !decision.insight.problem;
+}
+
 function insightActionId(insight: NoteInsight, relation: NoteRelationType | null): string {
   const kind = baseKindOf(insight, relation);
   const source = `${kind}|${insight.anchor}|${insight.text}|${insight.action}|${insight.note_ids.join(',')}`;
@@ -2803,9 +3337,13 @@ function sentenceCase(text: string): string {
 function InsightSentence({ insight, kind, onOpenSource }: { insight: NoteInsight; kind: SuggestionKind; onOpenSource: (noteId: string, focus?: string) => void }) {
   const quotes = insight.quotes ?? [];
   if (!quotes.length) return <>{stripInlineMarkdown(insight.text)}</>;
-  return <>{insight.text.split(/(\{\d+\})/).map((part, index) => {
-    const quote = /^\{\d+\}$/.test(part) ? quotes[Number(part.slice(1, -1)) - 1] : undefined;
-    if (!quote) return <Fragment key={index}>{stripInlineMarkdown(part)}</Fragment>;
+  const parts = insight.text.split(/(\{\d+\})/);
+  const quoteAt = (part: string) => /^\{\d+\}$/.test(part) ? quotes[Number(part.slice(1, -1)) - 1] : undefined;
+  return <>{parts.map((part, index) => {
+    const quote = quoteAt(part);
+    // A quote that ends a sentence already has its stop, so the sentence's own
+    // stop or comma right after it would double up ("okay.'.").
+    if (!quote) return <Fragment key={index}>{stripInlineMarkdown(index > 0 && /[.!?]$/.test(plainNoteText(quoteAt(parts[index - 1])?.text ?? '').trim()) ? part.replace(/^[.,;:]/, '') : part)}</Fragment>;
     const open = () => onOpenSource(quote.note_id, quote.text);
     // A span, not a button: browsers lay a button out as one block, so a long
     // quote filled the line and pushed the punctuation after it onto its own.
@@ -2893,14 +3431,17 @@ function CardAction({ insight, kind, decision, sourceTitle, sourceDate, sharedBy
 
   if (kind === 'solution') {
     const answerText = plainNoteText(answer?.text ?? insight.action);
+    // What to do, in plain words, when the search wrote it; the exact words go under it.
+    const solution = plainNoteText(insight.solution ?? '').trim();
     if (choice === 'solved') return <div className={box}>
       <p className={`flex items-center gap-1.5 ${heading}`}><Check className="h-3.5 w-3.5" /> Solved · shown beside your sentence</p>
-      <p className="mt-1 text-[14px] leading-relaxed text-[#26467a]">{answerText}</p>
+      <p className="mt-1 text-[14px] leading-relaxed text-[#26467a]">{solution || answerText}</p>
       <div className="mt-2"><UndoButton onUndo={() => onChoose(null)} /></div>
     </div>;
     return <div className={box}>
       <p className={heading}>Solution</p>
-      <p className="mt-1 text-[15px] leading-relaxed text-[#26467a]">{answerText}</p>
+      <p className="mt-1 text-[15px] leading-relaxed text-[#26467a]">{solution || answerText}</p>
+      {solution && <p className="mt-1 text-[12px] italic leading-relaxed text-[#5b7fc9]">‘{answerText}’</p>}
       {answer && <button type="button" onClick={(event) => { event.stopPropagation(); openAnswer(); }} className="mt-1 text-[11px] text-[#5b7fc9] hover:underline">From {sharedBy ? `${sharedBy}’s ` : ''}“{sourceTitle}” · {sourceDate} ↗</button>}
       <div className="mt-3 flex gap-2">
         <button type="button" onClick={(event) => { event.stopPropagation(); onChoose('solved'); }} className="rounded-md bg-[#477bea] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#3d6ed7] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477bea] focus-visible:ring-offset-2">Solved</button>
@@ -3114,6 +3655,390 @@ function SuggestionCard({ insight, kind, decision, notesById, trigger, outbound 
       </div>}
     </section>
   );
+}
+
+/*
+ * The suggestions view from the Ocreda design (Nov 24, built for testing).
+ * Each passage with a card gets a coloured line beside it; clicking one opens
+ * the panel on that card alone, with arrows to the others. A choice closes the
+ * panel and leaves a pill on the passage that opens what was chosen. The
+ * classic view stays one click away in the note's menu, to compare.
+ */
+const NOTE_VIEW_KEY = 'ocreda-note-suggestions-view';
+/** The id of the panel's last page, after the cards: related notes without a card. */
+const RELATED_PAGE = 'related';
+type NoteSuggestionsView = 'design' | 'classic';
+
+/**
+ * The phone sheet's grey bar: a tap and a swipe do the same thing (decided
+ * Nov 25), since people try to drag a sheet's bar. The press is captured so a
+ * swipe that leaves the bar still counts, and the page does not scroll under
+ * it. A click with no pointer behind it (Enter or Space) still works.
+ */
+function tapOrSwipe(action: () => void) {
+  return {
+    onPointerDown: (event: React.PointerEvent<HTMLElement>) => {
+      // Capturing only helps a swipe that leaves the bar; the bar works without it.
+      try { event.currentTarget.setPointerCapture?.(event.pointerId); } catch { /* No active pointer to capture. */ }
+    },
+    onPointerUp: (event: React.PointerEvent<HTMLElement>) => {
+      event.preventDefault();
+      // The bar usually disappears with the action, so the click that follows
+      // this tap would land on whatever was under it (a Domain card, the note's
+      // text) and open it. Swallow that one click.
+      const swallow = (click: MouseEvent) => { click.preventDefault(); click.stopPropagation(); };
+      window.addEventListener('click', swallow, { capture: true, once: true });
+      window.setTimeout(() => window.removeEventListener('click', swallow, { capture: true }), 400);
+      action();
+    },
+    onClick: (event: React.MouseEvent) => { if (event.detail === 0) action(); },
+    style: { touchAction: 'none' } as React.CSSProperties,
+  };
+}
+
+/** Whether the screen is narrower than the note-and-panel layout (Tailwind's xl, 1280px). */
+function useNarrowScreen(): boolean {
+  const [narrow, setNarrow] = useState(false);
+  useEffect(() => {
+    const query = window.matchMedia('(max-width: 1279.98px)');
+    const update = () => setNarrow(query.matches);
+    update();
+    query.addEventListener('change', update);
+    return () => query.removeEventListener('change', update);
+  }, []);
+  return narrow;
+}
+
+function readNoteSuggestionsView(): NoteSuggestionsView {
+  try { return localStorage.getItem(NOTE_VIEW_KEY) === 'classic' ? 'classic' : 'design'; } catch { return 'design'; }
+}
+
+function writeNoteSuggestionsView(view: NoteSuggestionsView): void {
+  try { localStorage.setItem(NOTE_VIEW_KEY, view); } catch { /* Kept for this visit only. */ }
+}
+
+/** The design's colours for each kind: the line and text, the soft border, and the tinted fill. */
+const DESIGN_TONES: Record<SuggestionKind, { ink: string; soft: string; tint: string }> = {
+  solution: { ink: '#3B66D6', soft: '#B9CBF5', tint: '#E9EFFD' },
+  contradiction: { ink: '#B42318', soft: '#F2B8B5', tint: '#FCE9E8' },
+  helps: { ink: '#2E7D4F', soft: '#A8D5BA', tint: '#E5F2EA' },
+  extension: { ink: '#7B4FC9', soft: '#D8CBF4', tint: '#F4EFFC' },
+  insight: { ink: '#9A7400', soft: '#EBD58A', tint: '#FDF7DE' },
+};
+
+/** The past note a card rests on, as the design names it. */
+type DesignSource = { note?: Note; title: string; date: string; sharedBy: string | null };
+
+function designSourceOf(item: NoteInsight, notesById: Map<string, Note>): DesignSource {
+  const sourceId = item.problem?.note_id || item.answer?.note_id || item.quotes?.[0]?.note_id || item.note_ids[0];
+  const note = sourceId ? notesById.get(sourceId) : undefined;
+  return { note, title: note ? noteLabel(note) : 'an earlier note', date: note ? formatDate(note.created_at) : '', sharedBy: note?.shared_by ?? null };
+}
+
+/** What a choice is called, on the panel and on the pill at the end of the passage. */
+function designChoiceLabel(choice: CardChoice | undefined, source: DesignSource): string {
+  switch (choice) {
+    case 'solved': return 'Solved';
+    case 'helped': return 'Helped';
+    case 'merged': return 'Merged';
+    case 'confirmed': return 'Noted';
+    case 'today': return 'What I wrote today is true';
+    case 'earlier': return source.sharedBy ? `What ${source.sharedBy} wrote${source.date ? ` on ${source.date}` : ''} is true` : `What I wrote${source.date ? ` on ${source.date}` : ' before'} is true`;
+    case 'both': return 'Both are true';
+    default: return 'Dismissed';
+  }
+}
+
+/**
+ * Whether a card's choice marks another note rather than this one: this note
+ * answered an earlier note's problem, or was marked as helping it. The answer
+ * shows on that earlier note; this note already holds it in its own words.
+ */
+function marksOtherNote(view: CardView, outbound: boolean): boolean {
+  const choice = view.decision?.choice;
+  return !view.fromNoteId && (choice === 'solved' || choice === 'helped') && (outbound || view.item.direction === 'outbound');
+}
+
+/** Undoing a Helps card that began as a solution puts it back as a Helps card, as the classic view does. */
+function designUndoChoice(view: CardView): CardChoice | null {
+  return view.decision?.choice === 'helped' && view.item.kind === 'solution' ? 'downgraded' : null;
+}
+
+/** The box at the top of an act-on card: what it offers, and what the buttons do. */
+type DesignSynthesis = { label: string; works: string; from: string; accept: CardChoice; acceptLabel: string; acceptText?: string; dismiss: CardChoice; quiet?: boolean };
+
+function designSynthesis(view: CardView, source: DesignSource, citedCount: number, outbound: boolean): DesignSynthesis | null {
+  const item = view.item;
+  const whose = source.sharedBy ? `${source.sharedBy}’s` : 'your';
+  const from = `Synthesis of ${citedCount || 1} of ${whose} notes`;
+  const where = `“${source.title}”${source.date ? ` · ${source.date}` : ''}`;
+  if (view.kind === 'solution') {
+    // The headline is what to do, in plain words; the exact words it rests on go beneath it.
+    const solution = plainNoteText(item.solution ?? '').trim();
+    if (outbound && item.problem) return solution
+      ? { label: `Your new note answers ${where}`, works: solution, from: `The problem there, in your words: ‘${plainNoteText(item.problem.text)}’`, accept: 'solved', acceptLabel: 'Solve', dismiss: 'rejected' }
+      : { label: `Your new note answers ${where}`, works: `“${plainNoteText(item.problem.text)}”`, from: `The problem, word for word from ${where}`, accept: 'solved', acceptLabel: 'Solve', dismiss: 'rejected' };
+    const answer = plainNoteText(item.answer?.text ?? item.action);
+    // A dismissed solution carries on as a Helps card, as in the classic view.
+    // With each note's words shown below, the headline is labelled as what it is: a synthesis.
+    return { label: 'Solution', works: solution || answer, from: solution && !item.evidence?.length ? `${source.sharedBy ? `${source.sharedBy}’s` : 'Your'} words in ${where}: ‘${answer}’` : from, accept: 'solved', acceptLabel: 'Solve', dismiss: 'downgraded' };
+  }
+  if (view.kind === 'helps') {
+    if (outbound) return { label: `Your new note could help ${where}`, works: sentenceCase(plainNoteText(item.action)), from, accept: 'helped', acceptLabel: 'Use this', dismiss: 'rejected' };
+    // A dismissed solution has no idea of its own, so its answer stands in.
+    const idea = item.kind === 'helps' ? sentenceCase(plainNoteText(item.action)) : `“${plainNoteText(item.answer?.text ?? item.action)}”`;
+    return { label: 'Helps', works: idea, from, accept: 'helped', acceptLabel: 'Use this', dismiss: 'rejected' };
+  }
+  if (view.kind === 'extension') {
+    const words = plainNoteText(item.answer?.text ?? item.action);
+    return { label: 'Will be added below your sentence', works: words, from: `${source.sharedBy ? `${source.sharedBy}’s` : 'Your'} exact words from ${where}`, accept: 'merged', acceptLabel: 'Merge', acceptText: words, dismiss: 'rejected', quiet: true };
+  }
+  if (view.kind === 'insight') return { label: 'Insight', works: plainNoteText(item.action), from, accept: 'confirmed', acceptLabel: 'Note', dismiss: 'rejected' };
+  return null;
+}
+
+/** "Your words and why it relates": the card's sentence with their quotes, and the notes it rests on. */
+function DesignEvidence({ view, cited, onOpenSource }: { view: CardView; cited: Note[]; onOpenSource: (noteId: string, focus?: string) => void }) {
+  const noteLink = (note: Note) => <button key={note.id} type="button" onClick={(event) => { event.stopPropagation(); onOpenSource(note.id); }} className="text-left text-[13px] text-[#55555B] hover:text-[#1B1B1F] hover:underline">
+    {note.shared_by ? `${note.shared_by}’s ` : ''}{noteLabel(note)} · {formatDate(note.created_at)} ↗
+  </button>;
+  // Each note on its own: what part it plays, its words and why it came back,
+  // then the note itself (decided Nov 26, from the cofounder's card design).
+  const evidence = (view.item.evidence ?? []).flatMap((entry) => {
+    const note = cited.find((item) => item.id === entry.note_id);
+    return note ? [{ entry, note }] : [];
+  });
+  if (evidence.length) {
+    const rest = cited.filter((note) => !evidence.some(({ note: shown }) => shown.id === note.id));
+    return <section className="flex flex-col gap-3">
+      <h2 className="text-[13px] font-normal text-[#6B6B70]">Your words and why it relates</h2>
+      <div className="flex flex-col gap-7">
+        {evidence.map(({ entry, note }) => <div key={note.id} className="flex flex-col gap-2">
+          <h3 className="text-[16px] font-normal italic text-[#2B2B2E]">{entry.heading}</h3>
+          <p className="text-[16px] leading-[1.75] text-[#6E6E74] [&_[role=button]]:text-[#1B1B1F]"><InsightSentence insight={{ ...view.item, text: entry.text }} kind={view.kind} onOpenSource={onOpenSource} /></p>
+          <div className="flex flex-col items-start">{noteLink(note)}</div>
+        </div>)}
+      </div>
+      {rest.length > 0 && <div className="flex flex-col items-start gap-1.5">{rest.map(noteLink)}</div>}
+    </section>;
+  }
+  return <section className="flex flex-col gap-3">
+    <h2 className="text-[13px] font-normal text-[#6B6B70]">Your words and why it relates</h2>
+    <p className="text-[16px] leading-[1.75] text-[#6E6E74] [&_[role=button]]:text-[#1B1B1F]"><InsightSentence insight={view.item} kind={view.kind} onOpenSource={onOpenSource} /></p>
+    <div className="flex flex-col items-start gap-1.5">
+      {cited.map((note) => <button key={note.id} type="button" onClick={(event) => { event.stopPropagation(); onOpenSource(note.id); }} className="text-left text-[13px] text-[#55555B] hover:text-[#1B1B1F] hover:underline">
+        {note.shared_by ? `${note.shared_by}’s ` : ''}{noteLabel(note)} · {formatDate(note.created_at)} ↗
+      </button>)}
+    </div>
+  </section>;
+}
+
+/** The panel's top row: arrows through the note's pages when there is more than one, refresh, and hide. */
+function DesignPanelBar({ position, total, refreshing, onPrev, onNext, onRefresh, onHide, sheet = false }: {
+  position: number;
+  total: number;
+  refreshing: boolean;
+  onPrev: () => void;
+  onNext: () => void;
+  onRefresh: () => void;
+  onHide: () => void;
+  /** On a phone's sheet the row sits under the handle, and closing it lowers the sheet. */
+  sheet?: boolean;
+}) {
+  // On a phone the row holds the arrows between cards and searching again,
+  // which the note's header no longer has; the grey bar above collapses the
+  // sheet (decided Nov 25).
+  if (sheet) return <div className="flex shrink-0 items-center justify-end pb-1 pl-5 pr-3">
+    {total > 1 && <div className="mr-auto flex items-center">
+      <button type="button" onClick={onPrev} aria-label="Previous suggestion" className="flex h-10 w-9 items-center justify-center text-[#55555B]"><ChevronLeft className="h-4 w-4" /></button>
+      <span className="text-[13px] text-[#55555B]">{position + 1} of {total}</span>
+      <button type="button" onClick={onNext} aria-label="Next suggestion" className="flex h-10 w-9 items-center justify-center text-[#55555B]"><ChevronRight className="h-4 w-4" /></button>
+    </div>}
+    <button type="button" onClick={onRefresh} disabled={refreshing} aria-label="Search again" title="Search again" className="flex h-10 w-10 items-center justify-center rounded-xl text-[#55555B] disabled:opacity-50"><RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} /></button>
+  </div>;
+  return <div className="flex shrink-0 items-center justify-end gap-3 px-6 pt-4 sm:px-8">
+    {total > 1 && <div className="mr-auto flex items-center gap-0.5">
+      <button type="button" onClick={onPrev} aria-label="Previous suggestion in this note" className="flex h-9 w-9 items-center justify-center rounded-[10px] text-[#55555B] hover:bg-white"><ChevronLeft className="h-4 w-4" /></button>
+      <span className="min-w-[48px] text-center text-[13px] text-[#55555B]">{position + 1} of {total}</span>
+      <button type="button" onClick={onNext} aria-label="Next suggestion in this note" className="flex h-9 w-9 items-center justify-center rounded-[10px] text-[#55555B] hover:bg-white"><ChevronRight className="h-4 w-4" /></button>
+    </div>}
+    <div className="flex items-center gap-0.5">
+      <button type="button" onClick={onRefresh} disabled={refreshing} aria-label="Refresh suggestions" title="Refresh suggestions" className="flex h-11 w-11 items-center justify-center rounded-xl text-[#55555B] hover:bg-white disabled:opacity-50"><RefreshCw className={`h-[18px] w-[18px] ${refreshing ? 'animate-spin' : ''}`} /></button>
+      <button type="button" onClick={onHide} aria-label="Hide suggestions panel" title="Hide suggestions panel" className="flex h-11 w-11 items-center justify-center rounded-xl text-[#55555B] hover:bg-white"><PanelRightOpen className="h-[18px] w-[18px]" /></button>
+    </div>
+  </div>;
+}
+
+/** The panel's view of one card, from the design: its result, what it offers, its evidence, and its buttons. */
+function DesignSuggestionPanel({ view, position, total, notesById, outbound, refreshing, onPrev, onNext, onRefresh, onHide, onChoose, onFindOther, onOpenSource, sheet = false }: {
+  /** On a phone the panel is a sheet: smaller type, and the buttons fixed along its bottom. */
+  sheet?: boolean;
+  view: CardView;
+  position: number;
+  total: number;
+  notesById: Map<string, Note>;
+  outbound: boolean;
+  refreshing: boolean;
+  onPrev: () => void;
+  onNext: () => void;
+  onRefresh: () => void;
+  onHide: () => void;
+  onChoose: (choice: CardChoice | null, text?: string) => void;
+  onFindOther: () => void;
+  onOpenSource: (noteId: string, focus?: string) => void;
+}) {
+  const tone = DESIGN_TONES[view.kind];
+  const source = designSourceOf(view.item, notesById);
+  const cited = view.item.note_ids.map((id) => notesById.get(id)).filter((note): note is Note => note !== undefined);
+  const choice = view.decision?.choice;
+  const rejected = choice === 'rejected';
+  const acted = isActedCard(view.decision);
+  const pending = isPendingCard(view.decision);
+  const synthesis = designSynthesis(view, source, cited.length, outbound);
+  const [bothOpen, setBothOpen] = useState(false);
+  const [bothText, setBothText] = useState(view.decision?.text ?? '');
+
+  const sides: { choice: CardChoice; kick: string; label: string }[] = [
+    { choice: 'today', kick: sheet ? 'Highlighted above' : 'Highlighted on the left', label: designChoiceLabel('today', source) },
+    { choice: 'earlier', kick: `“${source.title}”${source.date ? ` · ${source.date}` : ''}`, label: designChoiceLabel('earlier', source) },
+  ];
+
+  const buttons = synthesis && !rejected && pending ? <>
+    <button type="button" onClick={() => onChoose(synthesis.accept, synthesis.acceptText)} className={`flex items-center justify-center gap-2 font-semibold text-white hover:brightness-95 ${sheet ? 'min-h-[48px] flex-[2] rounded-xl text-base' : 'min-h-[44px] min-w-[190px] rounded-[10px] px-[22px] text-[15px]'}`} style={{ background: tone.ink }}><Check className="h-4 w-4" strokeWidth={2.6} />{synthesis.acceptLabel}</button>
+    <button type="button" onClick={() => onChoose(synthesis.dismiss)} className={`flex items-center justify-center border border-[#D6D6DB] bg-white font-medium text-[#2B2B2E] hover:border-[#b9b9c0] ${sheet ? 'min-h-[48px] flex-1 rounded-xl text-base' : 'min-h-[44px] min-w-[130px] rounded-[10px] px-[18px] text-[15px]'}`}>Dismiss</button>
+  </> : null;
+
+  return <div className="flex min-h-0 flex-1 flex-col">
+    <DesignPanelBar position={position} total={total} refreshing={refreshing} onPrev={onPrev} onNext={onNext} onRefresh={onRefresh} onHide={onHide} sheet={sheet} />
+
+    <div className={`min-h-0 flex-1 overflow-y-auto ${sheet ? 'px-5 pb-6 pt-2' : 'px-6 pb-10 pt-4 sm:px-12'}`}>
+      <div className={`flex max-w-[644px] flex-col ${sheet ? 'gap-5' : 'gap-8'}`}>
+        {acted && <div role="status" className="flex min-h-[60px] items-center gap-3.5 rounded-[14px] py-2 pl-[18px] pr-3 text-white shadow-[0_8px_22px_rgba(20,20,30,0.16)]" style={{ background: tone.ink }}>
+          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-white" style={{ color: tone.ink }}><Check className="h-4 w-4" strokeWidth={3} /></span>
+          <span className="flex flex-1 flex-col">
+            <span className="text-[19px] font-semibold leading-snug">{designChoiceLabel(choice, source)}</span>
+            {/* Nothing marks this note: the answer went to the earlier one, so say where. */}
+            {marksOtherNote(view, outbound) && <span className="text-[13px] leading-snug text-white/85">Shown on {source.sharedBy ? `${source.sharedBy}’s ` : ''}“{source.title}”{source.note && <> · <button type="button" onClick={() => onOpenSource(source.note!.id, view.item.problem?.text ?? '')} className="underline">open it</button></>}</span>}
+          </span>
+          <button type="button" onClick={() => onChoose(designUndoChoice(view))} className="min-h-[40px] px-2.5 text-sm text-white underline">Undo</button>
+        </div>}
+        {rejected && <div role="status" className="-mb-3 flex flex-wrap items-center gap-3">
+          <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[#8A8A90] text-white"><X className="h-4 w-4" strokeWidth={3} /></span>
+          <span className="flex-1 text-[18px] font-semibold text-[#55555B]">Dismissed</span>
+          <button type="button" onClick={onFindOther} className="flex min-h-[36px] items-center gap-1.5 rounded-lg border border-[#D6D6DB] bg-white px-3 text-[13px] font-medium text-[#2B2B2E] hover:border-[#b9b9c0]"><RefreshCw className="h-3.5 w-3.5" /> Find other notes</button>
+          <button type="button" onClick={() => onChoose(null)} className="min-h-[36px] px-2 text-[13px] text-[#6B6B70] underline">Undo</button>
+        </div>}
+
+        {view.kind === 'contradiction' && !rejected && <>
+          {choice === 'both' && view.decision?.text && <div className="flex flex-col gap-1.5 rounded-xl border bg-white px-5 py-[18px]" style={{ borderColor: tone.soft }}>
+            <span className="text-[13px] text-[#6B6B70]">Why both are true</span>
+            <p className="whitespace-pre-line text-[17px] leading-relaxed text-[#1B1B1F]">{view.decision.text}</p>
+          </div>}
+          <div style={{ opacity: choice === 'today' ? 0.4 : 1 }} className="transition-opacity"><DesignEvidence view={view} cited={cited} onOpenSource={onOpenSource} /></div>
+          {pending && <section aria-label="Which is true" className="flex flex-col gap-2.5 rounded-[14px] border p-5" style={{ borderColor: tone.soft, background: tone.tint }}>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-sm font-semibold" style={{ color: tone.ink }}>Which is true?</span>
+              <button type="button" onClick={() => onChoose('rejected')} aria-label="Dismiss this contradiction" title="Dismiss" className="-my-1.5 -mr-1.5 flex h-8 w-8 items-center justify-center rounded-lg hover:bg-white/60" style={{ color: tone.ink }}><X className="h-4 w-4" /></button>
+            </div>
+            {/* Side by side on a phone too, as in the design, with smaller type to fit. */}
+            <div className={`grid gap-2.5 ${sheet ? 'grid-cols-2 gap-2' : 'grid-cols-1 sm:grid-cols-2'}`}>
+              {sides.map((side) => <button key={side.choice} type="button" onClick={() => onChoose(side.choice)} className={`flex flex-col justify-between rounded-xl border-[1.5px] bg-white text-left text-[#2B2B2E] hover:brightness-[0.98] ${sheet ? 'min-h-[96px] gap-2 p-3' : 'min-h-[88px] gap-2.5 p-4'}`} style={{ borderColor: tone.soft }}>
+                <span className={`truncate font-semibold ${sheet ? 'text-[11px]' : 'text-xs'}`} style={{ color: tone.ink }}>{side.kick}</span>
+                <span className={`font-semibold leading-snug ${sheet ? 'text-sm' : 'text-base'}`}>{side.label}</span>
+              </button>)}
+            </div>
+            <button type="button" aria-pressed={bothOpen} onClick={() => setBothOpen(true)} className="min-h-[40px] self-center rounded-lg px-3.5 text-sm font-medium" style={bothOpen ? { background: '#FFFFFF', color: tone.ink } : { color: '#55555B' }}>Both are true</button>
+            {bothOpen && <div className="mt-1 flex flex-col gap-2">
+              <label htmlFor={`both-why-${view.id}`} className="text-[13px] text-[#55555B]">Why are both true?</label>
+              <textarea id={`both-why-${view.id}`} autoFocus value={bothText} onChange={(event) => setBothText(event.target.value)} placeholder="Write how both can be true at the same time…" className="min-h-[90px] resize-y rounded-[10px] border border-[#D6D6DB] bg-white px-3.5 py-3 text-[15px] leading-normal text-[#2B2B2E] outline-none focus:border-[#b9b9c0]" />
+              <button type="button" onClick={() => onChoose('both', bothText.trim())} className="min-h-[40px] min-w-[140px] self-start rounded-[10px] px-[18px] text-sm font-semibold text-white" style={{ background: tone.ink }}>Save</button>
+            </div>}
+          </section>}
+        </>}
+
+        {synthesis && !rejected && <>
+          <section aria-label="Synthesis" className="flex flex-col gap-3 rounded-[14px] border px-6 pb-5 pt-6" style={{ borderColor: tone.soft, background: tone.tint }}>
+            <span className="text-[13px] font-semibold" style={{ color: tone.ink }}>{synthesis.label}</span>
+            <p className={`${sheet ? 'text-[19px]' : 'text-[23px] tracking-[-0.01em]'} leading-[1.4] text-[#111114] ${synthesis.quiet ? 'font-medium' : 'font-semibold'}`}>{choice === 'merged' && view.decision?.text ? plainNoteText(view.decision.text) : synthesis.works}</p>
+            <span className={`${sheet ? 'text-[11px]' : 'text-xs'} text-[#55555B]`}>{synthesis.from}</span>
+          </section>
+          <DesignEvidence view={view} cited={cited} onOpenSource={onOpenSource} />
+          {buttons && !sheet && <div className="flex flex-wrap gap-2 border-t border-[#E2E2E6] pt-6">{buttons}</div>}
+        </>}
+      </div>
+    </div>
+    {/* On a phone the buttons stay along the bottom of the sheet while its content scrolls. */}
+    {buttons && sheet && <div className="flex shrink-0 gap-2 border-t border-[#E2E2E6] bg-[#F7F7F8] px-5 pb-7 pt-3">{buttons}</div>}
+  </div>;
+}
+
+/** What a chosen card shows under its passage when its pill is clicked: the result, and why. */
+function DesignDrop({ view, notesById, outbound, onUndo, onOpenSource }: {
+  view: CardView;
+  notesById: Map<string, Note>;
+  outbound: boolean;
+  onUndo: () => void;
+  onOpenSource: (noteId: string, focus?: string) => void;
+}) {
+  const tone = DESIGN_TONES[view.kind];
+  const source = designSourceOf(view.item, notesById);
+  const cited = view.item.note_ids.map((id) => notesById.get(id)).filter((note): note is Note => note !== undefined);
+  const synthesis = designSynthesis(view, source, cited.length, outbound);
+  const choice = view.decision?.choice;
+  const works = choice === 'merged' && view.decision?.text ? plainNoteText(view.decision.text) : synthesis?.works ?? '';
+  return <div className="mb-1.5 mt-[18px] flex flex-col gap-[22px] border-y border-[#EEEEF0] bg-[#F7F7F8] py-8 pr-2 [clip-path:inset(0_-100vw)]" style={{ boxShadow: '0 0 0 100vw #F7F7F8' }}>
+    <section aria-label="Synthesis" className="flex flex-col gap-2.5 rounded-xl border bg-white px-[22px] py-5" style={{ borderColor: tone.soft }}>
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-[13px] font-semibold" style={{ color: tone.ink }}>{synthesis?.label ?? 'Contradiction'}</span>
+        <button type="button" onClick={onUndo} className="min-h-[32px] px-1 text-[13px] text-[#6B6B70] underline">Undo</button>
+      </div>
+      {works && <p className="text-[20px] font-semibold leading-[1.4] text-[#1B1B1F]">{works}</p>}
+      {view.kind === 'contradiction' && <p className="text-[15px] leading-normal text-[#3A3A40]">You chose: <b className="font-semibold" style={{ color: tone.ink }}>{designChoiceLabel(choice, source)}</b></p>}
+      {choice === 'both' && view.decision?.text && <p className="whitespace-pre-line text-[15px] leading-normal text-[#3A3A40]">Why both are true: {view.decision.text}</p>}
+    </section>
+    <DesignEvidence view={view} cited={cited} onOpenSource={onOpenSource} />
+  </div>;
+}
+
+/** A past note opened from a card, inside the panel: the quoted words marked, and why it came back. */
+function DesignReadingView({ notes, index, focus, relevanceFor, onIndex, onClose, onOpenFull }: {
+  notes: Note[];
+  index: number;
+  focus: string;
+  relevanceFor: (noteId: string) => RelevanceResult | undefined;
+  onIndex: (index: number) => void;
+  onClose: () => void;
+  onOpenFull: (note: Note) => void;
+}) {
+  const note = notes[Math.max(0, Math.min(index, notes.length - 1))];
+  if (!note) return null;
+  const content = splitNote(note);
+  const relevance = relevanceFor(note.id);
+  const focusInBody = focus && content.body && findAnchor(content.body, focus) ? focus : '';
+  const matched = focusInBody || (relevance?.matched_text?.trim() ?? '');
+  const why = relevance?.explanation.trim() ?? '';
+  return <div className="relative flex min-h-0 flex-1 flex-col px-6 pb-8 pt-4 sm:px-12">
+    <div className="flex shrink-0 items-center justify-end gap-0.5">
+      <button type="button" onClick={() => onOpenFull(note)} aria-label="Open full note" title="Open full note" className="flex h-11 w-11 items-center justify-center rounded-xl text-[#55555B] hover:bg-white"><ExternalLink className="h-[18px] w-[18px]" /></button>
+      <button type="button" onClick={onClose} aria-label="Close note" title="Close" className="flex h-11 w-11 items-center justify-center rounded-xl text-[#55555B] hover:bg-white"><X className="h-5 w-5" /></button>
+    </div>
+    <div className="flex min-h-0 max-w-[644px] flex-1 flex-col gap-[26px] overflow-y-auto pr-3">
+      <div className="flex flex-col gap-1.5">
+        <span className="flex min-h-[32px] items-center text-sm text-[#6B6B70]">{fullNoteDate(note.created_at)} · {note.shared_by ? `Shared by ${note.shared_by}` : cleanCategory(note.category) || ORPHANS_MUSE}</span>
+        <h2 className="text-[30px] font-semibold leading-tight text-[#2B2B2E]">{content.title || 'Untitled note'}</h2>
+      </div>
+      {content.body && <div className="text-[19px] leading-[1.65] text-[#3A3A40]"><RetrievalMatchedBody text={content.body} matchedText={matched} label={focusInBody ? 'Quoted in your card' : 'Used for retrieval'} /></div>}
+      {why && <section aria-label="Why it came back" className="flex flex-col gap-2 rounded-xl border border-[#E2B93B] bg-white px-5 py-[18px]">
+        <span className="text-[13px] font-medium text-[#8F6D05]">Why it came back</span>
+        <p className="text-base leading-relaxed text-[#2B2B2E]">{why}</p>
+      </section>}
+      {notes.length > 1 && <div className="flex items-center justify-center gap-2 pb-2">
+        <button type="button" onClick={() => onIndex(index - 1)} disabled={index <= 0} aria-label="Previous retrieved note" className="flex h-10 w-10 items-center justify-center rounded-[10px] border border-[#DADADF] bg-white text-[#2B2B2E] disabled:text-[#C4C4C9]"><ChevronLeft className="h-4 w-4" /></button>
+        <span className="min-w-[64px] text-center text-sm text-[#55555B]">{index + 1} of {notes.length}</span>
+        <button type="button" onClick={() => onIndex(index + 1)} disabled={index >= notes.length - 1} aria-label="Next retrieved note" className="flex h-10 w-10 items-center justify-center rounded-[10px] border border-[#DADADF] bg-white text-[#2B2B2E] disabled:text-[#C4C4C9]"><ChevronRight className="h-4 w-4" /></button>
+      </div>}
+    </div>
+  </div>;
 }
 
 // Domains where the person answered "Just logging", so the goal question is not asked again.

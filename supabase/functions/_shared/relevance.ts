@@ -1169,6 +1169,20 @@ export interface InsightQuote {
 }
 
 /**
+ * One past note's part in a card: a few words naming the role it plays, and a
+ * sentence or two built around its own words saying what they found there and
+ * why it came back for the note being written (decided Nov 26, from the
+ * cofounder's card design).
+ */
+export interface InsightEvidence {
+  note_id: string;
+  /** A few plain words naming the note's part, such as "What got you out last time". */
+  heading: string;
+  /** Written around quotes: {1}, {2}, ... stand for the card's `quotes`, as in its `text`. */
+  text: string;
+}
+
+/**
  * The one thing from the person's past notes that should change what they do
  * next, tied to the passage of the draft it is about. The model writes only the
  * sentence that connects; everything taken from their notes is their own words.
@@ -1197,6 +1211,18 @@ export interface Insight {
   direction: Direction;
   /** For an outbound solution: the earlier note's problem, word for word, which the draft answers. */
   problem: InsightQuote | null;
+  /**
+   * For a solution: one sentence in the model's own words saying what to do
+   * about the problem, so the card reads as an answer to it rather than as a
+   * line lifted from another note (decided Nov 24). It is the conclusion of
+   * every note the card rests on, not a rewording of one answer (decided
+   * Nov 26). The past notes' own words stay in `answer`, the quotes and
+   * `evidence`. Empty when the model gave none, and then the card shows the
+   * answer itself.
+   */
+  solution: string;
+  /** Each cited note's part in the card, in the order given. Empty when the model gave none. */
+  evidence: InsightEvidence[];
   /**
    * What the action box shows: the answer's text for a solution or an
    * extension, the idea for helps (it completes "Might help to ..."), the
@@ -1331,6 +1357,9 @@ export function splitNoteTitle(rawText: string): { title: string; text: string }
   return { title: written ? title : "", text: body };
 }
 const MAX_IDEA_CHARS = 160;
+const MAX_SOLUTION_CHARS = 220;
+const MAX_EVIDENCE_HEADING_CHARS = 60;
+const MAX_EVIDENCE_TEXT_CHARS = 420;
 const MAX_PATTERN_CHARS = 260;
 const MAX_GOAL_SUGGESTION_CHARS = 60;
 const MAX_GOAL_SUGGESTIONS = 3;
@@ -1494,7 +1523,7 @@ GOAL - if they have said what they are working toward in this area, use it to de
 
 ${howMany}
 
-THEIR WORDS, NOT YOURS - a card is their own past words, connected by you. You write only the short sentence that links those words to the note; everything taken from a past note appears inside it exactly as they wrote it, so the card sounds familiar.
+THEIR WORDS, NOT YOURS - a card is their own past words, connected by you. You write only the short sentence that links those words to the note; everything taken from a past note appears inside it exactly as they wrote it, so the card sounds familiar. The one exception is a solution's SOLUTION line, below.
 ${sharedRule}
 For each insight:
 KIND - pick exactly one, by what the past notes actually offer:
@@ -1505,11 +1534,16 @@ KIND - pick exactly one, by what the past notes actually offer:
 "pattern" - the same thing has happened or shown up before, and the note being written is another instance of it.
 ANCHOR - copy, word for word, the key part of the sentence in the note being written that needs this card, at most 25 words${byIdea ? ", taken from inside the idea it is about" : ""}: the words that ask the question, state the problem, or make the claim. Copy it exactly: do not paraphrase, fix typos, or add quotation marks. Two insights never share or overlap an anchor.
 TEXT - one short sentence, written by you, with their past words placed inside it as {1}, {2}, ... in the order of QUOTES. Write only the connecting words; the quotes carry the content. Say where or with whom it was if that helps them place it, but never write a date or a day: the card already shows when each note was written. Never put your own paraphrase in quotation marks, and never restate the note being written. Examples: "Your weekend test got {1}, with {2}." / "The same manager told you they {1}. That's a turnover problem too, and you had {2}."
-QUOTES - one entry per placeholder, in order: the ID of the past note and the exact words copied from its Text, 3 to 15 words: only the phrase that carries the point, not the sentence around it. Copy them character for character; never shorten them in the middle, fix them, or reword them. Never quote a Title, and never quote a whole note: the card names the note for them, so a quote only needs the part that matters.
+QUOTES - one entry per placeholder used in TEXT or EVIDENCE, numbered in the order of first use: the ID of the past note and the exact words copied from its Text, 3 to 15 words: only the phrase that carries the point, not the sentence around it. Copy them character for character; never shorten them in the middle, fix them, or reword them. Never quote a Title, and never quote a whole note: the card names the note for them, so a quote only needs the part that matters.
 ANSWER - for "solution" and "extension" only: the exact words from a past note's Text that answer the question or add the detail, copied word for word, with the ID of that note. Take only what answers it, usually one sentence and at most 40 words, never the Title and never the whole note. For a solution this is the answer itself and nothing else.
-IDEA - for "helps" only: a short phrase, in plain words, that completes "Might help to ...", starting with a lowercase verb, such as "say the price and just wait".
+SOLUTION - required on every "solution" card, and only there: one sentence in your own plain words saying what to do about the problem. It is the card's headline, the first thing they read, so it is the conclusion that all the past notes this card rests on add up to, not a rewording of one of them. When more than one related note speaks to the same problem (a time it worked, a lesson, advice they recorded, what happened when they waited), rest the card on all of them and draw them together into one answer; when only one note speaks to it, one is fine. It must make sense as the answer to that problem on its own: name their situation and the step to take ("In your next tester calls, ask what they actually did last week instead of whether they would use it."). For an outbound solution, it says what to do about the earlier note's problem. This is the one line you write in your own words: do not copy ANSWER, do not put anything in quotation marks, and add nothing the past notes do not support.
+IDEA -for "helps" only: a short phrase, in plain words, that completes "Might help to ...", starting with a lowercase verb, such as "say the price and just wait".
 PATTERN - for "pattern" only: one or two short sentences naming what repeats, such as "Both times, price was what they said. Trust was what they asked about."
 NOTE_IDS - the IDs of the past notes this insight rests on, only from the list given.
+EVIDENCE - one entry per past note in NOTE_IDS, in the order they matter, showing what each one brings and why it came back now:
+  HEADING - 2 to 6 plain words naming the part this note plays in the card, as a reader would put it, such as "What got you out last time" or "What actually gave you answers". Not the note's title, no quotation marks, no date.
+  TEXT - one or two short sentences, written by you, with that note's own words placed inside as {1}, {2}, ... from QUOTES (add to QUOTES any words you need from it; the same numbering as the card's TEXT). Say what they found or did there, then why it came back: the part of the new note it answers ("It came back because your new note ..."). Never write a date or a day. Same voice as TEXT.
+Leave out EVIDENCE for a past note you cannot quote.
 OUTBOUND - when the notes an insight rests on are outbound, the note being written is the lesson and the past note is where it applies. TEXT places that earlier situation with its own words and says the note being written is what helps it, so it can never read as advice for the note being written ("Your new note is the fix for when you were stuck on {1}.").
 - When the note being written answers a problem or open question in that past note, give "solution", and as clearly as any other solution: PROBLEM is the exact words from the past note's Text that state the problem, with its ID, and ANSWER is the exact words from the note being written that answer it, with "note_id": "this". ANCHOR is the key part of that answer.
 - Otherwise use "helps" or "pattern", never "extension": IDEA says what that earlier situation could do with this lesson, such as "test your hypotheses by watching what people do in the product".
@@ -1523,8 +1557,8 @@ GOAL_SUGGESTIONS - they have not said what this area is for. Offer 2 or 3 short 
 VOICE - these are their own notes. Speak to them as "you", and when you mention the note being written, call it "your new note", like a friend who remembers everything they have written. Plain words, no jargon. Never say "the user", "the author", or "this note highlights".
 
 OUTPUT - a JSON object and nothing else, in this shape:
-{"intent": "<stuck|planning|deciding|capturing|reflecting|learning>", "insights": [{"kind": "<solution|helps|extension|contradiction|pattern>", "anchor": "<exact words from the note being written>", "text": "<one sentence with {1}, {2}...>", "quotes": [{"note_id": "<id>", "text": "<exact words from that note>"}], "answer": {"note_id": "<id, or this>", "text": "<exact words>"}, "problem": {"note_id": "<id>", "text": "<exact words>"}, "idea": "<helps only>", "pattern": "<pattern only>", "note_ids": ["<id>"]}]${askForGoal ? ', "goal_suggestions": ["<guess>"]' : ""}}
-Leave out "answer", "problem", "idea", and "pattern" where they do not apply. "insights" is [] when nothing clears the bar.
+{"intent": "<stuck|planning|deciding|capturing|reflecting|learning>", "insights": [{"kind": "<solution|helps|extension|contradiction|pattern>", "anchor": "<exact words from the note being written>", "text": "<one sentence with {1}, {2}...>", "quotes": [{"note_id": "<id>", "text": "<exact words from that note>"}], "answer": {"note_id": "<id, or this>", "text": "<exact words>"}, "problem": {"note_id": "<id>", "text": "<exact words>"}, "solution": "<solution only, your own words>", "idea": "<helps only>", "pattern": "<pattern only>", "note_ids": ["<id>"], "evidence": [{"note_id": "<id>", "heading": "<a few words>", "text": "<one or two sentences with {1}, {2}...>"}]}]${askForGoal ? ', "goal_suggestions": ["<guess>"]' : ""}}
+Leave out "answer", "problem", "solution", "idea", and "pattern" where they do not apply; a "solution" card always has both "answer" and "solution". "insights" is [] when nothing clears the bar.
 
 ========================================
 
@@ -1664,18 +1698,27 @@ export function parseInsightResponse(
     const offered = Array.isArray(card.quotes) ? card.quotes.map((item) => quoteFrom(item, MAX_QUOTE_CHARS)) : [];
     const quotes: InsightQuote[] = [];
     const renumbered = new Map<number, number>();
-    let quoteMissing = false;
-    const text = cleanLine(card.text, MAX_INSIGHT_TEXT_CHARS)
-      // The interface draws the quotation marks, so drop any the model added.
-      .replace(/["'‘’“”]?(\{\d+\})["'‘’“”]?/g, "$1")
-      .replace(/\{(\d+)\}/g, (_match, digits: string) => {
+    /** A sentence with its placeholders renumbered into `quotes`; null when one names a quote that is not really there. */
+    const withQuotes = (value: unknown, limit: number): string | null => {
+      let quoteMissing = false;
+      const used: number[] = [];
+      const cleaned = cleanLine(value, limit)
+        // The interface draws the quotation marks, so drop any the model added.
+        .replace(/["'‘’“”]?(\{\d+\})["'‘’“”]?/g, "$1");
+      cleaned.replace(/\{(\d+)\}/g, (_match, digits: string) => {
         const index = Number(digits) - 1;
-        const quote = offered[index];
-        if (!quote) { quoteMissing = true; return ""; }
-        if (!renumbered.has(index)) { quotes.push(quote); renumbered.set(index, quotes.length); }
-        return `{${renumbered.get(index)}}`;
+        if (!offered[index]) quoteMissing = true;
+        else used.push(index);
+        return "";
       });
-    if (!text || quoteMissing || quotes.length === 0 || seenText.has(text.toLowerCase())) continue;
+      if (quoteMissing) return null;
+      for (const index of used) {
+        if (!renumbered.has(index)) { quotes.push(offered[index] as InsightQuote); renumbered.set(index, quotes.length); }
+      }
+      return cleaned.replace(/\{(\d+)\}/g, (_match, digits: string) => `{${renumbered.get(Number(digits) - 1)}}`);
+    };
+    const text = withQuotes(card.text, MAX_INSIGHT_TEXT_CHARS);
+    if (!text || quotes.length === 0 || seenText.has(text.toLowerCase())) continue;
 
     const listedIds = Array.isArray(card.note_ids)
       ? card.note_ids.filter((id): id is string => typeof id === "string" && allowedNoteIds.has(id))
@@ -1707,8 +1750,23 @@ export function parseInsightResponse(
       ? cleanLine(card.idea, MAX_IDEA_CHARS).replace(/^might help(?: to)?[\s:.…-]*/i, "").replace(/^([A-Z])(?![A-Z])/, (letter) => letter.toLowerCase())
       : "";
     const pattern = kind === "pattern" ? cleanLine(card.pattern, MAX_PATTERN_CHARS) : "";
+    // The interface draws no quotation marks around it; drop any the model added.
+    const solution = kind === "solution" ? cleanLine(card.solution, MAX_SOLUTION_CHARS).replace(/^["'‘’“”]+|["'‘’“”]+$/g, "").trim() : "";
     const action = answer?.text ?? (idea || pattern);
     if (kind !== "contradiction" && !action) continue;
+    // One entry per cited note, each with at least one of its own words that
+    // are really there; an entry that misquotes is dropped, not the card.
+    const evidence: InsightEvidence[] = [];
+    for (const item of Array.isArray(card.evidence) ? card.evidence : []) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+      const row = item as Record<string, unknown>;
+      const noteId = typeof row.note_id === "string" ? row.note_id : "";
+      if (!noteIds.includes(noteId) || evidence.some((entry) => entry.note_id === noteId)) continue;
+      const heading = cleanLine(row.heading, MAX_EVIDENCE_HEADING_CHARS).replace(/^["'‘’“”]+|["'‘’“”:.]+$/g, "").trim();
+      const line = withQuotes(row.text, MAX_EVIDENCE_TEXT_CHARS);
+      if (!heading || !line || !/\{\d+\}/.test(line)) continue;
+      evidence.push({ note_id: noteId, heading, text: line });
+    }
 
     const quoted = typeof card.anchor === "string" ? card.anchor : "";
     const found = findAnchor(draft, quoted.slice(0, MAX_ANCHOR_CHARS * 2));
@@ -1730,6 +1788,8 @@ export function parseInsightResponse(
       answer,
       direction,
       problem,
+      solution,
+      evidence,
       action,
       note_ids: noteIds,
       section_id: sectionId,

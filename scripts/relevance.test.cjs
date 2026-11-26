@@ -588,6 +588,37 @@ test('a solution carries its answer word for word from the note, or is dropped',
   assert.strictEqual(first(insightJson({ kind: 'extension' })), undefined, 'an extension needs the words it would merge');
 });
 
+test('each cited note gets its own heading and line, with quotes numbered alongside the card sentence', () => {
+  const insight = first(insightJson({
+    note_ids: ['n1', 'n2'],
+    quotes: [quote('two testers said $10 was the most'), quote('A sample note would have helped', 'n2'), quote('Nobody took $15')],
+    evidence: [
+      { note_id: 'n2', heading: '"What helped Sam":', text: 'Sam found {2}. It came back because your new note has her lost too.' },
+      { note_id: 'n1', heading: 'Your last price test', text: 'In March {1}, and {3}.' },
+      { note_id: 'n1', heading: 'A second entry for the same note', text: 'Again {1}.' },
+    ],
+  }));
+  assert.deepStrictEqual(insight.quotes.map((q) => q.text), ['two testers said $10 was the most', 'A sample note would have helped', 'Nobody took $15']);
+  assert.deepStrictEqual(insight.evidence, [
+    { note_id: 'n2', heading: 'What helped Sam', text: 'Sam found {2}. It came back because your new note has her lost too.' },
+    { note_id: 'n1', heading: 'Your last price test', text: 'In March {1}, and {3}.' },
+  ]);
+});
+
+test('an evidence line that misquotes, quotes nothing or names an uncited note is dropped, not the card', () => {
+  const insight = first(insightJson({
+    quotes: [quote('two testers said $10 was the most'), quote('most people would pay $30')],
+    evidence: [
+      { note_id: 'n1', heading: 'Price test', text: 'You found {2}.' },
+      { note_id: 'n1', heading: 'Price test', text: 'No quote here.' },
+      { note_id: 'n2', heading: 'Sam', text: 'Sam found {1}.' },
+    ],
+  }));
+  assert.ok(insight, 'the card survives');
+  assert.deepStrictEqual(insight.evidence, []);
+  assert.strictEqual(insight.quotes.length, 1);
+});
+
 test('a helps idea completes "Might help to ...", whatever way the model starts it', () => {
   assert.strictEqual(first(insightJson({ idea: 'Might help to: Say the price and just wait' })).action, 'say the price and just wait');
   assert.strictEqual(first(insightJson({ idea: 'AI demos first' })).action, 'AI demos first');
@@ -700,6 +731,28 @@ test('an outbound solution without its problem, or with an answer the draft does
   assert.strictEqual(first(outboundSolution({ problem: undefined }), outboundOpts), undefined);
   assert.strictEqual(first(outboundSolution({ problem: quote('words the old note never had at all') }), outboundOpts), undefined);
   assert.strictEqual(first(outboundSolution({ answer: { note_id: 'this', text: 'she would gladly pay forty dollars' } }), outboundOpts), undefined);
+});
+
+test('a solution keeps the model\'s plain-words solution as its headline, beside the exact answer', () => {
+  const insight = first(insightJson({ kind: 'solution', idea: undefined, answer: quote('Nobody took $15.'), solution: '“Offer the next tester $10 and see if they take it.”' }));
+  assert.strictEqual(insight.solution, 'Offer the next tester $10 and see if they take it.', 'quotation marks the model added are dropped');
+  assert.strictEqual(insight.answer.text, 'Nobody took $15.', 'the answer itself is still the past note\'s exact words');
+  assert.strictEqual(insight.action, 'Nobody took $15.');
+});
+
+test('a solution without a solution line is still kept, and only solutions carry one', () => {
+  assert.strictEqual(first(insightJson({ kind: 'solution', idea: undefined, answer: quote('Nobody took $15.') })).solution, '');
+  assert.strictEqual(first(insightJson({ solution: 'Ask the next tester to choose.' })).solution, '', 'a helps card has no solution line');
+  const outbound = first(outboundSolution({ solution: 'Charge $20 a month, the price your tester said she would pay.' }), outboundOpts);
+  assert.strictEqual(outbound.solution, 'Charge $20 a month, the price your tester said she would pay.', 'an outbound solution gets one too');
+});
+
+test('the insight prompt asks for a solution line in plain words, as the one exception to quoting', () => {
+  const prompt = buildInsightPrompt({ draft: DRAFT, context: { domain: null, goal: null }, recentNotes: [], matches: [] });
+  assert.ok(/SOLUTION - required on every "solution" card, and only there: one sentence in your own plain words/.test(prompt));
+  assert.ok(prompt.includes('a "solution" card always has both "answer" and "solution"'));
+  assert.ok(prompt.includes('The one exception is a solution\'s SOLUTION line'));
+  assert.ok(prompt.includes('"solution": "<solution only, your own words>"'));
 });
 
 test('an inbound solution ignores any problem field', () => {

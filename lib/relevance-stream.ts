@@ -1,4 +1,4 @@
-import { CardKind, InsightIntent, InsightQuote, NoteInsight, RelevanceCoverage, RelevanceProgress, RelevanceResult, RelevanceSection, RelevantNotesResponse } from '@/lib/types';
+import { CardKind, InsightEvidence, InsightIntent, InsightQuote, NoteInsight, RelevanceCoverage, RelevanceProgress, RelevanceResult, RelevanceSection, RelevantNotesResponse } from '@/lib/types';
 
 const INTENTS: InsightIntent[] = ['stuck', 'planning', 'deciding', 'capturing', 'reflecting', 'learning'];
 
@@ -20,6 +20,16 @@ function readInsight(value: unknown, resultIds: Set<string>): NoteInsight | null
   if (!text || (!action && kind !== 'contradiction') || !noteIds.length) return null;
   // A sentence whose quotes did not survive would show "{1}" to the person.
   if (quotes.some((quote) => !quote) || [...text.matchAll(/\{(\d+)\}/g)].some((match) => !quotes[Number(match[1]) - 1])) return null;
+  // Each note's own line, kept only when every quote it uses is there.
+  const evidence: InsightEvidence[] = (Array.isArray(row.evidence) ? row.evidence : []).flatMap((item): InsightEvidence[] => {
+    if (!item || typeof item !== 'object') return [];
+    const entry = item as Record<string, unknown>;
+    const line = typeof entry.text === 'string' ? entry.text.trim() : '';
+    const heading = typeof entry.heading === 'string' ? entry.heading.trim() : '';
+    if (typeof entry.note_id !== 'string' || !noteIds.includes(entry.note_id) || !heading || !line) return [];
+    if ([...line.matchAll(/\{(\d+)\}/g)].some((match) => !quotes[Number(match[1]) - 1])) return [];
+    return [{ note_id: entry.note_id, heading, text: line }];
+  });
   return {
     anchor: typeof row.anchor === 'string' ? row.anchor : '',
     intent: INTENTS.includes(row.intent as InsightIntent) ? (row.intent as InsightIntent) : 'reflecting',
@@ -29,6 +39,9 @@ function readInsight(value: unknown, resultIds: Set<string>): NoteInsight | null
     answer,
     direction,
     problem,
+    // A solution's headline in plain words; older servers send none.
+    ...(kind === 'solution' && typeof row.solution === 'string' && row.solution.trim() ? { solution: row.solution.trim() } : {}),
+    ...(evidence.length ? { evidence } : {}),
     action,
     note_ids: noteIds,
     ...(typeof row.section_id === 'string' ? { section_id: row.section_id } : {}),
